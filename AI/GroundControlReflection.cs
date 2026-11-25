@@ -412,7 +412,7 @@ internal static class GroundControlReflection
 
     // Milestone 6 Map / Champions start-base & Alert targets
     internal static readonly MethodInfo? TickChampionsStartMethod = AccessTools.Method(EconomyServiceType, "TickChampionsStart", Type.EmptyTypes);
-    internal static readonly FieldInfo? EcoChampionsDealtField = AccessTools.Field(EconomyServiceType, "championsDealt");
+    internal static readonly PropertyInfo? EcoChampionsDealtProp = AccessTools.Property(EconomyServiceType, "ChampionsDealt");
     internal static readonly FieldInfo? EcoChampionsStartBasesField = AccessTools.Field(EconomyServiceType, "ChampionsStartBases");
     internal static readonly FieldInfo? EcoGodStartBasesField = AccessTools.Field(EconomyServiceType, "GodStartBases");
     internal static readonly FieldInfo? EcoChampionKitKeysField = AccessTools.Field(EconomyServiceType, "ChampionKitKeys");
@@ -864,7 +864,7 @@ internal static class GroundControlReflection
             ("CommanderGodService", GodServiceType),
             ("CommanderAlertService", AlertServiceType),
             ("CommanderEconomyService.TickChampionsStart", TickChampionsStartMethod),
-            ("CommanderEconomyService.championsDealt", EcoChampionsDealtField),
+            ("CommanderEconomyService.ChampionsDealt", EcoChampionsDealtProp),
             ("CommanderEconomyService.ChampionsStartBases", EcoChampionsStartBasesField),
             ("CommanderEconomyService.GodStartBases", EcoGodStartBasesField),
             ("CommanderEconomyService.ChampionKitKeys", EcoChampionKitKeysField),
@@ -1786,14 +1786,35 @@ internal static class GroundControlReflection
     }
 
     internal static bool GetChampionsDealt(object? ecoInstance)
-        => ecoInstance != null && EcoChampionsDealtField?.GetValue(ecoInstance) is bool b && b;
+    {
+        if (ecoInstance == null)
+        {
+            return false;
+        }
+
+        if (EcoChampionsDealtProp != null && EcoChampionsDealtProp.GetValue(ecoInstance) is bool propVal)
+        {
+            return propVal;
+        }
+
+        FieldInfo? legacyField = AccessTools.Field(EconomyServiceType, "championsDealt");
+        return legacyField?.GetValue(ecoInstance) is bool fieldVal && fieldVal;
+    }
 
     internal static void SetChampionsDealt(object? ecoInstance, bool value)
     {
-        if (ecoInstance != null)
+        if (ecoInstance == null)
         {
-            EcoChampionsDealtField?.SetValue(ecoInstance, value);
+            return;
         }
+
+        if (EcoChampionsDealtProp != null)
+        {
+            EcoChampionsDealtProp.SetValue(ecoInstance, value);
+            return;
+        }
+
+        AccessTools.Field(EconomyServiceType, "championsDealt")?.SetValue(ecoInstance, value);
     }
 
     internal static string[] GetChampionsStartBases(bool godBudget)

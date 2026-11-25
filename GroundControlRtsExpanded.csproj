@@ -20,6 +20,8 @@
     <GameDir Condition="'$(GameDir)' == ''">$(NUCLEAR_OPTION_DIR)</GameDir>
     <GameDir Condition="'$(GameDir)' == ''">D:\SteamLibrary\steamapps\common\Nuclear Option</GameDir>
     <PluginInstallDir>$(GameDir)\BepInEx\plugins\GroundControlRtsExpanded</PluginInstallDir>
+    <GroundControlRtsDll Condition="Exists('$(GameDir)\BepInEx\plugins\GroundControlRts\GroundControlRts.dll')">$(GameDir)\BepInEx\plugins\GroundControlRts\GroundControlRts.dll</GroundControlRtsDll>
+    <GroundControlRtsDll Condition="'$(GroundControlRtsDll)' == '' And Exists('$(GameDir)\BepInEx\plugins\GroundControlRts\GroundControlRts\GroundControlRts.dll')">$(GameDir)\BepInEx\plugins\GroundControlRts\GroundControlRts\GroundControlRts.dll</GroundControlRtsDll>
     <MdsFrameworkDll>$(GameDir)\BepInEx\plugins\MDSFramework\MDSFramework.dll</MdsFrameworkDll>
     <DefineConstants Condition="Exists('$(MdsFrameworkDll)')">$(DefineConstants);HAS_MDS_FRAMEWORK</DefineConstants>
   </PropertyGroup>
@@ -67,8 +69,8 @@
       <HintPath>$(GameDir)\BepInEx\core\0Harmony.dll</HintPath>
       <Private>false</Private>
     </Reference>
-    <Reference Include="GroundControlRts">
-      <HintPath>$(GameDir)\BepInEx\plugins\GroundControlRts\GroundControlRts.dll</HintPath>
+    <Reference Include="GroundControlRts" Condition="Exists('$(GroundControlRtsDll)')">
+      <HintPath>$(GroundControlRtsDll)</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="MDSFramework" Condition="Exists('$(MdsFrameworkDll)')">

@@ -71,7 +71,8 @@ internal static class ChampionsDynamicStartBasePatch
                 continue;
             }
 
-            if (enemyHq.TryGetNearestDepot(ab.center.position, ab.GetRadius(), out _))
+            if (IsThirdFactionsAirbase(ab, localHq, enemyHq) ||
+                enemyHq.TryGetNearestDepot(ab.center.position, ab.GetRadius(), out _))
             {
                 continue;
             }
@@ -139,7 +140,10 @@ internal static class ChampionsDynamicStartBasePatch
             }
 
             SavedAirbase? savedOther = other.SavedAirbase;
-            if (savedOther != null && savedOther.Capturable && !ReferenceEquals(other.CurrentHQ, enemyHq))
+            if (savedOther != null &&
+                savedOther.Capturable &&
+                !ReferenceEquals(other.CurrentHQ, enemyHq) &&
+                !IsThirdFactionsAirbase(other, localHq, enemyHq))
             {
                 other.capture.ForceCapture(enemyHq);
             }
@@ -170,5 +174,12 @@ internal static class ChampionsDynamicStartBasePatch
         GroundControlReflection.NotifyAlert("YOUR BASE: " + chosenLabel.ToUpperInvariant());
         GroundControlReflection.GiveEnemyBasesDepots(__instance, enemyHq);
         return false;
+    }
+
+    private static bool IsThirdFactionsAirbase(Airbase ab, FactionHQ localHq, FactionHQ enemyHq)
+    {
+        return ab.CurrentHQ != null &&
+               !ReferenceEquals(ab.CurrentHQ, localHq) &&
+               !ReferenceEquals(ab.CurrentHQ, enemyHq);
     }
 }

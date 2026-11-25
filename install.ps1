@@ -64,9 +64,14 @@ if (-not (Test-Path $distDll)) {
 }
 
 $resolvedGameDir = Resolve-NuclearOptionDir -ExplicitDir $GameDir
-$gcRtsDll = Join-Path $resolvedGameDir "BepInEx\plugins\GroundControlRts\GroundControlRts.dll"
-if (-not (Test-Path $gcRtsDll)) {
-    Write-Warning "Base mod GroundControlRts.dll was not found at '$gcRtsDll'. Make sure GroundControlRts is installed!"
+$gcRoot = Join-Path $resolvedGameDir "BepInEx\plugins\GroundControlRts"
+$gcRtsDll = $null
+if (Test-Path $gcRoot) {
+    $gcMatch = Get-ChildItem $gcRoot -Recurse -Filter "GroundControlRts.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($gcMatch) { $gcRtsDll = $gcMatch.FullName }
+}
+if (-not $gcRtsDll) {
+    Write-Warning "Base mod GroundControlRts.dll was not found under '$gcRoot'. Make sure GroundControlRts is installed!"
 }
 
 $targetDir = Join-Path $resolvedGameDir "BepInEx\plugins\$modName"
