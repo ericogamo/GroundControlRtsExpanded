@@ -50,6 +50,9 @@ internal static class MdsBridgeBootstrap
     internal static Func<bool>? HasSelectedFriendlyMdsWeaponSite { get; set; }
     internal static Func<Unit?, float?>? GetMdsDefencePrice { get; set; }
     internal static Func<WeaponInfo?, bool>? IsMdsAntiShipWeaponInfo { get; set; }
+    internal static Func<GroundVehicle?, bool>? IsMdsContainerHauler { get; set; }
+    internal static Func<GroundVehicle?, UnityEngine.Vector3?>? TryGetMdsHaulerBedOffset { get; set; }
+    internal static Action<GroundVehicle?, bool>? SetMdsHaulerOutriggersDeployed { get; set; }
 
     internal static bool IsMdsPluginPresent()
     {
@@ -148,6 +151,9 @@ internal static class MdsBridgeBootstrap
         HasSelectedFriendlyMdsWeaponSite = null;
         GetMdsDefencePrice = null;
         IsMdsAntiShipWeaponInfo = null;
+        IsMdsContainerHauler = null;
+        TryGetMdsHaulerBedOffset = null;
+        SetMdsHaulerOutriggersDeployed = null;
     }
 
 #if HAS_MDS_FRAMEWORK

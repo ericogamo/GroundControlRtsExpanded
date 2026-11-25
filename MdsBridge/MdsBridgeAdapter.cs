@@ -129,6 +129,9 @@ internal static class MdsBridgeAdapter
         MdsBridgeBootstrap.HasSelectedFriendlyMdsWeaponSite = uiTransport.HasSelectedFriendlyMdsWeaponSite;
         MdsBridgeBootstrap.GetMdsDefencePrice = uiTransport.GetMdsDefencePrice;
         MdsBridgeBootstrap.IsMdsAntiShipWeaponInfo = ContractorRegistry.IsAntiShipWeaponInfo;
+        MdsBridgeBootstrap.IsMdsContainerHauler = uiTransport.IsMdsContainerHauler;
+        MdsBridgeBootstrap.TryGetMdsHaulerBedOffset = uiTransport.TryGetMdsHaulerBedOffset;
+        MdsBridgeBootstrap.SetMdsHaulerOutriggersDeployed = uiTransport.SetMdsHaulerOutriggersDeployed;
         RtsBridgeHost.QueryUnitHoldFire = GroundControlReflection.IsUnitHoldingFire;
 
         UpdateStatusSummary();
@@ -2486,6 +2489,12 @@ internal static class MdsBridgeAdapter
             AccessTools.Property(ModularSiteBehaviorType, "CommandNetEffectorCount");
         private static readonly MethodInfo? SiteSetHoldFireMethod =
             AccessTools.Method(ModularSiteBehaviorType, "SetHoldFire", new[] { typeof(bool) });
+        private static readonly PropertyInfo? SiteIsLogisticsHaulerProp =
+            AccessTools.Property(ModularSiteBehaviorType, "IsLogisticsHauler");
+        private static readonly MethodInfo? SiteTryGetCargoDeckMethod =
+            AccessTools.Method(ModularSiteBehaviorType, "TryGetCargoDeckLocalOffset", new[] { typeof(Vector3).MakeByRefType() });
+        private static readonly MethodInfo? SiteSetHaulerOutriggersMethod =
+            AccessTools.Method(ModularSiteBehaviorType, "SetHaulerOutriggersDeployed", new[] { typeof(bool) });
 
         private readonly RtsEconomyBridgeImpl ecoBridge;
         private readonly RtsCapBridgeImpl capBridge;
@@ -2917,7 +2926,8 @@ internal static class MdsBridgeAdapter
             }
 
             string? resolvedPath = ResolveDistinctPreviewGlbPath(pkg.AssetRootDirectory, spec);
-            return string.IsNullOrEmpty(resolvedPath) ? null : (resolvedPath!, 6.2f, false);
+            float previewScale = spec.IsMobileVehicle ? 10.5f : 6.2f;
+            return string.IsNullOrEmpty(resolvedPath) ? null : (resolvedPath!, previewScale, false);
         }
 
         private static string? ResolveDistinctPreviewGlbPath(string assetRoot, ModularUnitSpec spec)
@@ -3210,6 +3220,38 @@ internal static class MdsBridgeAdapter
 
         internal bool IsMdsSelectableUnit(Unit? unit)
             => unit != null && !unit.disabled && HasMdsComponent(unit);
+
+        internal bool IsMdsContainerHauler(GroundVehicle? vehicle)
+        {
+            Component? siteComp = FindModularSiteComponent(vehicle);
+            return siteComp != null && SiteIsLogisticsHaulerProp?.GetValue(siteComp) is bool isHauler && isHauler;
+        }
+
+        internal Vector3? TryGetMdsHaulerBedOffset(GroundVehicle? vehicle)
+        {
+            Component? siteComp = FindModularSiteComponent(vehicle);
+            if (siteComp == null || SiteTryGetCargoDeckMethod == null)
+            {
+                return null;
+            }
+
+            object[] args = new object[] { Vector3.zero };
+            if (SiteTryGetCargoDeckMethod.Invoke(siteComp, args) is bool ok && ok && args[0] is Vector3 offset)
+            {
+                return offset;
+            }
+
+            return null;
+        }
+
+        internal void SetMdsHaulerOutriggersDeployed(GroundVehicle? vehicle, bool deployed)
+        {
+            Component? siteComp = FindModularSiteComponent(vehicle);
+            if (siteComp != null)
+            {
+                SiteSetHaulerOutriggersMethod?.Invoke(siteComp, new object[] { deployed });
+            }
+        }
 
         internal bool HasSelectedFriendlyMdsWeaponSite()
         {

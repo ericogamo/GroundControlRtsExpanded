@@ -214,6 +214,7 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
         else
         {
             jobs.Remove(job);
+            MdsBridgeBootstrap.SetMdsHaulerOutriggersDeployed?.Invoke(job.Hauler, false);
             GroundControlReflection.SendRepairUnitHome(job.Hauler);
             SetFeedback("Trailer pickup cancelled.");
         }
@@ -275,6 +276,7 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
                 if (t >= 1f)
                 {
                     job.Stage = HaulStage.Loaded;
+                    MdsBridgeBootstrap.SetMdsHaulerOutriggersDeployed?.Invoke(job.Hauler, false);
                     string msg = $"{GroundControlReflection.GetUnitLabel(job.Container)} loaded onto {GroundControlReflection.GetUnitLabel(job.Hauler)}.";
                     SetFeedback(msg);
                     AddonLog.Info($"[Trailer] {msg}");
@@ -347,7 +349,11 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
         float standardOffsetZ = -Mathf.Max(0f, halfHauler - halfCargo);
         float maxFrontZ = Mathf.Max(0.5f, halfHauler - 3.65f);
         float bedOffsetZ = Mathf.Min(standardOffsetZ, maxFrontZ - halfCargo);
-        job.BedOffset = new Vector3(0f, BedHeightMeters - localBottomY, bedOffsetZ);
+        Vector3? customSeat = MdsBridgeBootstrap.TryGetMdsHaulerBedOffset?.Invoke(job.Hauler);
+        job.BedOffset = customSeat.HasValue
+            ? new Vector3(customSeat.Value.x, customSeat.Value.y - localBottomY, customSeat.Value.z)
+            : new Vector3(0f, BedHeightMeters - localBottomY, bedOffsetZ);
+        MdsBridgeBootstrap.SetMdsHaulerOutriggersDeployed?.Invoke(job.Hauler, true);
         job.LoadStartPos = job.Container.transform.position;
         job.LoadStartRot = job.Container.transform.rotation;
         job.LoadStartedAt = now;
@@ -372,6 +378,7 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
         }
 
         RestoreContainerPhysics(job, placeOnGround: true);
+        MdsBridgeBootstrap.SetMdsHaulerOutriggersDeployed?.Invoke(job.Hauler, false);
         MdsBridgeBootstrap.SetMdsContainerTransitState?.Invoke(job.Container, false);
     }
 
@@ -519,6 +526,11 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
 
     private static bool IsHaulerVehicle(GroundVehicle vehicle)
     {
+        if (MdsBridgeBootstrap.IsMdsContainerHauler?.Invoke(vehicle) == true)
+        {
+            return true;
+        }
+
         string unitName = vehicle.definition?.unitName ?? vehicle.unitName ?? string.Empty;
         string jsonKey = vehicle.definition?.jsonKey ?? string.Empty;
 
