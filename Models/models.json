@@ -1,0 +1,94 @@
+{
+  "slots": {
+    "command_hq": {
+      "file": "command_hq.glb",
+      "targetMaxDimensionMeters": 28.0,
+      "scaleMultiplier": 1.0,
+      "rotationEuler": [0.0, 0.0, 0.0],
+      "positionOffset": [0.0, 0.0, 0.0],
+      "autoGround": true,
+      "tintHex": null,
+      "smoothnessOverride": null
+    },
+    "barracks": {
+      "file": "barracks.glb",
+      "targetMaxDimensionMeters": 24.0,
+      "scaleMultiplier": 1.0,
+      "rotationEuler": [0.0, 0.0, 0.0],
+      "positionOffset": [0.0, 0.0, 0.0],
+      "autoGround": true,
+      "tintHex": null,
+      "smoothnessOverride": null
+    },
+    "pilot_academy": {
+      "file": "pilot_academy.glb",
+      "targetMaxDimensionMeters": 30.0,
+      "scaleMultiplier": 1.0,
+      "rotationEuler": [0.0, 0.0, 0.0],
+      "positionOffset": [0.0, 0.0, 0.0],
+      "autoGround": true,
+      "tintHex": null,
+      "smoothnessOverride": null
+    },
+    "logistics_camp": {
+      "file": "logistics_camp.glb",
+      "targetMaxDimensionMeters": 26.0,
+      "scaleMultiplier": 1.0,
+      "rotationEuler": [0.0, 0.0, 0.0],
+      "positionOffset": [0.0, 0.0, 0.0],
+      "autoGround": true,
+      "tintHex": null,
+      "smoothnessOverride": null
+    },
+    "naval_command": {
+      "file": "naval_command.glb",
+      "targetMaxDimensionMeters": 26.0,
+      "scaleMultiplier": 1.0,
+      "rotationEuler": [0.0, 0.0, 0.0],
+      "positionOffset": [0.0, 0.0, 0.0],
+      "autoGround": true,
+      "tintHex": null,
+      "smoothnessOverride": null
+    },
+    "abm_radar": {
+      "file": "abm_radar.glb",
+      "targetMaxDimensionMeters": 22.0,
+      "scaleMultiplier": 1.0,
+      "rotationEuler": [0.0, 0.0, 0.0],
+      "positionOffset": [0.0, 0.0, 0.0],
+      "autoGround": true,
+      "tintHex": null,
+      "smoothnessOverride": null
+    },
+    "abm_silo": {
+      "file": "abm_silo.glb",
+      "targetMaxDimensionMeters": 20.0,
+      "scaleMultiplier": 1.0,
+      "rotationEuler": [0.0, 0.0, 0.0],
+      "positionOffset": [0.0, 0.0, 0.0],
+      "autoGround": true,
+      "tintHex": null,
+      "smoothnessOverride": null
+    },
+    "abm_plant": {
+      "file": "abm_plant.glb",
+      "targetMaxDimensionMeters": 32.0,
+      "scaleMultiplier": 1.0,
+      "rotationEuler": [0.0, 0.0, 0.0],
+      "positionOffset": [0.0, 0.0, 0.0],
+      "autoGround": true,
+      "tintHex": null,
+      "smoothnessOverride": null
+    },
+    "sam_kit": {
+      "file": "sam_kit.glb",
+      "targetMaxDimensionMeters": 6.12,
+      "scaleMultiplier": 1.0,
+      "rotationEuler": [0.0, 0.0, 0.0],
+      "positionOffset": [0.0, 0.0, 0.0],
+      "autoGround": true,
+      "tintHex": null,
+      "smoothnessOverride": null
+    }
+  }
+}
