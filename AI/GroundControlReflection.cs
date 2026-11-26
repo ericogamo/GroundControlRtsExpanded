@@ -62,6 +62,8 @@ internal static class GroundControlReflection
     internal static readonly Type? SupplyHeliPendingSpawnType = AccessTools.TypeByName("GroundControlRts.CommanderSupplyHeliService+PendingAircraftSpawn");
     internal static readonly Type? SupplyHeliQueuedSpawnType = AccessTools.TypeByName("GroundControlRts.CommanderSupplyHeliService+QueuedCargoSpawn");
     internal static readonly Type? NavalPurchaseServiceType = AccessTools.TypeByName("GroundControlRts.CommanderNavalPurchaseService");
+    internal static readonly Type? FactionVehicleServiceType = AccessTools.TypeByName("GroundControlRts.CommanderFactionVehicleService");
+    internal static readonly Type? SpawnServiceType = AccessTools.TypeByName("GroundControlRts.CommanderSpawnService");
 
     // CommanderEconomyService members
     internal static readonly PropertyInfo? EcoInstanceProp = AccessTools.Property(EconomyServiceType, "Instance");
@@ -529,6 +531,8 @@ internal static class GroundControlReflection
     internal static readonly MethodInfo? MobileEmplacementBeginHitchMethod = AccessTools.Method(MobileEmplacementServiceType, "BeginHitch", Type.EmptyTypes);
     internal static readonly MethodInfo? MobileEmplacementDropTrailerMethod = AccessTools.Method(MobileEmplacementServiceType, "DropTrailer", new[] { typeof(Unit) });
     internal static readonly MethodInfo? MobileEmplacementSetStatusMethod = AccessTools.Method(MobileEmplacementServiceType, "SetStatus", new[] { typeof(string) });
+    internal static readonly MethodInfo? MobileEmplacementIsTowedByMethod = AccessTools.Method(MobileEmplacementServiceType, "IsTowedBy", new[] { typeof(GroundVehicle), typeof(Transform) });
+    internal static readonly MethodInfo? GameAccessSetUnitHoldPositionMethod = AccessTools.Method(GameAccessType, "SetUnitHoldPosition", new[] { typeof(Unit), typeof(bool) });
     internal static readonly MethodInfo? RepairSendRepairCrewMethod = AccessTools.Method(RepairServiceType, "SendRepairCrew", new[] { typeof(Unit) });
     internal static readonly MethodInfo? RepairHasCrewAssignedMethod = AccessTools.Method(RepairServiceType, "HasCrewAssigned", new[] { typeof(Unit) });
     internal static readonly FieldInfo? EcoBuiltUnitsField = AccessTools.Field(EconomyServiceType, "builtUnits");
@@ -657,6 +661,13 @@ internal static class GroundControlReflection
     internal static readonly MethodInfo? MoveClearOrderMethod = AccessTools.Method(MoveServiceType, "ClearOrder", new[] { typeof(Unit) });
     internal static readonly MethodInfo? AirBuildSlingLoadoutMethod = AccessTools.Method(AirCommandServiceType, "BuildSlingLoadout", new[] { typeof(AircraftDefinition) });
     internal static readonly MethodInfo? AirCanAiFlyMethod = AccessTools.Method(AirCommandServiceType, "CanAiFly", new[] { typeof(AircraftDefinition) });
+    internal static readonly MethodInfo? EcoIsStuckAiBuilderMethod = FindMethodByNameAndParamCount(EconomyServiceType, "IsStuckAiBuilder", 2);
+    internal static readonly MethodInfo? EcoIsSupplyTruckMethod = AccessTools.Method(EconomyServiceType, "IsSupplyTruck", new[] { typeof(VehicleDefinition) });
+    internal static readonly MethodInfo? FactionVehicleCanPurchaseMethod = AccessTools.Method(FactionVehicleServiceType, "CanPurchase", new[] { typeof(VehicleDefinition), typeof(FactionHQ) });
+    internal static readonly MethodInfo? GameAccessTryGetLocalVehicleDefinitionsMethod = AccessTools.Method(GameAccessType, "TryGetLocalVehicleDefinitions", new[] { typeof(List<VehicleDefinition>) });
+    internal static readonly MethodInfo? SpawnServiceRefreshFactionVehiclesMethod = AccessTools.Method(SpawnServiceType, "RefreshFactionVehicleDefinitions", Type.EmptyTypes);
+    internal static readonly MethodInfo? SpawnServiceRefreshVehiclesMethod = AccessTools.Method(SpawnServiceType, "RefreshVehicleDefinitions", Type.EmptyTypes);
+    internal static readonly FieldInfo? SpawnServiceVehicleDefinitionsField = AccessTools.Field(SpawnServiceType, "vehicleDefinitions");
 
     private static bool bindingsValidated;
 
@@ -1243,6 +1254,7 @@ internal static class GroundControlReflection
             ("CommanderMoveService.ClearOrder", MoveClearOrderMethod),
             ("CommanderAirCommandService.BuildSlingLoadout", AirBuildSlingLoadoutMethod),
             ("CommanderAirCommandService.CanAiFly", AirCanAiFlyMethod),
+            ("CommanderEconomyService.IsStuckAiBuilder(2)", EcoIsStuckAiBuilderMethod),
         };
 
         int present = 0;
@@ -2089,6 +2101,14 @@ internal static class GroundControlReflection
         }
     }
 
+    internal static void SetUnitHoldPosition(Unit? unit, bool hold)
+    {
+        if (unit != null && GameAccessSetUnitHoldPositionMethod != null)
+        {
+            GameAccessSetUnitHoldPositionMethod.Invoke(null, new object?[] { unit, hold });
+        }
+    }
+
     internal static bool GetMoveHasCommandableSelection(object? moveService)
         => moveService != null && MoveHasCommandableSelectionGetter?.Invoke(moveService, null) is bool b && b;
 
@@ -2672,6 +2692,153 @@ internal static class GroundControlReflection
             ClearTargetsUsingRadarMethod.Invoke(null, new object?[] { radar });
         }
     }
+
+    internal static float EcoGetNavalDockBuildCost()
+        => EcoNavalDockBuildCostProp?.GetValue(null) is float c ? c : 600f;
+
+    internal static float GetSettingsBuildRadiusKm()
+        => SettingsBuildRadiusKmGetter?.Invoke(null, null) is float r && r > 0.1f ? r : 2.5f;
+
+    internal static float EcoGetGasTerminalTier3Income()
+        => BuildKindGasTerminalValue != null ? GetStageIncomePerMinute(BuildKindGasTerminalValue, 3) : 75f;
+
+    internal static BuildingDefinition? EcoResolveNavalDockDefinition(object? ecoInstance)
+        => ecoInstance != null && BuildKindNavalDockValue != null
+            ? EcoResolveDefinitionMethod?.Invoke(ecoInstance, new object?[] { BuildKindNavalDockValue }) as BuildingDefinition
+            : null;
+
+    internal static float GetStructureCost(BuildingDefinition? def)
+        => def != null && GetStructureCostMethod?.Invoke(null, new object?[] { def }) is float c ? c : 750f;
+
+    internal static string GetStructureLabel(BuildingDefinition? def)
+        => def != null && GetStructureLabelMethod?.Invoke(null, new object?[] { def }) is string s && !string.IsNullOrWhiteSpace(s)
+            ? s
+            : (def?.unitName ?? "Structure");
+
+    internal static void EcoClearShoreSearchFailed(object? ecoInstance, FactionHQ? hq)
+    {
+        if (ecoInstance != null && hq != null && EcoShoreSearchFailedField?.GetValue(ecoInstance) is Dictionary<FactionHQ, int> map)
+        {
+            map.Remove(hq);
+        }
+    }
+
+    internal static object? EcoGetPreview(object? ecoInstance)
+        => ecoInstance != null ? EcoPreviewField?.GetValue(ecoInstance) : null;
+
+    internal static Dictionary<Unit, float>? EcoGetBuilderResting(object? ecoInstance)
+        => ecoInstance != null ? EcoBuilderRestingField?.GetValue(ecoInstance) as Dictionary<Unit, float> : null;
+
+    internal static void EcoCollectIdleBuilders(FactionHQ? hq, List<Unit> into)
+    {
+        into.Clear();
+        if (hq != null && EcoCollectIdleBuildersMethod != null)
+        {
+            EcoCollectIdleBuildersMethod.Invoke(null, new object?[] { hq, into });
+        }
+    }
+
+    internal static bool EcoHasBusyBuilderNear(object? ecoInstance, FactionHQ? hq, GlobalPosition site)
+        => ecoInstance != null && hq != null && EcoHasBusyBuilderNearMethod?.Invoke(ecoInstance, new object?[] { hq, site }) is bool b && b;
+
+    internal static void EcoSendBuilder(object? site, Unit? builder)
+    {
+        if (site != null && builder != null && EcoSendBuilderMethod != null)
+        {
+            EcoSendBuilderMethod.Invoke(null, new object?[] { site, builder });
+        }
+    }
+
+    internal static int EcoCountNavalDockBlueprints(FactionHQ? hq)
+        => hq != null && BuildKindNavalDockValue != null && EcoCountBlueprintsMethod?.Invoke(null, new object?[] { hq, BuildKindNavalDockValue }) is int n ? n : 0;
+
+    internal static bool EcoIsWater(GlobalPosition anchor, Vector3 direction, float distance)
+        => EcoIsWaterMethod?.Invoke(null, new object?[] { anchor, direction, distance }) is bool b && b;
+
+    internal static bool EcoIsOpenWater(GlobalPosition anchor, Vector3 direction, float distance)
+        => EcoIsOpenWaterMethod?.Invoke(null, new object?[] { anchor, direction, distance }) is bool b && b;
+
+    internal static bool EcoReachesSea(GlobalPosition start)
+        => EcoReachesSeaMethod?.Invoke(null, new object?[] { start }) is bool b && b;
+
+    internal static bool EcoIsNearBuiltTower(FactionHQ? hq, GlobalPosition target)
+        => hq != null && EcoIsNearBuiltTowerMethod?.Invoke(null, new object?[] { hq, target }) is bool b && b;
+
+    internal static bool IsSiteKindNavalDock(object? site)
+        => site != null && BuildKindNavalDockValue != null && Equals(SiteKindProp?.GetValue(site), BuildKindNavalDockValue);
+
+    internal static List<Unit>? SiteGetBuilders(object? site)
+        => site != null ? SiteBuildersProp?.GetValue(site) as List<Unit> : null;
+
+    internal static float SiteGetNextBuilderSpawnAt(object? site)
+        => site != null && SiteNextBuilderSpawnAtProp?.GetValue(site) is float t ? t : 0f;
+
+    internal static void SiteSetNextBuilderSpawnAt(object? site, float nextSpawnAt)
+    {
+        if (site != null && SiteNextBuilderSpawnAtProp != null)
+        {
+            SiteNextBuilderSpawnAtProp.SetValue(site, nextSpawnAt);
+        }
+    }
+
+    internal static bool BuildPreviewIsSiteAllowed(
+        object? previewObj,
+        BuildingDefinition? definition,
+        GlobalPosition target,
+        FactionHQ? hq,
+        out string reason,
+        bool navalDock = false,
+        Quaternion? rotation = null)
+    {
+        reason = string.Empty;
+        if (previewObj == null || definition == null || BuildPreviewIsSiteAllowedMethod == null)
+        {
+            return false;
+        }
+
+        object?[] args = { definition, target, hq, string.Empty, navalDock, rotation };
+        bool allowed = BuildPreviewIsSiteAllowedMethod.Invoke(previewObj, args) is bool ok && ok;
+        reason = args[3] as string ?? string.Empty;
+        return allowed;
+    }
+
+    internal static bool BuildPreviewIsShoreline(GlobalPosition target)
+        => BuildPreviewIsShorelineMethod?.Invoke(null, new object?[] { target }) is bool b && b;
+
+    internal static bool BuildPreviewIsControlTower(BuildingDefinition? def)
+        => def != null && BuildPreviewIsControlTowerMethod?.Invoke(null, new object?[] { def }) is bool b && b;
+
+    internal static bool BuildPreviewIsControlTowerUnit(Unit? unit)
+        => unit != null && BuildPreviewIsControlTowerUnitMethod?.Invoke(null, new object?[] { unit }) is bool b && b;
+
+    internal static VehicleDefinition? FindRepairVehicleDefinition(FactionHQ? hq)
+        => GameAccessFindRepairVehicleDefinitionMethod?.Invoke(null, new object?[] { hq }) as VehicleDefinition;
+
+    internal static bool EcoTryGiveStartingBuilders(object? ecoInstance, FactionHQ? hq, VehicleDepot? depot, int count)
+        => ecoInstance != null && hq != null && depot != null && EcoTryGiveStartingBuildersMethod?.Invoke(ecoInstance, new object?[] { hq, depot, count }) is bool ok && ok;
+
+    internal static bool UnitCapIsGroundFull(FactionHQ? hq)
+        => hq != null && UnitCapIsGroundFullMethod?.Invoke(null, new object?[] { hq }) is bool b && b;
+
+    internal static void MoveClearOrder(Unit? unit)
+    {
+        if (unit == null || MoveClearOrderMethod == null)
+        {
+            return;
+        }
+
+        object? inst = MoveInstanceProp?.GetValue(null);
+        if (inst != null)
+        {
+            MoveClearOrderMethod.Invoke(inst, new object?[] { unit });
+        }
+    }
+
+    internal static bool AirHasSlingLoadout(AircraftDefinition? def)
+        => def != null && AirBuildSlingLoadoutMethod?.Invoke(null, new object?[] { def }) != null;
+
+    internal static bool AirCanAiFly(AircraftDefinition? def)
+        => def != null && AirCanAiFlyMethod?.Invoke(null, new object?[] { def }) is bool b && b;
 
     private static MethodInfo? FindMethodByNameAndParamCount(Type? type, string name, int paramCount)
     {

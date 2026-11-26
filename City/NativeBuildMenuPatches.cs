@@ -786,6 +786,21 @@ internal static class MobileEmplacementIsReservedHaulerMdsPatch
 }
 
 [HarmonyPatch]
+internal static class MobileEmplacementIsTowedByMdsPatch
+{
+    private static bool Prepare() => GroundControlReflection.MobileEmplacementIsTowedByMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.MobileEmplacementIsTowedByMethod!;
+
+    private static void Postfix(GroundVehicle tractor, Transform? obstacle, ref bool __result)
+    {
+        if (!__result && AddonConfig.ModEnabled.Value && MdsFlatbedHaulService.Instance.IsMdsTowedBy(tractor, obstacle))
+        {
+            __result = true;
+        }
+    }
+}
+
+[HarmonyPatch]
 internal static class MobileEmplacementIsInTowJobMdsPatch
 {
     private static bool Prepare() => GroundControlReflection.MobileEmplacementIsInTowJobMethod != null;
@@ -1128,5 +1143,125 @@ internal static class OverlayDrawLoadoutIconsMdsPatch
             float y = startY + (i / 2) * 22f;
             GUI.DrawTexture(new Rect(x, y + 2f, 22f, 18f), tex, ScaleMode.ScaleToFit, true);
         }
+    }
+}
+
+[HarmonyPatch]
+internal static class GameAccessTryGetLocalVehicleDefinitionsMdsPatch
+{
+    private static bool Prepare() => GroundControlReflection.GameAccessTryGetLocalVehicleDefinitionsMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.GameAccessTryGetLocalVehicleDefinitionsMethod!;
+
+    private static void Prefix()
+    {
+        if (AddonConfig.ModEnabled.Value)
+        {
+            MdsBridgeBootstrap.EnsureMdsCatalogRegisteredAction?.Invoke();
+        }
+    }
+
+    private static void Postfix(List<VehicleDefinition>? buffer, ref bool __result)
+    {
+        if (!AddonConfig.ModEnabled.Value || buffer == null)
+        {
+            return;
+        }
+
+        MdsBridgeBootstrap.AppendMissingMdsVehicleDefinitions?.Invoke(buffer);
+        if (buffer.Count > 0)
+        {
+            __result = true;
+        }
+    }
+}
+
+[HarmonyPatch]
+internal static class SpawnServiceRefreshFactionVehiclesMdsPatch
+{
+    private static bool refreshingVehicles;
+
+    private static bool Prepare()
+        => GroundControlReflection.SpawnServiceRefreshFactionVehiclesMethod != null
+           && GroundControlReflection.SpawnServiceRefreshVehiclesMethod != null
+           && GroundControlReflection.SpawnServiceVehicleDefinitionsField != null;
+
+    private static MethodBase TargetMethod() => GroundControlReflection.SpawnServiceRefreshFactionVehiclesMethod!;
+
+    private static void Prefix(object? __instance)
+    {
+        if (!AddonConfig.ModEnabled.Value || refreshingVehicles || __instance == null)
+        {
+            return;
+        }
+
+        if (GroundControlReflection.SpawnServiceVehicleDefinitionsField?.GetValue(__instance) is List<VehicleDefinition> list
+            && MdsBridgeBootstrap.HasMissingMdsVehicleDefinitions?.Invoke(list) == true)
+        {
+            refreshingVehicles = true;
+            try
+            {
+                GroundControlReflection.SpawnServiceRefreshVehiclesMethod?.Invoke(__instance, null);
+            }
+            finally
+            {
+                refreshingVehicles = false;
+            }
+        }
+    }
+}
+
+[HarmonyPatch]
+internal static class FactionVehicleCanPurchaseMdsPatch
+{
+    private static bool Prepare() => GroundControlReflection.FactionVehicleCanPurchaseMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.FactionVehicleCanPurchaseMethod!;
+
+    private static void Postfix(VehicleDefinition? definition, FactionHQ? hq, ref bool __result)
+    {
+        if (!AddonConfig.ModEnabled.Value || definition == null)
+        {
+            return;
+        }
+
+        if (MdsBridgeBootstrap.TryCanPurchaseMdsVehicle?.Invoke(definition, hq) is bool allowed)
+        {
+            __result = allowed;
+        }
+    }
+}
+
+[HarmonyPatch]
+internal static class EconomyIsSupplyTruckMdsPatch
+{
+    private static bool Prepare() => GroundControlReflection.EcoIsSupplyTruckMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EcoIsSupplyTruckMethod!;
+
+    private static bool Prefix(VehicleDefinition? definition, ref bool __result)
+    {
+        if (AddonConfig.ModEnabled.Value && MdsBridgeBootstrap.IsMdsMobileVehicleDefinition?.Invoke(definition) == true)
+        {
+            __result = false;
+            return false;
+        }
+
+        return true;
+    }
+}
+
+[HarmonyPatch]
+internal static class EconomyGetRequiredDepotLevelMdsPatch
+{
+    private static bool Prepare() => GroundControlReflection.GetRequiredDepotLevelMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.GetRequiredDepotLevelMethod!;
+
+    private static bool Prefix(VehicleDefinition? definition, ref int __result)
+    {
+        if (AddonConfig.ModEnabled.Value && MdsBridgeBootstrap.GetMdsVehicleRequiredDepotLevel?.Invoke(definition) is int level)
+        {
+            __result = level;
+            return false;
+        }
+
+        return true;
     }
 }

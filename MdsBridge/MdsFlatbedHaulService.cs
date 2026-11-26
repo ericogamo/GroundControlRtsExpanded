@@ -27,6 +27,7 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
         internal float LoadDurationSeconds { get; set; } = 2.4f;
         internal float GroundClearanceY { get; set; }
         internal float NextOrderAt { get; set; }
+        internal float StoppedSince { get; set; } = float.MaxValue;
         internal Collider[] SavedColliders { get; set; } = Array.Empty<Collider>();
         internal bool WasKinematic { get; set; }
     }
@@ -43,6 +44,7 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
     private Unit? availabilityContainer;
     private bool cachedHaulerAvailable;
     private float nextAvailabilityCheckAt;
+    private bool issuingInternalCommand;
 
     private MdsFlatbedHaulService()
     {
@@ -113,13 +115,30 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
 
     internal bool IsMdsReservedHauler(Unit? unit)
     {
-        if (unit == null)
+        if (unit == null || issuingInternalCommand)
         {
             return false;
         }
 
         HaulJob? job = FindJobByUnit(unit);
         return job != null && job.Stage != HaulStage.Loaded && ReferenceEquals(job.Hauler, unit);
+    }
+
+    internal bool IsMdsTowedBy(GroundVehicle? tractor, Transform? obstacle)
+    {
+        if (tractor == null || obstacle == null)
+        {
+            return false;
+        }
+
+        HaulJob? job = FindJobByUnit(tractor);
+        if (job == null || !ReferenceEquals(job.Hauler, tractor) || job.Container == null)
+        {
+            return false;
+        }
+
+        return ReferenceEquals(obstacle, job.Container.transform)
+            || obstacle.IsChildOf(job.Container.transform);
     }
 
     internal bool TryGetMdsTowJobState(Unit? unit, out bool towing)
@@ -215,6 +234,7 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
         {
             jobs.Remove(job);
             MdsBridgeBootstrap.SetMdsHaulerOutriggersDeployed?.Invoke(job.Hauler, false);
+            GroundControlReflection.SetUnitHoldPosition(job.Hauler, false);
             GroundControlReflection.SendRepairUnitHome(job.Hauler);
             SetFeedback("Trailer pickup cancelled.");
         }
@@ -229,6 +249,12 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
             HaulJob job = jobs[i];
             if (job.Container == null || job.Container.disabled || job.Hq == null || !((NetworkBehaviour)job.Hq).IsServer)
             {
+                if (job.Hauler != null && !job.Hauler.disabled)
+                {
+                    MdsBridgeBootstrap.SetMdsHaulerOutriggersDeployed?.Invoke(job.Hauler, false);
+                    GroundControlReflection.SetUnitHoldPosition(job.Hauler, false);
+                }
+
                 RestoreContainerPhysics(job, placeOnGround: false);
                 jobs.RemoveAt(i);
                 continue;
@@ -247,8 +273,13 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
 
             if (job.Stage == HaulStage.Approaching)
             {
-                float dist = FastMath.Distance(job.Hauler.GlobalPosition(), job.Container.GlobalPosition());
-                if (dist <= HitchArrivalMeters)
+                Vector3 delta = job.Hauler.transform.position - job.Container.transform.position;
+                delta.y = 0f;
+                float dist = delta.magnitude;
+                bool stopped = Mathf.Abs(job.Hauler.speed) <= 1.0f;
+                job.StoppedSince = stopped ? Mathf.Min(job.StoppedSince, now) : float.MaxValue;
+
+                if (dist <= HitchArrivalMeters || (dist <= 60f && (now - job.StoppedSince) >= 4.0f))
                 {
                     BeginLoadingOntoBed(job, now);
                 }
@@ -256,7 +287,7 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
                 {
                     job.NextOrderAt = now + 2.5f;
                     GlobalPosition pickupPt = ComputeApproachPoint(job.Hauler, job.Container);
-                    GroundControlReflection.TrySetDestination(job.Hauler, pickupPt);
+                    IssueHaulerDestination(job.Hauler, pickupPt);
                 }
 
                 continue;
@@ -277,6 +308,7 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
                 {
                     job.Stage = HaulStage.Loaded;
                     MdsBridgeBootstrap.SetMdsHaulerOutriggersDeployed?.Invoke(job.Hauler, false);
+                    GroundControlReflection.SetUnitHoldPosition(job.Hauler, false);
                     string msg = $"{GroundControlReflection.GetUnitLabel(job.Container)} loaded onto {GroundControlReflection.GetUnitLabel(job.Hauler)}.";
                     SetFeedback(msg);
                     AddonLog.Info($"[Trailer] {msg}");
@@ -309,15 +341,16 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
         };
         jobs.Add(job);
 
+        GroundControlReflection.SetUnitHoldPosition(hauler, true);
         GlobalPosition pickupPt = ComputeApproachPoint(hauler, container);
-        GroundControlReflection.TrySetDestination(hauler, pickupPt);
+        IssueHaulerDestination(hauler, pickupPt);
         SetFeedback($"{GroundControlReflection.GetUnitLabel(hauler)} dispatched to load container.");
         AddonLog.Info($"[Trailer] Dispatched '{GroundControlReflection.GetUnitLabel(hauler)}' to load '{GroundControlReflection.GetUnitLabel(container)}'.");
     }
 
     private void BeginLoadingOntoBed(HaulJob job, float now)
     {
-        GroundControlReflection.TrySetDestination(job.Hauler, job.Hauler.GlobalPosition());
+        IssueHaulerDestination(job.Hauler, job.Hauler.GlobalPosition());
 
         GlobalPosition groundAtContainer = GroundControlReflection.SnapToTerrain(job.Container.GlobalPosition());
         job.GroundClearanceY = Mathf.Clamp(job.Container.transform.position.y - groundAtContainer.ToLocalPosition().y, 0f, 3f);
@@ -502,7 +535,7 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
                 || gv.disabled
                 || !ReferenceEquals(gv.NetworkHQ, hq)
                 || !IsHaulerVehicle(gv)
-                || Mathf.Abs(gv.speed) > 2.0f
+                || Mathf.Abs(gv.speed) > 4.0f
                 || FindJobByUnit(gv) != null)
             {
                 continue;
@@ -540,6 +573,19 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
             || string.Equals(jsonKey, "HLT-L", StringComparison.OrdinalIgnoreCase)
             || string.Equals(jsonKey, "Truck2-T", StringComparison.OrdinalIgnoreCase)
             || string.Equals(jsonKey, "Truck2-L", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void IssueHaulerDestination(GroundVehicle hauler, GlobalPosition destination)
+    {
+        issuingInternalCommand = true;
+        try
+        {
+            GroundControlReflection.TrySetDestination(hauler, destination);
+        }
+        finally
+        {
+            issuingInternalCommand = false;
+        }
     }
 
     private void SetFeedback(string text)

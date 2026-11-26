@@ -132,6 +132,12 @@ internal static class MdsBridgeAdapter
         MdsBridgeBootstrap.IsMdsContainerHauler = uiTransport.IsMdsContainerHauler;
         MdsBridgeBootstrap.TryGetMdsHaulerBedOffset = uiTransport.TryGetMdsHaulerBedOffset;
         MdsBridgeBootstrap.SetMdsHaulerOutriggersDeployed = uiTransport.SetMdsHaulerOutriggersDeployed;
+        MdsBridgeBootstrap.EnsureMdsCatalogRegisteredAction = uiTransport.EnsureCatalogRegistered;
+        MdsBridgeBootstrap.AppendMissingMdsVehicleDefinitions = uiTransport.AppendMissingMdsVehicleDefinitions;
+        MdsBridgeBootstrap.HasMissingMdsVehicleDefinitions = uiTransport.HasMissingMdsVehicleDefinitions;
+        MdsBridgeBootstrap.TryCanPurchaseMdsVehicle = uiTransport.TryCanPurchaseMdsVehicle;
+        MdsBridgeBootstrap.IsMdsMobileVehicleDefinition = uiTransport.IsMdsMobileVehicleDefinition;
+        MdsBridgeBootstrap.GetMdsVehicleRequiredDepotLevel = uiTransport.GetMdsVehicleRequiredDepotLevel;
         RtsBridgeHost.QueryUnitHoldFire = GroundControlReflection.IsUnitHoldingFire;
 
         UpdateStatusSummary();
@@ -2495,6 +2501,10 @@ internal static class MdsBridgeAdapter
             AccessTools.Method(ModularSiteBehaviorType, "TryGetCargoDeckLocalOffset", new[] { typeof(Vector3).MakeByRefType() });
         private static readonly MethodInfo? SiteSetHaulerOutriggersMethod =
             AccessTools.Method(ModularSiteBehaviorType, "SetHaulerOutriggersDeployed", new[] { typeof(bool) });
+        private static readonly Type? MdsEncyclopediaCatalogType =
+            AccessTools.TypeByName("MDSFramework.Deployment.MdsEncyclopediaCatalog");
+        private static readonly MethodInfo? MdsEncyclopediaEnsureRegisteredMethod =
+            AccessTools.Method(MdsEncyclopediaCatalogType, "EnsureRegisteredAll", Type.EmptyTypes);
 
         private readonly RtsEconomyBridgeImpl ecoBridge;
         private readonly RtsCapBridgeImpl capBridge;
@@ -2669,7 +2679,7 @@ internal static class MdsBridgeAdapter
                 ContractorRegistry.TryGetUnitSpec(unitId, out _, out ModularUnitSpec spec) &&
                 spec != null)
             {
-                return Mathf.Max(1f, spec.Logistics.CreditCost);
+                return Mathf.Max(0.05f, spec.Logistics.CreditCost);
             }
 
             return cargo.value > 0f ? cargo.value : null;
@@ -2925,22 +2935,31 @@ internal static class MdsBridgeAdapter
                 return null;
             }
 
-            string? resolvedPath = ResolveDistinctPreviewGlbPath(pkg.AssetRootDirectory, spec);
+            string? resolvedPath = ResolveDistinctPreviewGlbPath(pkg, spec);
             float previewScale = spec.IsMobileVehicle ? 10.5f : 6.2f;
-            return string.IsNullOrEmpty(resolvedPath) ? null : (resolvedPath!, previewScale, false);
+            bool sampleEndFrame = !key.StartsWith("mds_cargo_", StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrEmpty(resolvedPath)
+                && resolvedPath!.EndsWith("_container.glb", StringComparison.OrdinalIgnoreCase);
+            return string.IsNullOrEmpty(resolvedPath) ? null : (resolvedPath!, previewScale, sampleEndFrame);
         }
 
-        private static string? ResolveDistinctPreviewGlbPath(string assetRoot, ModularUnitSpec spec)
+        private static string? ResolveDistinctPreviewGlbPath(ContractorPackage pkg, ModularUnitSpec spec)
         {
-            // Prefer open weapon/turret models for icon clarity whenever a *_container.glb also has an open sibling.
+            string assetRoot = pkg.AssetRootDirectory;
+
+            // Prefer open weapon/turret models for icon clarity whenever a *_container.glb also has an open sibling
+            // that is NOT a registered missile model (e.g., vgd_seawraith_container.glb vs vgd_seawraith.glb).
             if (!string.IsNullOrEmpty(spec.GlbRelativePath)
                 && spec.GlbRelativePath.EndsWith("_container.glb", StringComparison.OrdinalIgnoreCase))
             {
                 string openRel = spec.GlbRelativePath.Substring(0, spec.GlbRelativePath.Length - "_container.glb".Length) + ".glb";
-                string? openFull = TryFindGlbInPackageRoot(assetRoot, openRel);
-                if (!string.IsNullOrEmpty(openFull))
+                if (!IsRegisteredMissileGlbFile(pkg, openRel))
                 {
-                    return openFull;
+                    string? openFull = TryFindGlbInPackageRoot(assetRoot, openRel);
+                    if (!string.IsNullOrEmpty(openFull))
+                    {
+                        return openFull;
+                    }
                 }
             }
 
@@ -2950,7 +2969,8 @@ internal static class MdsBridgeAdapter
                 {
                     string rel = spec.FallbackGlbRelativePaths[i];
                     if (!string.IsNullOrEmpty(rel)
-                        && rel.IndexOf("_container", StringComparison.OrdinalIgnoreCase) < 0)
+                        && rel.IndexOf("_container", StringComparison.OrdinalIgnoreCase) < 0
+                        && !IsRegisteredMissileGlbFile(pkg, rel))
                     {
                         string? found = TryFindGlbInPackageRoot(assetRoot, rel);
                         if (!string.IsNullOrEmpty(found))
@@ -2980,6 +3000,69 @@ internal static class MdsBridgeAdapter
             }
 
             return null;
+        }
+
+        private static bool IsRegisteredMissileGlbFile(ContractorPackage primaryPkg, string? relPath)
+        {
+            string? fileName = string.IsNullOrWhiteSpace(relPath) ? null : Path.GetFileName(relPath);
+            if (string.IsNullOrEmpty(fileName))
+            {
+                return false;
+            }
+
+            if (PackageHasMissileGlbFile(primaryPkg, fileName!))
+            {
+                return true;
+            }
+
+            IReadOnlyCollection<ContractorPackage> packages = ContractorRegistry.GetPackages();
+            foreach (ContractorPackage pkg in packages)
+            {
+                if (pkg != null && !ReferenceEquals(pkg, primaryPkg) && PackageHasMissileGlbFile(pkg, fileName!))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool PackageHasMissileGlbFile(ContractorPackage? pkg, string targetFileName)
+        {
+            if (pkg?.Missiles == null)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < pkg.Missiles.Count; i++)
+            {
+                CustomMissileSpec m = pkg.Missiles[i];
+                if (m == null)
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrEmpty(m.GlbRelativePath) &&
+                    string.Equals(Path.GetFileName(m.GlbRelativePath), targetFileName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                if (m.FallbackGlbRelativePaths != null)
+                {
+                    for (int f = 0; f < m.FallbackGlbRelativePaths.Length; f++)
+                    {
+                        string fb = m.FallbackGlbRelativePaths[f];
+                        if (!string.IsNullOrEmpty(fb) &&
+                            string.Equals(Path.GetFileName(fb), targetFileName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            return false;
         }
 
         private static string? TryFindGlbInPackageRoot(string root, string? relPath)
@@ -3032,7 +3115,7 @@ internal static class MdsBridgeAdapter
             FactionAffinity affinity = ToAffinity(hq);
             foreach (KeyValuePair<BuildingDefinition, (ContractorPackage Pkg, ModularUnitSpec Spec)> kv in metaByBuildDef)
             {
-                if (kv.Key != null && ecoBridge.IsPackageAllowedForFaction(kv.Value.Pkg, affinity))
+                if (kv.Key != null && !kv.Value.Spec.IsMobileVehicle && ecoBridge.IsPackageAllowedForFaction(kv.Value.Pkg, affinity))
                 {
                     list.Add(kv.Key);
                 }
@@ -3061,7 +3144,7 @@ internal static class MdsBridgeAdapter
         {
             if (def != null && TryResolveBuildMeta(def, out _, out ModularUnitSpec spec))
             {
-                return Mathf.Max(1f, spec.Logistics.CreditCost);
+                return Mathf.Max(0.05f, spec.Logistics.CreditCost);
             }
 
             return def != null ? def.value : 0f;
@@ -3365,13 +3448,13 @@ internal static class MdsBridgeAdapter
             Component? siteComp = FindModularSiteComponent(unit);
             if (siteComp != null && SiteSpecField?.GetValue(siteComp) is ModularUnitSpec siteSpec)
             {
-                return Mathf.Max(1f, siteSpec.Logistics.CreditCost);
+                return Mathf.Max(0.05f, siteSpec.Logistics.CreditCost);
             }
 
             Component? airdropComp = FindAirdropComponent(unit);
             if (airdropComp != null && AirdropSpecProp?.GetValue(airdropComp) is ModularUnitSpec dropSpec)
             {
-                return Mathf.Max(1f, dropSpec.Logistics.CreditCost);
+                return Mathf.Max(0.05f, dropSpec.Logistics.CreditCost);
             }
 
             string? key = unit.definition != null ? unit.definition.jsonKey : null;
@@ -3396,7 +3479,7 @@ internal static class MdsBridgeAdapter
                     ContractorRegistry.TryGetUnitSpec(unitId!, out _, out ModularUnitSpec regSpec) &&
                     regSpec != null)
                 {
-                    return Mathf.Max(1f, regSpec.Logistics.CreditCost);
+                    return Mathf.Max(0.05f, regSpec.Logistics.CreditCost);
                 }
             }
 
@@ -3501,6 +3584,124 @@ internal static class MdsBridgeAdapter
             }
         }
 
+        internal void EnsureCatalogRegistered()
+        {
+            if (Encyclopedia.i == null || MdsEncyclopediaEnsureRegisteredMethod == null)
+            {
+                return;
+            }
+
+            try
+            {
+                MdsEncyclopediaEnsureRegisteredMethod.Invoke(null, null);
+            }
+            catch (Exception ex)
+            {
+                AddonLog.Debug($"[MDS Bridge] EnsureCatalogRegistered skipped error: {ex.Message}");
+            }
+        }
+
+        private static bool TryResolveMdsMobileVehicle(
+            VehicleDefinition? def,
+            out ContractorPackage pkg,
+            out ModularUnitSpec spec)
+        {
+            pkg = null!;
+            spec = null!;
+            if (def == null || string.IsNullOrEmpty(def.jsonKey))
+            {
+                return false;
+            }
+
+            if (!def.jsonKey.StartsWith("mds_", StringComparison.OrdinalIgnoreCase)
+                || def.jsonKey.StartsWith(BuildDefKeyPrefix, StringComparison.OrdinalIgnoreCase)
+                || def.jsonKey.StartsWith("mds_cargo_", StringComparison.OrdinalIgnoreCase)
+                || def.jsonKey.StartsWith("mds_missile_", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            string unitId = def.jsonKey.Substring(4);
+            return ContractorRegistry.TryGetUnitSpec(unitId, out pkg, out spec)
+                && pkg != null
+                && spec != null
+                && spec.IsMobileVehicle;
+        }
+
+        internal void AppendMissingMdsVehicleDefinitions(List<VehicleDefinition> buffer)
+        {
+            if (buffer == null)
+            {
+                return;
+            }
+
+            EnsureCatalogRegistered();
+            List<VehicleDefinition>? encVehicles = Encyclopedia.i?.vehicles;
+            if (encVehicles == null)
+            {
+                return;
+            }
+
+            for (int i = 0; i < encVehicles.Count; i++)
+            {
+                VehicleDefinition? vehDef = encVehicles[i];
+                if (vehDef == null || !TryResolveMdsMobileVehicle(vehDef, out _, out ModularUnitSpec spec))
+                {
+                    continue;
+                }
+
+                vehDef.value = Mathf.Max(0.05f, spec.Logistics.CreditCost);
+                if (!buffer.Contains(vehDef))
+                {
+                    buffer.Add(vehDef);
+                }
+            }
+        }
+
+        internal bool HasMissingMdsVehicleDefinitions(List<VehicleDefinition> current)
+        {
+            EnsureCatalogRegistered();
+            List<VehicleDefinition>? encVehicles = Encyclopedia.i?.vehicles;
+            if (encVehicles == null)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < encVehicles.Count; i++)
+            {
+                VehicleDefinition? vehDef = encVehicles[i];
+                if (vehDef != null && TryResolveMdsMobileVehicle(vehDef, out _, out _) && !current.Contains(vehDef))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        internal bool? TryCanPurchaseMdsVehicle(VehicleDefinition? def, FactionHQ? hq)
+        {
+            if (!TryResolveMdsMobileVehicle(def, out ContractorPackage pkg, out _))
+            {
+                return null;
+            }
+
+            return ecoBridge.IsPackageAllowedForFaction(pkg, ToAffinity(hq));
+        }
+
+        internal bool IsMdsMobileVehicleDefinition(VehicleDefinition? def)
+            => TryResolveMdsMobileVehicle(def, out _, out _);
+
+        internal int? GetMdsVehicleRequiredDepotLevel(VehicleDefinition? def)
+        {
+            if (!TryResolveMdsMobileVehicle(def, out _, out ModularUnitSpec spec))
+            {
+                return null;
+            }
+
+            return Mathf.Clamp(spec.Logistics.RequiredTechTier, 1, 3);
+        }
+
         private void EnsureBuildCatalogSynced()
         {
             Encyclopedia? enc = Encyclopedia.i;
@@ -3528,14 +3729,14 @@ internal static class MdsBridgeAdapter
                 for (int i = 0; i < pkg.Units.Count; i++)
                 {
                     ModularUnitSpec spec = pkg.Units[i];
-                    if (spec == null || string.IsNullOrEmpty(spec.UnitId))
+                    if (spec == null || string.IsNullOrEmpty(spec.UnitId) || spec.IsMobileVehicle)
                     {
                         continue;
                     }
 
                     if (buildDefsByUnitId.TryGetValue(spec.UnitId, out BuildingDefinition? existing) && existing != null)
                     {
-                        existing.value = Mathf.Max(1f, spec.Logistics.CreditCost);
+                        existing.value = Mathf.Max(0.05f, spec.Logistics.CreditCost);
                         metaByBuildDef[existing] = (pkg, spec);
                         continue;
                     }
@@ -3552,7 +3753,7 @@ internal static class MdsBridgeAdapter
                     clone.jsonKey = key;
                     clone.unitName = spec.DisplayName;
                     clone.code = "MDS";
-                    clone.value = Mathf.Max(1f, spec.Logistics.CreditCost);
+                    clone.value = Mathf.Max(0.05f, spec.Logistics.CreditCost);
                     clone.buildingType = (spec.Role == WeaponCascadeRole.FireControl ||
                                           spec.Role == WeaponCascadeRole.EarlyWarningRadar ||
                                           spec.Role == WeaponCascadeRole.CommandControl)

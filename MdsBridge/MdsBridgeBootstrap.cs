@@ -53,6 +53,12 @@ internal static class MdsBridgeBootstrap
     internal static Func<GroundVehicle?, bool>? IsMdsContainerHauler { get; set; }
     internal static Func<GroundVehicle?, UnityEngine.Vector3?>? TryGetMdsHaulerBedOffset { get; set; }
     internal static Action<GroundVehicle?, bool>? SetMdsHaulerOutriggersDeployed { get; set; }
+    internal static Action? EnsureMdsCatalogRegisteredAction { get; set; }
+    internal static Action<System.Collections.Generic.List<VehicleDefinition>>? AppendMissingMdsVehicleDefinitions { get; set; }
+    internal static Func<System.Collections.Generic.List<VehicleDefinition>, bool>? HasMissingMdsVehicleDefinitions { get; set; }
+    internal static Func<VehicleDefinition?, FactionHQ?, bool?>? TryCanPurchaseMdsVehicle { get; set; }
+    internal static Func<VehicleDefinition?, bool>? IsMdsMobileVehicleDefinition { get; set; }
+    internal static Func<VehicleDefinition?, int?>? GetMdsVehicleRequiredDepotLevel { get; set; }
 
     internal static bool IsMdsPluginPresent()
     {
@@ -154,6 +160,12 @@ internal static class MdsBridgeBootstrap
         IsMdsContainerHauler = null;
         TryGetMdsHaulerBedOffset = null;
         SetMdsHaulerOutriggersDeployed = null;
+        EnsureMdsCatalogRegisteredAction = null;
+        AppendMissingMdsVehicleDefinitions = null;
+        HasMissingMdsVehicleDefinitions = null;
+        TryCanPurchaseMdsVehicle = null;
+        IsMdsMobileVehicleDefinition = null;
+        GetMdsVehicleRequiredDepotLevel = null;
     }
 
 #if HAS_MDS_FRAMEWORK

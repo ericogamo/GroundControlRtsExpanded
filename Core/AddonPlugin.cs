@@ -41,6 +41,7 @@ public sealed class AddonPlugin : BaseUnityPlugin
         ModelRegistry.Initialize(PluginDirectory);
         RuntimeController = gameObject.AddComponent<AddonRuntimeController>();
         RuntimeController.Register(AiStrategicDirectorService.Instance);
+        RuntimeController.Register(AiCoastalOutpostService.Instance);
         RuntimeController.Register(AiBattlefieldIntelService.Instance);
         RuntimeController.Register(AiTacticalDoctrineService.Instance);
         RuntimeController.Register(AiOperationalManeuverService.Instance);

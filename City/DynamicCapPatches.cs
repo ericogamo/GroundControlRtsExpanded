@@ -534,6 +534,7 @@ internal static class EconomySpawnBuildingPatch
         }
 
         DynamicCapAndTechService.Instance.OnBuildingSpawned(hq, definition, __result);
+        AiCoastalOutpostService.Instance.OnControlTowerBuilt(GroundControlReflection.GetEcoInstance(), hq, __result);
     }
 }
 

@@ -1465,3 +1465,128 @@ internal static class TryPickEnemyBuildSiteSafePatch
         return true;
     }
 }
+
+[HarmonyPatch]
+internal static class GetEnemyDockCostOutpostPatch
+{
+    private static bool Prepare() => GroundControlReflection.EcoGetEnemyDockCostMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EcoGetEnemyDockCostMethod!;
+
+    private static void Postfix(object __instance, FactionHQ hq, int upToLevel, ref float __result)
+    {
+        if (upToLevel == 1)
+        {
+            __result = AiCoastalOutpostService.Instance.EvaluateDockOrOutpostCost(__instance, hq, __result);
+        }
+    }
+}
+
+[HarmonyPatch]
+internal static class TryBuildEnemyDockOutpostPatch
+{
+    private static bool Prepare() => GroundControlReflection.EcoTryBuildEnemyDockMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EcoTryBuildEnemyDockMethod!;
+
+    private static bool Prefix(object __instance, FactionHQ hq, int upToLevel, ref bool __result)
+    {
+        if (upToLevel == 1 && AiCoastalOutpostService.Instance.TryInterceptEnemyDockBuild(__instance, hq, out bool handled))
+        {
+            __result = handled;
+            return false;
+        }
+
+        return true;
+    }
+}
+
+[HarmonyPatch]
+internal static class HasGivenUpOnDockOutpostPatch
+{
+    private static bool Prepare() => GroundControlReflection.EcoHasGivenUpOnDockMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EcoHasGivenUpOnDockMethod!;
+
+    private static void Postfix(object __instance, FactionHQ hq, ref bool __result)
+    {
+        if (__result && AiCoastalOutpostService.Instance.HasBuiltCoastalTowerReady(__instance, hq))
+        {
+            __result = false;
+        }
+    }
+}
+
+[HarmonyPatch]
+internal static class TryFindShoreSiteOutpostPatch
+{
+    private static bool Prepare() => GroundControlReflection.TryFindShoreSiteMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.TryFindShoreSiteMethod!;
+
+    private static void Postfix(
+        object __instance,
+        FactionHQ hq,
+        BuildingDefinition dock,
+        ref GlobalPosition site,
+        ref bool __result)
+    {
+        if (!__result
+            && !AiCoastalOutpostService.Instance.IsProbingVanillaShore
+            && AiCoastalOutpostService.Instance.TryFindBuiltCoastalTowerDockSite(__instance, hq, dock, out GlobalPosition fallbackDock))
+        {
+            site = fallbackDock;
+            __result = true;
+        }
+    }
+}
+
+[HarmonyPatch]
+internal static class ReviewBuildersOutpostPatch
+{
+    private static bool Prepare() => GroundControlReflection.EcoReviewBuildersMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EcoReviewBuildersMethod!;
+
+    private static void Postfix(object __instance)
+    {
+        AiCoastalOutpostService.Instance.TryAssignRemoteBuilders(__instance);
+    }
+}
+
+[HarmonyPatch]
+internal static class TryGetStrandedBuilderOutpostPatch
+{
+    private static bool Prepare() => GroundControlReflection.EcoTryGetStrandedBuilderMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EcoTryGetStrandedBuilderMethod!;
+
+    private static void Postfix(
+        object __instance,
+        FactionHQ hq,
+        ref GlobalPosition site,
+        ref Unit? builder,
+        ref bool __result)
+    {
+        if (!__result
+            && AiCoastalOutpostService.Instance.TryFindStrandedRemoteBuilder(__instance, hq, out GlobalPosition foundSite, out Unit? foundBuilder)
+            && foundBuilder != null)
+        {
+            site = foundSite;
+            builder = foundBuilder;
+            __result = true;
+        }
+    }
+}
+
+[HarmonyPatch]
+internal static class IsStuckAiBuilderOutpostPatch
+{
+    private static bool Prepare() => GroundControlReflection.EcoIsStuckAiBuilderMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EcoIsStuckAiBuilderMethod!;
+
+    private static bool Prefix(object site, Unit builder, ref bool __result)
+    {
+        if (AiCoastalOutpostService.Instance.ShouldSuppressStuckRemoteBuilder(site, builder))
+        {
+            __result = false;
+            return false;
+        }
+
+        return true;
+    }
+}
