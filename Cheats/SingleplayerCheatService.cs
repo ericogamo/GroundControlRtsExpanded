@@ -37,7 +37,31 @@ internal sealed class SingleplayerCheatService : IAddonTick, IAddonGui, IAddonRe
     internal static bool IsAllowed =>
         AddonConfig.ModEnabled.Value
         && AddonConfig.EnableSingleplayerCheats.Value
-        && GameManager.gameState == GameState.SinglePlayer;
+        && (GameManager.gameState == GameState.SinglePlayer || IsAuthorizedHostTestCheatUser());
+
+    private static bool IsAuthorizedHostTestCheatUser()
+    {
+        if (GameManager.gameState != GameState.Multiplayer || GroundControlReflection.IsNetworkGuest())
+        {
+            return false;
+        }
+
+        string configured = (AddonConfig.HostTestCheatSteamId.Value ?? string.Empty).Trim();
+        if (string.IsNullOrEmpty(configured) || !ulong.TryParse(configured, out ulong allowedId) || allowedId == 0UL)
+        {
+            return false;
+        }
+
+        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
+        if (localHq == null || !((NetworkBehaviour)localHq).IsServer)
+        {
+            return false;
+        }
+
+        return GameManager.GetLocalPlayer<NuclearOption.Networking.BasePlayer>(out NuclearOption.Networking.BasePlayer localPlayer)
+            && localPlayer != null
+            && localPlayer.SteamID == allowedId;
+    }
 
     internal bool IsWindowVisible => IsAllowed && windowVisible;
 
@@ -139,7 +163,8 @@ internal sealed class SingleplayerCheatService : IAddonTick, IAddonGui, IAddonRe
             windowPositioned = true;
         }
 
-        windowRect = NativeThemeBridge.DrawWindow(WindowId, windowRect, DrawCheatWindow, "SINGLEPLAYER CHEATS");
+        string title = GameManager.gameState == GameState.SinglePlayer ? "SINGLEPLAYER CHEATS" : "HOST TEST CHEATS";
+        windowRect = NativeThemeBridge.DrawWindow(WindowId, windowRect, DrawCheatWindow, title);
     }
 
     internal static bool ConsumeCompleteAllOrInstantBuild(object ecoInstance)
@@ -216,7 +241,8 @@ internal sealed class SingleplayerCheatService : IAddonTick, IAddonGui, IAddonRe
         GUI.Box(new Rect(12f, y, innerW, 38f), string.Empty, NativeThemeBridge.Panel);
         string fundsLabel = localHq != null ? $"${localHq.factionFunds:0.#}m" : "$0m";
         int tier = localHq != null ? DynamicCapAndTechService.Instance.GetSnapshot(localHq).TechTier : 1;
-        GUI.Label(new Rect(22f, y + 8f, innerW - 20f, 22f), $"SINGLEPLAYER ONLY   |   FUNDS {fundsLabel}   |   TIER {tier}", NativeThemeBridge.Header);
+        string modeTag = GameManager.gameState == GameState.SinglePlayer ? "SINGLEPLAYER ONLY" : "HOST TEST MODE";
+        GUI.Label(new Rect(22f, y + 8f, innerW - 20f, 22f), $"{modeTag}   |   FUNDS {fundsLabel}   |   TIER {tier}", NativeThemeBridge.Header);
         y += 46f;
 
         // Section 1: FUNDS

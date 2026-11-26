@@ -75,10 +75,11 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
             return;
         }
 
-        float now = Time.unscaledTime;
-        if (now >= nextAirdropRetryAt && MdsBridgeBootstrap.EnsureAirdropMountsInjectedAction != null && Encyclopedia.i != null)
+        float now = Time.time;
+        float unscaledNow = Time.unscaledTime;
+        if (unscaledNow >= nextAirdropRetryAt && MdsBridgeBootstrap.EnsureAirdropMountsInjectedAction != null && Encyclopedia.i != null)
         {
-            nextAirdropRetryAt = now + 2.0f;
+            nextAirdropRetryAt = unscaledNow + 2.0f;
             MdsBridgeBootstrap.EnsureAirdropMountsInjectedAction();
         }
 
@@ -341,7 +342,6 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
         };
         jobs.Add(job);
 
-        GroundControlReflection.SetUnitHoldPosition(hauler, true);
         GlobalPosition pickupPt = ComputeApproachPoint(hauler, container);
         IssueHaulerDestination(hauler, pickupPt);
         SetFeedback($"{GroundControlReflection.GetUnitLabel(hauler)} dispatched to load container.");
@@ -350,6 +350,7 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
 
     private void BeginLoadingOntoBed(HaulJob job, float now)
     {
+        GroundControlReflection.SetUnitHoldPosition(job.Hauler, true);
         IssueHaulerDestination(job.Hauler, job.Hauler.GlobalPosition());
 
         GlobalPosition groundAtContainer = GroundControlReflection.SnapToTerrain(job.Container.GlobalPosition());

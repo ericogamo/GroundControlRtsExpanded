@@ -51,6 +51,7 @@ public sealed class AddonPlugin : BaseUnityPlugin
         RuntimeController.Register(WreckCleanupService.Instance);
         RuntimeController.Register(DynamicCapAndTechService.Instance);
         RuntimeController.Register(RtsCityUiService.Instance);
+        RuntimeController.Register(EconomyTrackerUiService.Instance);
         RuntimeController.Register(PioneerRoadService.Instance);
         AbmDefenseService.Instance.BindMdsBridge();
         RuntimeController.Register(AbmDefenseService.Instance);

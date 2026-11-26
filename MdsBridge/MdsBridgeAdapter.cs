@@ -102,6 +102,8 @@ internal static class MdsBridgeAdapter
         MdsBridgeBootstrap.TickAiMdsDeploymentAction = aiThreats.TickAiDeployment;
         MdsBridgeBootstrap.IsUnitBuildingMdsSite = logistics.IsBuilderAssignedToAnyOrder;
         MdsBridgeBootstrap.CollectFriendlyMdsEwPositions = aiThreats.CollectActiveFriendlyMdsEwPositions;
+        MdsBridgeBootstrap.GetHostileMdsCompensation = aiThreats.GetHostileMdsCompensationForHq;
+        MdsBridgeBootstrap.CountKnownHostileMdsSites = aiThreats.CountKnownHostileSitesForHq;
         MdsBridgeBootstrap.RaiseBallisticThreatAction = abmStockpile.RaiseBallisticThreat;
 
         MdsBridgeBootstrap.EnsureAirdropMountsInjectedAction = uiTransport.EnsureAirdropMountsInjected;
@@ -961,6 +963,7 @@ internal static class MdsBridgeAdapter
             abmStockpile?.ResetSession();
             aiThreats?.ResetSession();
             uiTransport?.ResetSession();
+            activeDeliveryHq = null;
             nextOrderId = 1;
             nextTickAt = 0f;
         }
@@ -1657,6 +1660,8 @@ internal static class MdsBridgeAdapter
             internal WeaponCascadeRole Role;
             internal GlobalPosition Pos;
             internal bool RadarActive;
+            internal float LastRadarActiveAt = -100f;
+            internal Unit? BoundUnit;
         }
 
         private const float AiMdsCooldownSeconds = 45f;
@@ -1702,10 +1707,12 @@ internal static class MdsBridgeAdapter
                 return;
             }
 
+            Unit? boundUnit = TryResolveSiteUnitFromWorld(worldPos, faction, out FactionHQ? worldHq);
             FactionHQ? resolvedHq = activeDeliveryHq
-                ?? TryResolveSiteOwnerHqFromWorld(worldPos, faction)
+                ?? worldHq
                 ?? logisticsBridge.FindPendingOrderHqNear(worldPos, faction)
                 ?? ResolveHq(faction);
+            float activeAt = radarActive ? Time.unscaledTime : -100f;
             if (trackedSites.TryGetValue(siteId, out TrackedSite? existing))
             {
                 existing.Faction = faction;
@@ -1714,9 +1721,18 @@ internal static class MdsBridgeAdapter
                     existing.Hq = resolvedHq;
                 }
 
+                if (boundUnit != null)
+                {
+                    existing.BoundUnit = boundUnit;
+                }
+
                 existing.Role = role;
                 existing.Pos = worldPos.ToGlobalPosition();
                 existing.RadarActive = radarActive;
+                if (radarActive)
+                {
+                    existing.LastRadarActiveAt = activeAt;
+                }
                 return;
             }
 
@@ -1728,14 +1744,17 @@ internal static class MdsBridgeAdapter
                 Role = role,
                 Pos = worldPos.ToGlobalPosition(),
                 RadarActive = radarActive,
+                LastRadarActiveAt = activeAt,
+                BoundUnit = boundUnit,
             };
         }
 
-        private static FactionHQ? TryResolveSiteOwnerHqFromWorld(Vector3 worldPos, FactionAffinity faction)
+        private static Unit? TryResolveSiteUnitFromWorld(Vector3 worldPos, FactionAffinity faction, out FactionHQ? bestHq)
         {
             GlobalPosition target = worldPos.ToGlobalPosition();
             float bestSq = 55f * 55f;
-            FactionHQ? bestHq = null;
+            Unit? bestUnit = null;
+            bestHq = null;
             for (int i = 0; i < UnitRegistry.allUnits.Count; i++)
             {
                 Unit? u = UnitRegistry.allUnits[i];
@@ -1753,11 +1772,12 @@ internal static class MdsBridgeAdapter
                 if (dSq < bestSq)
                 {
                     bestSq = dSq;
+                    bestUnit = u;
                     bestHq = u.NetworkHQ;
                 }
             }
 
-            return bestHq;
+            return bestUnit;
         }
 
         public void ReportSiteDestroyed(string siteId)
@@ -1849,6 +1869,76 @@ internal static class MdsBridgeAdapter
             return false;
         }
 
+        internal int GetHostileMdsCompensationForHq(FactionHQ aiHq)
+        {
+            if (aiHq == null)
+            {
+                return 0;
+            }
+
+            FactionAffinity aiAffinity = ToAffinity(aiHq);
+            bool hasAllowedPackage = false;
+            foreach (ContractorPackage pkg in ContractorRegistry.GetPackages())
+            {
+                if (pkg != null && ecoBridge.IsPackageAllowedForFaction(pkg, aiAffinity))
+                {
+                    hasAllowedPackage = true;
+                    break;
+                }
+            }
+
+            if (hasAllowedPackage)
+            {
+                return 0;
+            }
+
+            int hostileSites = 0;
+            foreach (TrackedSite site in trackedSites.Values)
+            {
+                bool hostile = site.Hq != null
+                    ? !ReferenceEquals(site.Hq, aiHq)
+                    : (site.Faction != FactionAffinity.Any && site.Faction != aiAffinity);
+                if (hostile)
+                {
+                    hostileSites++;
+                }
+            }
+
+            return hostileSites;
+        }
+
+        internal int CountKnownHostileSitesForHq(FactionHQ aiHq)
+        {
+            if (aiHq == null || aiHq.trackingDatabase == null || trackedSites.Count == 0)
+            {
+                return 0;
+            }
+
+            FactionAffinity aiAffinity = ToAffinity(aiHq);
+            float levelTime = Time.timeSinceLevelLoad;
+            int count = 0;
+            foreach (KeyValuePair<PersistentID, TrackingInfo> kv in aiHq.trackingDatabase)
+            {
+                TrackingInfo? info = kv.Value;
+                if (info == null
+                    || !info.TryGetUnit(out Unit unit)
+                    || unit == null
+                    || unit.disabled
+                    || ReferenceEquals(unit.NetworkHQ, aiHq)
+                    || levelTime - info.lastSpottedTime > 120f)
+                {
+                    continue;
+                }
+
+                if (TryMatchHostileSite(aiHq, aiAffinity, unit, info.GetPosition(), requireActiveOrGrace: false, out _))
+                {
+                    count++;
+                }
+            }
+
+            return count;
+        }
+
         internal bool HasEmittingHostileSite(FactionHQ aiHq)
         {
             if (aiHq == null || aiHq.trackingDatabase == null)
@@ -1871,7 +1961,7 @@ internal static class MdsBridgeAdapter
                     continue;
                 }
 
-                if (TryMatchEmittingHostileSite(aiHq, aiAffinity, info.GetPosition(), out _))
+                if (TryMatchHostileSite(aiHq, aiAffinity, unit, info.GetPosition(), requireActiveOrGrace: true, out _))
                 {
                     return true;
                 }
@@ -1907,7 +1997,7 @@ internal static class MdsBridgeAdapter
                 }
 
                 GlobalPosition detectedPos = info.GetPosition();
-                if (!TryMatchEmittingHostileSite(aiHq, aiAffinity, detectedPos, out TrackedSite? matchedSite)
+                if (!TryMatchHostileSite(aiHq, aiAffinity, unit, detectedPos, requireActiveOrGrace: true, out TrackedSite? matchedSite)
                     || matchedSite == null)
                 {
                     continue;
@@ -1928,22 +2018,36 @@ internal static class MdsBridgeAdapter
             return bestUnit != null ? (bestUnit, bestPos) : (null, default);
         }
 
-        private bool TryMatchEmittingHostileSite(
+        private bool TryMatchHostileSite(
             FactionHQ aiHq,
             FactionAffinity aiAffinity,
+            Unit? detectedUnit,
             GlobalPosition detectedPos,
+            bool requireActiveOrGrace,
             out TrackedSite? matched)
         {
             matched = null;
             float bestSq = 55f * 55f;
+            float now = Time.unscaledTime;
             foreach (TrackedSite site in trackedSites.Values)
             {
                 bool hostile = site.Hq != null
                     ? !ReferenceEquals(site.Hq, aiHq)
                     : (site.Faction != FactionAffinity.Any && site.Faction != aiAffinity);
-                if (!hostile || !site.RadarActive)
+                if (!hostile)
                 {
                     continue;
+                }
+
+                if (requireActiveOrGrace && !site.RadarActive && (site.LastRadarActiveAt < 0f || now - site.LastRadarActiveAt > 15f))
+                {
+                    continue;
+                }
+
+                if (detectedUnit != null && ReferenceEquals(site.BoundUnit, detectedUnit))
+                {
+                    matched = site;
+                    return true;
                 }
 
                 float dSq = FastMath.SquareDistance(detectedPos, site.Pos);
@@ -1976,7 +2080,15 @@ internal static class MdsBridgeAdapter
             nextAiDeployAt[aiHq] = now + AiMdsCooldownSeconds;
 
             object? eco = GroundControlReflection.GetEcoInstance();
-            if (AiStrategicDirectorService.Instance.EvaluatePhase(eco, aiHq) == AiStrategicPhase.EmergencyReconstruction)
+            AiStrategicPhase phase = AiStrategicDirectorService.Instance.EvaluatePhase(eco, aiHq);
+            if (phase == AiStrategicPhase.OpeningEconomy || phase == AiStrategicPhase.EmergencyReconstruction)
+            {
+                return;
+            }
+
+            float buildReserve = GroundControlReflection.GetEnemyBuildReserve(aiHq, out bool resGoldMine, out _);
+            if (resGoldMine
+                || (eco != null && GroundControlReflection.CountGoldMines(eco, aiHq) == 0 && GroundControlReflection.GetHqIncomePerMinute(eco, aiHq) >= 150f))
             {
                 return;
             }
@@ -1990,7 +2102,7 @@ internal static class MdsBridgeAdapter
             FactionAffinity aiAffinity = ToAffinity(aiHq);
             int techTier = ecoBridge.QueryFactionTechTier(aiHq);
 
-            ModularUnitSpec? chosen = PickAiModularSpec(aiHq, aiAffinity, techTier, liveAndQueued);
+            ModularUnitSpec? chosen = PickAiModularSpec(aiHq, aiAffinity, techTier, liveAndQueued, buildReserve);
             if (chosen == null)
             {
                 return;
@@ -2043,7 +2155,7 @@ internal static class MdsBridgeAdapter
             return count;
         }
 
-        private ModularUnitSpec? PickAiModularSpec(FactionHQ aiHq, FactionAffinity aiAffinity, int techTier, int totalSites)
+        private ModularUnitSpec? PickAiModularSpec(FactionHQ aiHq, FactionAffinity aiAffinity, int techTier, int totalSites, float protectedReserve = 0f)
         {
             int fcuCount = CountRoleOwnedAndPending(aiHq, aiAffinity, WeaponCascadeRole.FireControl);
             int ewCount = CountRoleOwnedAndPending(aiHq, aiAffinity, WeaponCascadeRole.EarlyWarningRadar);
@@ -2138,7 +2250,7 @@ internal static class MdsBridgeAdapter
                             continue;
                         }
 
-                        if (aiHq.factionFunds < spec.Logistics.CreditCost * 1.4f)
+                        if (aiHq.factionFunds < spec.Logistics.CreditCost * 1.4f + protectedReserve * 0.5f)
                         {
                             continue;
                         }

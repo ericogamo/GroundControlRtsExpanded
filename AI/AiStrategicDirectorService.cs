@@ -145,7 +145,7 @@ internal sealed class AiStrategicDirectorService : IAddonResetSession
                 float age = levelTime - info.lastSpottedTime;
                 if (unit is Aircraft)
                 {
-                    if (age <= 45f)
+                    if (age <= 90f)
                     {
                         aircraft++;
                     }
@@ -199,6 +199,11 @@ internal sealed class AiStrategicDirectorService : IAddonResetSession
             samRadars = 1;
         }
 
+        if (MdsBridgeBootstrap.CountKnownHostileMdsSites != null)
+        {
+            samRadars = Mathf.Max(samRadars, MdsBridgeBootstrap.CountKnownHostileMdsSites(aiHq));
+        }
+
         var snapshot = new PlayerThreatSnapshot(aircraft, heavyArmor, ships, artillery, samRadars);
         state.ThreatSnapshot = snapshot;
         state.ThreatCachedAt = now;
@@ -209,18 +214,21 @@ internal sealed class AiStrategicDirectorService : IAddonResetSession
     {
         int safeBases = Mathf.Max(1, bases);
         int bestDepot = GroundControlReflection.GetBestDepotLevel(hq);
+        int mdsComp = hq != null && MdsBridgeBootstrap.GetHostileMdsCompensation != null
+            ? Mathf.Clamp(MdsBridgeBootstrap.GetHostileMdsCompensation(hq), 0, 6)
+            : 0;
         if (bestDepot < 2)
         {
-            return Mathf.Clamp(2 + safeBases / 2, 2, 5);
+            return Mathf.Clamp(2 + safeBases / 2 + Mathf.Min(2, mdsComp), 2, 7);
         }
 
         PlayerThreatSnapshot threat = ReadPlayerThreat(hq);
         if (bestDepot == 2)
         {
-            return Mathf.Clamp(3 + 2 * safeBases + Mathf.Min(4, threat.Aircraft / 2), 5, 18);
+            return Mathf.Clamp(3 + 2 * safeBases + Mathf.Min(4, threat.Aircraft / 2) + mdsComp, 5, 22);
         }
 
-        return Mathf.Clamp(5 + 3 * safeBases + Mathf.Min(8, threat.Aircraft / 2), 8, 30);
+        return Mathf.Clamp(5 + 3 * safeBases + Mathf.Min(8, threat.Aircraft / 2) + mdsComp, 8, 34);
     }
 
     internal bool ShouldSuppressOpeningDepotSpam(object? ecoInstance, FactionHQ? hq)
@@ -248,12 +256,13 @@ internal sealed class AiStrategicDirectorService : IAddonResetSession
             if (kind == RtsBuildingKind.CommandHq
                 && !isUpgrade
                 && snap.CommandHqCount == 0
-                && ((enemyGross >= 75f && totalMines >= 2) || enemyGross >= 125f))
+                && ((enemyGross >= 75f && totalMines >= 2) || enemyGross >= 100f))
             {
-                return hq.factionFunds >= cost + 120f;
+                return hq.factionFunds >= cost + 60f;
             }
 
-            if (kind == RtsBuildingKind.Barracks && !isUpgrade && snap.BarracksCount == 0 && isUrgentCapRelief)
+            if ((kind == RtsBuildingKind.Barracks && !isUpgrade && snap.BarracksCount == 0 && isUrgentCapRelief)
+                || (kind == RtsBuildingKind.PilotAcademy && !isUpgrade && snap.PilotAcademyCount == 0 && isUrgentCapRelief))
             {
                 return hq.factionFunds >= cost + 60f;
             }
@@ -263,7 +272,7 @@ internal sealed class AiStrategicDirectorService : IAddonResetSession
 
         if (phase == AiStrategicPhase.EmergencyReconstruction)
         {
-            bool isLuxury = (kind == RtsBuildingKind.CommandHq && isUpgrade)
+            bool isLuxury = (kind == RtsBuildingKind.CommandHq && isUpgrade && snap.CommandHqLevel >= 2)
                 || kind == RtsBuildingKind.AbmPlant
                 || kind == RtsBuildingKind.AbmRadar
                 || kind == RtsBuildingKind.AbmSilo
@@ -282,9 +291,18 @@ internal sealed class AiStrategicDirectorService : IAddonResetSession
         float mineFund = GroundControlReflection.GetStateFloat(cmdState, GroundControlReflection.StateMineFundProp);
         float protectedReserve = Mathf.Max(buildReserve, mineFund);
 
-        if (resGoldMine || resIncome || protectedReserve >= 250f)
+        bool isCoreCommandHq = kind == RtsBuildingKind.CommandHq
+            && ((!isUpgrade && snap.CommandHqCount == 0) || (isUpgrade && snap.CommandHqLevel == 1));
+        if (isCoreCommandHq && (!resGoldMine || enemyGross >= 150f))
         {
-            float reserveShare = isUrgentCapRelief ? 0.35f : 0.90f;
+            if (hq.factionFunds < cost + protectedReserve * 0.15f)
+            {
+                return false;
+            }
+        }
+        else if (resGoldMine || resIncome || protectedReserve >= 250f)
+        {
+            float reserveShare = isUrgentCapRelief ? 0.15f : 0.90f;
             if (hq.factionFunds < cost + protectedReserve * reserveShare)
             {
                 return false;

@@ -58,16 +58,22 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
     private readonly Dictionary<Unit, float> artilleryCooldownUntil = new();
     private readonly Dictionary<Unit, float> artilleryScootUntil = new();
     private readonly Dictionary<Unit, GlobalPosition> artilleryScootDestinations = new();
+    private readonly Dictionary<Unit, GlobalPosition> managedExpectedDestinations = new();
+    private readonly Dictionary<Aircraft, (GlobalPosition AlertPos, float NextRetargetAt)> qrfAirRetargets = new();
     private readonly Dictionary<FactionHQ, ReconRefreshState> reconStates = new();
 
     private readonly List<Unit> pruneScratch = new(32);
     private readonly List<FactionHQ> pruneFactionScratch = new(8);
     private readonly List<RtsBuildingRecord> buildingScratch = new(16);
     private readonly List<GlobalPosition> repairDepotPosScratch = new(16);
+    private readonly List<float> repairDepotPenaltyScratch = new(16);
     private readonly List<Unit> repairJackknifeScratch = new(8);
+    private readonly List<float> repairJackknifePenaltyScratch = new(8);
     private readonly List<Unit> combatUnitScratch = new(64);
     private readonly List<(Unit Unit, float DistSq)> qrfCandidateScratch = new(32);
     private readonly List<Unit> batteryKeyScratch = new(16);
+    private readonly List<Aircraft> pruneAirScratch = new(16);
+    private readonly Dictionary<VehicleDefinition, (bool IsBuilder, bool IsSupply, bool IsSamLauncher, bool IsStaticEmplacement)> vdefRoleCache = new();
 
     private float nextTickAt;
 
@@ -84,17 +90,52 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         artilleryCooldownUntil.Clear();
         artilleryScootUntil.Clear();
         artilleryScootDestinations.Clear();
+        managedExpectedDestinations.Clear();
+        qrfAirRetargets.Clear();
         reconStates.Clear();
         pruneScratch.Clear();
         pruneFactionScratch.Clear();
         buildingScratch.Clear();
         repairDepotPosScratch.Clear();
+        repairDepotPenaltyScratch.Clear();
         repairJackknifeScratch.Clear();
+        repairJackknifePenaltyScratch.Clear();
         combatUnitScratch.Clear();
         qrfCandidateScratch.Clear();
         batteryKeyScratch.Clear();
+        pruneAirScratch.Clear();
+        vdefRoleCache.Clear();
         IsIssuingManagedOrder = false;
         nextTickAt = 0f;
+    }
+
+    internal bool IsManagedExpectedDestination(Unit? unit, GlobalPosition spot)
+    {
+        if (unit == null || !managedExpectedDestinations.TryGetValue(unit, out GlobalPosition expected))
+        {
+            return false;
+        }
+
+        return FastMath.InRange(expected, spot, 8f);
+    }
+
+    internal bool ShouldRetargetAirForQrf(Aircraft ac, GlobalPosition alertPos)
+    {
+        if (ac == null)
+        {
+            return false;
+        }
+
+        float now = Time.time;
+        if (qrfAirRetargets.TryGetValue(ac, out var prev)
+            && now < prev.NextRetargetAt
+            && FastMath.InRange(prev.AlertPos, alertPos, 2000f))
+        {
+            return false;
+        }
+
+        qrfAirRetargets[ac] = (alertPos, now + 15f);
+        return true;
     }
 
     internal bool IsUnitManaged(Unit? unit)
@@ -235,6 +276,39 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         }
 
         pruneScratch.Clear();
+        foreach (Unit u in managedExpectedDestinations.Keys)
+        {
+            if (u == null || u.disabled)
+            {
+                pruneScratch.Add(u!);
+            }
+        }
+
+        for (int i = 0; i < pruneScratch.Count; i++)
+        {
+            managedExpectedDestinations.Remove(pruneScratch[i]);
+        }
+
+        pruneScratch.Clear();
+
+        if (qrfAirRetargets.Count > 0)
+        {
+            pruneAirScratch.Clear();
+            foreach (KeyValuePair<Aircraft, (GlobalPosition AlertPos, float NextRetargetAt)> kv in qrfAirRetargets)
+            {
+                if (kv.Key == null || kv.Key.disabled || now >= kv.Value.NextRetargetAt)
+                {
+                    pruneAirScratch.Add(kv.Key!);
+                }
+            }
+
+            for (int i = 0; i < pruneAirScratch.Count; i++)
+            {
+                qrfAirRetargets.Remove(pruneAirScratch[i]);
+            }
+
+            pruneAirScratch.Clear();
+        }
 
         if (qrfByFaction.Count > 0)
         {
@@ -352,11 +426,21 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
                 continue;
             }
 
+            if (!vdefRoleCache.TryGetValue(vdef, out var roles))
+            {
+                roles = (
+                    GroundControlReflection.IsBuilderVehicle(vdef),
+                    GroundControlReflection.IsSupplyVehicle(vdef),
+                    GroundControlReflection.EnemyIsSamSiteLauncher(vdef),
+                    IsStaticEmplacementVehicle(vdef));
+                vdefRoleCache[vdef] = roles;
+            }
+
             if (vdef.value < 25f
-                || GroundControlReflection.IsBuilderVehicle(vdef)
-                || GroundControlReflection.IsSupplyVehicle(vdef)
-                || GroundControlReflection.EnemyIsSamSiteLauncher(vdef)
-                || IsStaticEmplacementVehicle(vdef))
+                || roles.IsBuilder
+                || roles.IsSupply
+                || roles.IsSamLauncher
+                || roles.IsStaticEmplacement)
             {
                 continue;
             }
@@ -367,6 +451,20 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         if (combatUnitScratch.Count == 0 || (repairDepotPosScratch.Count == 0 && repairJackknifeScratch.Count == 0))
         {
             return;
+        }
+
+        // Precompute threat penalty once per repair spot per tick (avoids O(U * S * C) trackingDatabase scans).
+        repairDepotPenaltyScratch.Clear();
+        for (int i = 0; i < repairDepotPosScratch.Count; i++)
+        {
+            repairDepotPenaltyScratch.Add(ComputeRepairSpotThreatPenalty(hq, repairDepotPosScratch[i]));
+        }
+
+        repairJackknifePenaltyScratch.Clear();
+        for (int i = 0; i < repairJackknifeScratch.Count; i++)
+        {
+            Unit jk = repairJackknifeScratch[i];
+            repairJackknifePenaltyScratch.Add(jk != null && !jk.disabled ? ComputeRepairSpotThreatPenalty(hq, jk.GlobalPosition()) : float.MaxValue);
         }
 
         int currentRetreating = 0;
@@ -403,17 +501,12 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
             }
 
             GlobalPosition unitPos = unit.GlobalPosition();
-            if (IsFinishingBaseCapture(hq, unitPos))
+            if (IsFinishingBaseCapture(hq, unitPos) || IsWithin90mOfAnyRepairSpot(unitPos))
             {
                 continue;
             }
 
-            if (!TryFindNearestRepairSpot(hq, unitPos, out GlobalPosition repairSpot))
-            {
-                continue;
-            }
-
-            if (FastMath.InRange(unitPos, repairSpot, 90f))
+            if (!TryFindNearestRepairSpot(unitPos, out GlobalPosition repairSpot))
             {
                 continue;
             }
@@ -436,7 +529,29 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         }
     }
 
-    private bool TryFindNearestRepairSpot(FactionHQ hq, GlobalPosition fromPos, out GlobalPosition spot)
+    private bool IsWithin90mOfAnyRepairSpot(GlobalPosition fromPos)
+    {
+        for (int i = 0; i < repairDepotPosScratch.Count; i++)
+        {
+            if (FastMath.InRange(fromPos, repairDepotPosScratch[i], 90f))
+            {
+                return true;
+            }
+        }
+
+        for (int i = 0; i < repairJackknifeScratch.Count; i++)
+        {
+            Unit jk = repairJackknifeScratch[i];
+            if (jk != null && !jk.disabled && FastMath.InRange(fromPos, jk.GlobalPosition(), 90f))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryFindNearestRepairSpot(GlobalPosition fromPos, out GlobalPosition spot)
     {
         spot = default;
         float bestEffectiveDist = float.MaxValue;
@@ -445,18 +560,16 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         for (int i = 0; i < repairDepotPosScratch.Count; i++)
         {
             GlobalPosition candidate = repairDepotPosScratch[i];
-            if (!GroundControlReflection.CanDriveBetween(fromPos, candidate))
+            float penalty = i < repairDepotPenaltyScratch.Count ? repairDepotPenaltyScratch[i] : 0f;
+            float lowerBound = FastMath.Distance(fromPos, candidate) + penalty;
+            if (lowerBound >= bestEffectiveDist || !GroundControlReflection.CanDriveBetween(fromPos, candidate))
             {
                 continue;
             }
 
-            float scoreDist = FastMath.Distance(fromPos, candidate) + ComputeRepairSpotThreatPenalty(hq, candidate);
-            if (scoreDist < bestEffectiveDist)
-            {
-                bestEffectiveDist = scoreDist;
-                spot = candidate;
-                found = true;
-            }
+            bestEffectiveDist = lowerBound;
+            spot = candidate;
+            found = true;
         }
 
         for (int i = 0; i < repairJackknifeScratch.Count; i++)
@@ -468,18 +581,16 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
             }
 
             GlobalPosition candidate = jackknife.GlobalPosition();
-            if (!GroundControlReflection.CanDriveBetween(fromPos, candidate))
+            float penalty = i < repairJackknifePenaltyScratch.Count ? repairJackknifePenaltyScratch[i] : 0f;
+            float lowerBound = FastMath.Distance(fromPos, candidate) + penalty;
+            if (lowerBound >= bestEffectiveDist || !GroundControlReflection.CanDriveBetween(fromPos, candidate))
             {
                 continue;
             }
 
-            float scoreDist = FastMath.Distance(fromPos, candidate) + ComputeRepairSpotThreatPenalty(hq, candidate);
-            if (scoreDist < bestEffectiveDist)
-            {
-                bestEffectiveDist = scoreDist;
-                spot = candidate;
-                found = true;
-            }
+            bestEffectiveDist = lowerBound;
+            spot = candidate;
+            found = true;
         }
 
         if (found)
@@ -783,16 +894,22 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
             return;
         }
 
-        // Air raids do not pull ground tanks or close-air gunships onto a moving air threat;
-        // air guard interceptors handle aerial threats via TaskAirWingSeadHoldPatch.
-        if (attacker is Aircraft)
+        bool isAirRaid = attacker is Aircraft;
+        bool shoradOnly = false;
+        if (isAirRaid)
         {
-            if (qrfState.Active)
+            // Only mobilize 1 nearby mobile SHORAD/SPAAG if an air raid hits an unprotected rear site (no friendly AD within 2.5 km).
+            if (HasFriendlyAirDefenceNear(hq, alertPos, 2500f))
             {
-                ReleaseQrfForFaction(hq, qrfState);
+                if (qrfState.Active)
+                {
+                    ReleaseQrfForFaction(hq, qrfState);
+                }
+
+                return;
             }
 
-            return;
+            shoradOnly = true;
         }
 
         bool hostileNearAlert = HasTrackedHostileNear(hq, alertPos, 3000f);
@@ -835,7 +952,9 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
             }
         }
 
-        if (currentQrfCount < QrfMaxGroundUnits && hq.factionUnits != null)
+        int maxQrfCount = shoradOnly ? 1 : (int)QrfMaxGroundUnits;
+        float maxSearchRadius = shoradOnly ? 5000f : QrfSearchRadiusMeters;
+        if (currentQrfCount < maxQrfCount && hq.factionUnits != null)
         {
             qrfCandidateScratch.Clear();
             IDictionary? drives = captureService != null ? GroundControlReflection.CaptureDrivesField?.GetValue(captureService) as IDictionary : null;
@@ -852,8 +971,22 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
                     continue;
                 }
 
-                if (unit.definition is not VehicleDefinition vdef
-                    || !GroundControlReflection.IsCombatVehicle(vdef)
+                if (unit.definition is not VehicleDefinition vdef)
+                {
+                    continue;
+                }
+
+                if (shoradOnly)
+                {
+                    bool isMobileShorad = (vdef.vehicleType == VehicleType.AAA || vdef.vehicleType == VehicleType.IR_SAM || vdef.vehicleType == VehicleType.R_SAM)
+                        && !GroundControlReflection.EnemyIsSamSiteLauncher(vdef)
+                        && !IsStaticEmplacementVehicle(vdef);
+                    if (!isMobileShorad)
+                    {
+                        continue;
+                    }
+                }
+                else if (!GroundControlReflection.IsCombatVehicle(vdef)
                     || GroundControlReflection.IsAirDefence(vdef)
                     || vdef.vehicleType == VehicleType.ART
                     || GroundControlReflection.IsBuilderVehicle(vdef)
@@ -869,7 +1002,7 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
                 }
 
                 GlobalPosition uPos = unit.GlobalPosition();
-                if (!FastMath.InRange(uPos, alertPos, QrfSearchRadiusMeters))
+                if (!FastMath.InRange(uPos, alertPos, maxSearchRadius))
                 {
                     continue;
                 }
@@ -885,7 +1018,7 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
             qrfCandidateScratch.Sort((a, b) => a.DistSq.CompareTo(b.DistSq));
             IDictionary? defenders = cmdState != null ? GroundControlReflection.StateDefendersProp?.GetValue(cmdState) as IDictionary : null;
 
-            for (int i = 0; i < qrfCandidateScratch.Count && currentQrfCount < QrfMaxGroundUnits; i++)
+            for (int i = 0; i < qrfCandidateScratch.Count && currentQrfCount < maxQrfCount; i++)
             {
                 Unit responder = qrfCandidateScratch[i].Unit;
                 RemoveUnitFromDrives(drives, responder, keepIfLaunched: true);
@@ -899,7 +1032,7 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         }
 
         // Also divert free AI gunship/escort helicopters onto rear surface threat
-        if (hq.factionUnits != null)
+        if (!shoradOnly && hq.factionUnits != null)
         {
             foreach (PersistentID pid in hq.factionUnits)
             {
@@ -910,7 +1043,8 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
 
                 if (!GroundControlReflection.AirHasRotaryPilot(ac)
                     || IsCargoConfigured(ac)
-                    || !CanSafelyDivertToRearQrf(ac))
+                    || !CanSafelyDivertToRearQrf(ac)
+                    || !ShouldRetargetAirForQrf(ac, alertPos))
                 {
                     continue;
                 }
@@ -922,6 +1056,31 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
                 GroundControlReflection.AirRetargetAiMission(ac, 1, alertPos, 4500f);
             }
         }
+    }
+
+    private static bool HasFriendlyAirDefenceNear(FactionHQ hq, GlobalPosition center, float radiusMeters)
+    {
+        if (hq.factionUnits == null)
+        {
+            return false;
+        }
+
+        foreach (PersistentID pid in hq.factionUnits)
+        {
+            if (!pid.TryGetUnit(out Unit unit) || unit == null || unit.disabled)
+            {
+                continue;
+            }
+
+            bool isAd = (unit is GroundVehicle && unit.definition is VehicleDefinition vd && GroundControlReflection.IsAirDefence(vd))
+                || (unit is Building && unit.definition != null && unit.definition.roleIdentity.antiAir > 0f);
+            if (isAd && FastMath.InRange(unit.GlobalPosition(), center, radiusMeters))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     internal static bool CanSafelyDivertToRearQrf(Aircraft aircraft)
@@ -1153,8 +1312,13 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         return false;
     }
 
-    private static void IssueManagedPin(Unit unit, GlobalPosition spot)
+    private void IssueManagedPin(Unit unit, GlobalPosition spot)
     {
+        if (unit != null)
+        {
+            managedExpectedDestinations[unit] = spot;
+        }
+
         bool prev = IsIssuingManagedOrder;
         IsIssuingManagedOrder = true;
         try
@@ -1167,8 +1331,13 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         }
     }
 
-    private static void IssueManagedHold(Unit unit, GlobalPosition spot)
+    private void IssueManagedHold(Unit unit, GlobalPosition spot)
     {
+        if (unit != null)
+        {
+            managedExpectedDestinations[unit] = spot;
+        }
+
         bool prev = IsIssuingManagedOrder;
         IsIssuingManagedOrder = true;
         try
@@ -1181,8 +1350,13 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         }
     }
 
-    private static void IssueManagedRelease(Unit unit)
+    private void IssueManagedRelease(Unit unit)
     {
+        if (unit != null)
+        {
+            managedExpectedDestinations.Remove(unit);
+        }
+
         bool prev = IsIssuingManagedOrder;
         IsIssuingManagedOrder = true;
         try

@@ -27,6 +27,7 @@ internal sealed class AiTacticalDoctrineService : IAddonResetSession
 
     private readonly Dictionary<FactionHQ, (float CachedAt, int Count)> radarCountCache = new();
     private readonly Dictionary<FactionHQ, float> seadHoldStartedAt = new();
+    private readonly Dictionary<FactionHQ, float> seadHoldCooldownUntil = new();
     private readonly Dictionary<FactionHQ, int> savedWaveGoalDuringSead = new();
     private readonly Dictionary<(FactionHQ Hq, Airbase Staging, int Slot), PushTracker> pushTrackers = new();
     private readonly Dictionary<(FactionHQ Hq, Airbase Target), float> targetStalledUntil = new();
@@ -50,6 +51,7 @@ internal sealed class AiTacticalDoctrineService : IAddonResetSession
     {
         radarCountCache.Clear();
         seadHoldStartedAt.Clear();
+        seadHoldCooldownUntil.Clear();
         savedWaveGoalDuringSead.Clear();
         pushTrackers.Clear();
         targetStalledUntil.Clear();
@@ -184,7 +186,7 @@ internal sealed class AiTacticalDoctrineService : IAddonResetSession
         float now = Time.time;
         if (!seadHoldStartedAt.TryGetValue(aiHq, out float startedAt))
         {
-            if (waveCurrentlyOut)
+            if (waveCurrentlyOut || (seadHoldCooldownUntil.TryGetValue(aiHq, out float readyAt) && now < readyAt))
             {
                 return false;
             }
@@ -199,8 +201,9 @@ internal sealed class AiTacticalDoctrineService : IAddonResetSession
 
         if (now - startedAt >= MaxSeadHoldSeconds)
         {
-            // Stop waiting after SEAD window expires so strikes are never deadlocked indefinitely.
+            // Stop waiting after SEAD window expires and enforce a 90s cooldown so holds cannot loop endlessly.
             seadHoldStartedAt.Remove(aiHq);
+            seadHoldCooldownUntil[aiHq] = now + 90f;
             releaseSavedGoal = true;
             return false;
         }
@@ -354,7 +357,8 @@ internal sealed class AiTacticalDoctrineService : IAddonResetSession
             }
 
             float ownerGrip = GroundControlReflection.GetOwnerGrip(target);
-            if (tracker.LossTimestamps.Count >= StallLossThreshold && ownerGrip >= 0.85f)
+            if ((tracker.LossTimestamps.Count >= StallLossThreshold && ownerGrip >= 0.85f)
+                || tracker.LossTimestamps.Count >= StallLossThreshold + 2)
             {
                 var targetKey = (hq, target);
                 if (!targetStalledUntil.TryGetValue(targetKey, out float stalledUntil) || now >= stalledUntil)

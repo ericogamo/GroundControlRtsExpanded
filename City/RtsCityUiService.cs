@@ -111,7 +111,7 @@ internal sealed class RtsCityUiService : IAddonTick, IAddonGui, IAddonResetSessi
     private void DrawTopSubBar(FactionHQ localHq, FactionCapSnapshot snap)
     {
         bool showCheats = SingleplayerCheatService.IsAllowed;
-        float desiredWidth = showCheats ? 790f : 704f;
+        float desiredWidth = showCheats ? 854f : 768f;
         float barW = Mathf.Min(desiredWidth, NativeThemeBridge.UiWidth - 24f);
         subBarRect = new Rect(Mathf.Round((NativeThemeBridge.UiWidth - barW) * 0.5f), 42f, barW, SubBarHeight);
         subBarVisible = true;
@@ -123,7 +123,7 @@ internal sealed class RtsCityUiService : IAddonTick, IAddonGui, IAddonResetSessi
         float y = subBarRect.y + 3f;
         float btnH = 22f;
 
-        float btnAreaW = showCheats ? 314f : 234f;
+        float btnAreaW = showCheats ? 378f : 298f;
         float textAreaW = Mathf.Max(140f, barW - btnAreaW - 24f);
         string statusText = AddonConfig.EnableDynamicCaps.Value
             ? $"TECH T{snap.TechTier}   |   GND {snap.GroundUsed}/{snap.GroundCap}   |   AIR {snap.AirUsed}/{snap.AirCap}   |   NAV {snap.NavalUsed}/{snap.NavalCap}"
@@ -156,9 +156,15 @@ internal sealed class RtsCityUiService : IAddonTick, IAddonGui, IAddonResetSessi
             AbmDefenseService.Instance.ToggleWindow();
         }
 
+        bx += 82f;
+        if (GUI.Button(new Rect(bx, y, 60f, btnH), "ECO", EconomyTrackerUiService.Instance.IsWindowVisible ? NativeThemeBridge.SelectedButton : NativeThemeBridge.Button))
+        {
+            EconomyTrackerUiService.Instance.ToggleWindow();
+        }
+
         if (showCheats)
         {
-            bx += 82f;
+            bx += 64f;
             if (GUI.Button(new Rect(bx, y, 76f, btnH), "CHEATS", SingleplayerCheatService.Instance.IsWindowVisible ? NativeThemeBridge.SelectedButton : NativeThemeBridge.Button))
             {
                 SingleplayerCheatService.Instance.ToggleWindow();
@@ -186,7 +192,7 @@ internal sealed class RtsCityUiService : IAddonTick, IAddonGui, IAddonResetSessi
                 new Rect(12f, y, innerW, 92f),
                 "RTS City buildings unlock higher Tech Tiers and expand unit caps. " +
                 "All buildings and pioneer roads are constructed physically by M12 Jackknifes. " +
-                "Hotkeys: Shift+C (City), Shift+R (Roads), Shift+B (ABM).") + 10f;
+                "Hotkeys: Shift+C (City), Shift+R (Roads), Shift+B (ABM), Shift+E (Eco Tracker).") + 10f;
         }
 
         // Top stats + cap bars

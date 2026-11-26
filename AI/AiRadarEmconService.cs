@@ -43,6 +43,8 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
     private readonly List<RadarUnitEntry> entryList = new(64);
     private readonly List<Unit> pruneScratch = new(32);
     private readonly List<GlobalPosition> ewCoverageScratch = new(32);
+    private readonly List<float> ewRangeScratch = new(32);
+    private readonly List<GlobalPosition> hostileAirScratch = new(32);
     private readonly Dictionary<int, float> nextArmSweepByMissileId = new();
     private readonly List<int> staleMissileIdScratch = new(32);
     private readonly Dictionary<WeaponInfo, bool> aradWeaponCache = new();
@@ -60,6 +62,8 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
         entryList.Clear();
         pruneScratch.Clear();
         ewCoverageScratch.Clear();
+        ewRangeScratch.Clear();
+        hostileAirScratch.Clear();
         nextArmSweepByMissileId.Clear();
         staleMissileIdScratch.Clear();
         aradWeaponCache.Clear();
@@ -130,6 +134,7 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
             if (directOwner != null
                 && !directOwner.disabled
                 && !(directOwner is Aircraft)
+                && !(directOwner is Ship)
                 && directOwner.NetworkHQ != null
                 && !ReferenceEquals(directOwner.NetworkHQ, missile.NetworkHQ)
                 && GroundControlReflection.IsAiFaction(directOwner.NetworkHQ, localHq)
@@ -316,10 +321,16 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
             return;
         }
 
+        float range = entry.MaxWeaponRange > 0f ? entry.MaxWeaponRange : entry.MaxRadarRange;
+        if (range > 0f && !HasBackupRadarWithin300m(entry) && HasCloseHostileAirThreat(entry.Hq, entry.Unit.GlobalPosition(), range * 0.55f))
+        {
+            return;
+        }
+
         float blinkSeconds = Mathf.Clamp(AddonConfig.AiRadarBlinkSeconds.Value, 4f, 18f);
         entry.BlinkOffUntil = now + blinkSeconds;
         entry.BlinkCooldownUntil = Mathf.Max(now + BlinkReblinkCooldownSeconds, entry.BlinkOffUntil + 4f);
-        SetUnitRadarsActive(entry, active: false);
+        SetUnitRadarsActive(entry, active: false, clearLocks: true);
 
         // Handoff track continuity to nearest neighbor AI radar within 25 km not under ARAD approach
         GlobalPosition origin = entry.Unit.GlobalPosition();
@@ -451,6 +462,7 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
     private void ProcessFactionEmcon(FactionHQ hq, float now)
     {
         ewCoverageScratch.Clear();
+        ewRangeScratch.Clear();
 
         // Pass 1: Keep non-SAM EW radars online (unless blinking from ARAD) and collect active EW/AWACS coverage
         for (int i = 0; i < entryList.Count; i++)
@@ -468,14 +480,18 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
 
             if (AddonConfig.EnableAiRadarEmcon.Value && now < entry.BlinkOffUntil)
             {
-                SetUnitRadarsActive(entry, active: false);
+                SetUnitRadarsActive(entry, active: false, clearLocks: true);
                 continue;
             }
 
-            SetUnitRadarsActive(entry, active: true);
-            if (HasOperationalActiveRadar(entry.Radars))
+            SetUnitRadarsActive(entry, active: true, clearLocks: false);
+            if (HasOperationalNonJammedActiveRadar(entry.Radars))
             {
                 ewCoverageScratch.Add(entry.Unit.GlobalPosition());
+                float effRange = entry.MaxRadarRange > 0f
+                    ? Mathf.Min(EwCoverageRadiusMeters, entry.MaxRadarRange * 0.85f)
+                    : EwCoverageRadiusMeters;
+                ewRangeScratch.Add(effRange);
             }
         }
 
@@ -490,11 +506,18 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
                     && ac.HasRadarEmission())
                 {
                     ewCoverageScratch.Add(ac.GlobalPosition());
+                    ewRangeScratch.Add(EwCoverageRadiusMeters);
                 }
             }
         }
 
         MdsBridgeBootstrap.CollectFriendlyMdsEwPositions?.Invoke(hq, ewCoverageScratch);
+        while (ewRangeScratch.Count < ewCoverageScratch.Count)
+        {
+            ewRangeScratch.Add(EwCoverageRadiusMeters);
+        }
+
+        CollectHostileAirPositionsOnce(hq);
 
         // Pass 2: Evaluate SAM radars for blink restore, handoff, or Ambush-EMCON
         for (int i = 0; i < entryList.Count; i++)
@@ -507,27 +530,27 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
 
             if (AddonConfig.EnableAiRadarEmcon.Value && now < entry.BlinkOffUntil)
             {
-                SetUnitRadarsActive(entry, active: false);
+                SetUnitRadarsActive(entry, active: false, clearLocks: true);
                 continue;
             }
 
             if (now < entry.ForcedOnUntil)
             {
-                SetUnitRadarsActive(entry, active: true);
+                SetUnitRadarsActive(entry, active: true, clearLocks: false);
                 continue;
             }
 
             if (!AddonConfig.EnableAiAmbushEmcon.Value)
             {
-                SetUnitRadarsActive(entry, active: true);
+                SetUnitRadarsActive(entry, active: true, clearLocks: false);
                 continue;
             }
 
             GlobalPosition samPos = entry.Unit.GlobalPosition();
-            if (!HasEwCoverageNear(samPos, EwCoverageRadiusMeters))
+            if (!HasEwCoverageNear(samPos))
             {
-                // Safety net: never blind SAMs without EW/AWACS coverage within 35 km
-                SetUnitRadarsActive(entry, active: true);
+                // Safety net: never blind SAMs without non-jammed EW/AWACS coverage
+                SetUnitRadarsActive(entry, active: true, clearLocks: false);
                 continue;
             }
 
@@ -537,10 +560,10 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
                 maxRange = 18000f;
             }
 
-            float hotRadius = maxRange * 0.70f;
-            float silentKeepRadius = Mathf.Clamp(maxRange * 0.75f, 11000f, 26000f);
+            float hotRadius = maxRange * 0.95f;
+            float silentKeepRadius = Mathf.Clamp(maxRange * 1.10f, 14000f, 32000f);
 
-            EvaluateAirThreatDistances(hq, samPos, hotRadius, silentKeepRadius, out bool insideHot, out bool insideSilentKeep);
+            EvaluateAirThreatDistances(samPos, hotRadius, silentKeepRadius, out bool insideHot, out bool insideSilentKeep);
 
             bool wantHot;
             if (insideHot)
@@ -557,18 +580,20 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
                 wantHot = false;
             }
 
-            SetUnitRadarsActive(entry, wantHot);
+            SetUnitRadarsActive(entry, wantHot, clearLocks: false);
         }
 
         ewCoverageScratch.Clear();
+        ewRangeScratch.Clear();
+        hostileAirScratch.Clear();
     }
 
-    private bool HasEwCoverageNear(GlobalPosition pos, float radiusMeters)
+    private bool HasEwCoverageNear(GlobalPosition pos)
     {
-        float rSq = radiusMeters * radiusMeters;
         for (int i = 0; i < ewCoverageScratch.Count; i++)
         {
-            if (FastMath.SquareDistance(pos, ewCoverageScratch[i]) <= rSq)
+            float range = i < ewRangeScratch.Count ? ewRangeScratch[i] : EwCoverageRadiusMeters;
+            if (FastMath.SquareDistance(pos, ewCoverageScratch[i]) <= range * range)
             {
                 return true;
             }
@@ -577,26 +602,15 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
         return false;
     }
 
-    private static void EvaluateAirThreatDistances(
-        FactionHQ hq,
-        GlobalPosition samPos,
-        float hotRadius,
-        float silentKeepRadius,
-        out bool insideHot,
-        out bool insideSilentKeep)
+    private void CollectHostileAirPositionsOnce(FactionHQ hq)
     {
-        insideHot = false;
-        insideSilentKeep = false;
-
+        hostileAirScratch.Clear();
         if (hq.trackingDatabase == null)
         {
             return;
         }
 
-        float hotSq = hotRadius * hotRadius;
-        float keepSq = silentKeepRadius * silentKeepRadius;
         float levelNow = Time.timeSinceLevelLoad;
-
         foreach (KeyValuePair<PersistentID, TrackingInfo> kv in hq.trackingDatabase)
         {
             TrackingInfo info = kv.Value;
@@ -615,12 +629,31 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
                 continue;
             }
 
-            if (levelNow - info.lastSpottedTime > 45f)
+            if (levelNow - info.lastSpottedTime > 15f)
             {
                 continue;
             }
 
-            float dSq = FastMath.SquareDistance(samPos, info.GetPosition());
+            hostileAirScratch.Add(info.GetPosition());
+        }
+    }
+
+    private void EvaluateAirThreatDistances(
+        GlobalPosition samPos,
+        float hotRadius,
+        float silentKeepRadius,
+        out bool insideHot,
+        out bool insideSilentKeep)
+    {
+        insideHot = false;
+        insideSilentKeep = false;
+
+        float hotSq = hotRadius * hotRadius;
+        float keepSq = silentKeepRadius * silentKeepRadius;
+
+        for (int i = 0; i < hostileAirScratch.Count; i++)
+        {
+            float dSq = FastMath.SquareDistance(samPos, hostileAirScratch[i]);
             if (dSq <= hotSq)
             {
                 insideHot = true;
@@ -635,7 +668,82 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
         }
     }
 
-    private static void SetUnitRadarsActive(RadarUnitEntry entry, bool active)
+    private bool HasBackupRadarWithin300m(RadarUnitEntry entry)
+    {
+        if (entry.Unit == null || entry.Hq == null)
+        {
+            return false;
+        }
+
+        GlobalPosition pos = entry.Unit.GlobalPosition();
+        for (int i = 0; i < entryList.Count; i++)
+        {
+            RadarUnitEntry cand = entryList[i];
+            if (cand == entry || cand.Unit == null || cand.Unit.disabled || !ReferenceEquals(cand.Hq, entry.Hq))
+            {
+                continue;
+            }
+
+            if (FastMath.InRange(pos, cand.Unit.GlobalPosition(), 300f) && HasOperationalActiveRadar(cand.Radars))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool HasCloseHostileAirThreat(FactionHQ? hq, GlobalPosition samPos, float radiusMeters)
+    {
+        if (hq == null || hq.trackingDatabase == null || radiusMeters <= 0f)
+        {
+            return false;
+        }
+
+        float rSq = radiusMeters * radiusMeters;
+        float levelNow = Time.timeSinceLevelLoad;
+        foreach (KeyValuePair<PersistentID, TrackingInfo> kv in hq.trackingDatabase)
+        {
+            TrackingInfo info = kv.Value;
+            if (info == null || !info.TryGetUnit(out Unit u) || u == null || u.disabled)
+            {
+                continue;
+            }
+
+            if (!(u is Aircraft) && !(u is Missile))
+            {
+                continue;
+            }
+
+            if (u.NetworkHQ == null || ReferenceEquals(u.NetworkHQ, hq) || levelNow - info.lastSpottedTime > 15f)
+            {
+                continue;
+            }
+
+            if (FastMath.SquareDistance(samPos, info.GetPosition()) <= rSq)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool HasOperationalNonJammedActiveRadar(Radar[] radars)
+    {
+        for (int i = 0; i < radars.Length; i++)
+        {
+            Radar r = radars[i];
+            if (r != null && r.IsOperational() && r.activated && !r.IsJammed())
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static void SetUnitRadarsActive(RadarUnitEntry entry, bool active, bool clearLocks = false)
     {
         bool anyChanged = false;
         bool anyOperational = false;
@@ -649,15 +757,19 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
             }
 
             anyOperational = true;
-            if (r.activated != active || r.enabled != active)
+            bool wantEnabled = (active || r.IsJammed()) && !GameManager.IsHeadless;
+            if (r.activated != active || r.enabled != wantEnabled)
             {
                 r.activated = active;
-                r.enabled = active;
+                r.enabled = wantEnabled;
                 if (!active)
                 {
                     r.detectedTargets.Clear();
                     r.ResetRotators();
-                    GroundControlReflection.ClearTargetsUsingRadar(r);
+                    if (clearLocks)
+                    {
+                        GroundControlReflection.ClearTargetsUsingRadar(r);
+                    }
                 }
 
                 anyChanged = true;

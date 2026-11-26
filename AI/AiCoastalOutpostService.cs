@@ -53,6 +53,8 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
     internal bool IsProbingVanillaShore { get; private set; }
 
     private readonly Dictionary<FactionHQ, CoastalOutpostState> states = new();
+    private readonly Dictionary<Unit, float> failedLiftBuildersUntil = new();
+    private readonly Dictionary<(int CellX, int CellZ), int> failedLiftSiteCounts = new();
     private readonly List<Airbase> ownBasesScratch = new(16);
     private readonly List<(GlobalPosition Pos, float OwnDistSq, int BaseIndex)> seaCandidateScratch = new(128);
     private readonly HashSet<(int, int)> seaCellScratch = new();
@@ -66,6 +68,8 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
     public void ResetSession()
     {
         states.Clear();
+        failedLiftBuildersUntil.Clear();
+        failedLiftSiteCounts.Clear();
         ownBasesScratch.Clear();
         seaCandidateScratch.Clear();
         seaCellScratch.Clear();
@@ -115,6 +119,11 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
 
         if (GroundControlReflection.GetNavalDockLevel(hq) > 0
             || GroundControlReflection.EcoCountNavalDockBlueprints(hq) > 0)
+        {
+            return 0f;
+        }
+
+        if (!IsEconomyReadyForNavalDockLevel(ecoInstance, hq, 1))
         {
             return 0f;
         }
@@ -177,6 +186,12 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
         }
 
         if (GroundControlReflection.EcoCountNavalDockBlueprints(hq) > 0)
+        {
+            buildResult = false;
+            return true;
+        }
+
+        if (!IsEconomyReadyForNavalDockLevel(ecoInstance, hq, 1))
         {
             buildResult = false;
             return true;
@@ -522,6 +537,7 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
                 continue;
             }
 
+            float now = Time.time;
             for (int j = 0; j < builders.Count; j++)
             {
                 Unit? assigned = builders[j];
@@ -530,7 +546,22 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
                     continue;
                 }
 
+                if (failedLiftBuildersUntil.TryGetValue(assigned, out float liftRetryAt) && now < liftRetryAt)
+                {
+                    continue;
+                }
+
+                if (IsUnderStaticCover(assigned))
+                {
+                    continue;
+                }
+
                 GlobalPosition bPos = assigned.GlobalPosition();
+                if (EvaluateKnownHostileExposure(hq, csPos) >= 450f || EvaluateKnownHostileExposure(hq, bPos) >= 450f)
+                {
+                    continue;
+                }
+
                 float dist = FastMath.Distance(bPos, csPos);
                 if (dist > RemoteBuilderAirThresholdMeters
                     || (dist > 250f && !GroundControlReflection.CanDriveBetween(bPos, csPos)))
@@ -548,6 +579,12 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
     internal bool ShouldSuppressStuckRemoteBuilder(object? site, Unit? builder)
     {
         if (site == null || builder == null || builder.disabled || builder.IsSlung())
+        {
+            return false;
+        }
+
+        if (IsUnderStaticCover(builder)
+            || (failedLiftBuildersUntil.TryGetValue(builder, out float liftRetryAt) && Time.time < liftRetryAt))
         {
             return false;
         }
@@ -620,26 +657,128 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
         return found;
     }
 
-    private static bool IsEconomyReadyForOutpost(object ecoInstance, FactionHQ hq)
+    internal bool IsEconomyReadyForNavalDockLevel(object ecoInstance, FactionHQ hq, int targetLevel)
     {
+        if (ecoInstance == null || hq == null)
+        {
+            return false;
+        }
+
+        if (targetLevel >= 3)
+        {
+            return EnemyTier3NavalDockHelper.IsReadyForTier3NavalDock(ecoInstance, hq, out _);
+        }
+
         AiStrategicPhase phase = AiStrategicDirectorService.Instance.EvaluatePhase(ecoInstance, hq);
         if (phase == AiStrategicPhase.OpeningEconomy || phase == AiStrategicPhase.EmergencyReconstruction)
         {
             return false;
         }
 
+        int bestDepot = GroundControlReflection.GetBestDepotLevel(hq);
         int goldMines = GroundControlReflection.CountGoldMines(ecoInstance, hq);
-        if (goldMines < 1)
+        float enemyGross = GroundControlReflection.GetHqIncomePerMinute(ecoInstance, hq);
+
+        if (targetLevel <= 1)
+        {
+            float gasL3Income = GroundControlReflection.EcoGetGasTerminalTier3Income();
+            PlayerThreatSnapshot threat = AiStrategicDirectorService.Instance.ReadPlayerThreat(hq);
+            float threshold = threat.Ships > 0 ? Mathf.Min(120f, gasL3Income) : Mathf.Max(75f, gasL3Income);
+            return enemyGross >= threshold && (goldMines >= 1 || (bestDepot >= 2 && enemyGross >= 225f));
+        }
+
+        // Dock Level 2: prevent upgrading L1->L2 on weak Opening/1-mine economies before Depot/TechTier mature.
+        if (bestDepot < 2)
         {
             return false;
         }
 
-        float enemyGross = GroundControlReflection.GetHqIncomePerMinute(ecoInstance, hq);
-        float gasL3Income = GroundControlReflection.EcoGetGasTerminalTier3Income();
-        PlayerThreatSnapshot threat = AiStrategicDirectorService.Instance.ReadPlayerThreat(hq);
-        float threshold = threat.Ships > 0 ? Mathf.Min(120f, gasL3Income) : Mathf.Max(75f, gasL3Income);
-        return enemyGross >= threshold;
+        if (DynamicCapAndTechService.IsActive && DynamicCapAndTechService.Instance.GetSnapshot(hq).TechTier < 2)
+        {
+            return false;
+        }
+
+        float enemyNet = GroundControlReflection.GetEnemyNetIncomePerMinute(hq);
+        return goldMines >= 2 || enemyNet >= 350f;
     }
+
+    internal void NotifyFailedSlingLift(object? ecoInstance, Unit? load, GlobalPosition drop)
+    {
+        if (load == null)
+        {
+            return;
+        }
+
+        failedLiftBuildersUntil[load] = Time.time + 180f;
+
+        FactionHQ? hq = load.NetworkHQ;
+        if (hq == null || !IsEnabledFor(hq))
+        {
+            return;
+        }
+
+        var cellKey = (Mathf.RoundToInt(drop.x / 500f), Mathf.RoundToInt(drop.z / 500f));
+        int count = failedLiftSiteCounts.TryGetValue(cellKey, out int prev) ? prev + 1 : 1;
+        failedLiftSiteCounts[cellKey] = count;
+
+        if (count >= 2)
+        {
+            RecordBlockedSite(GetOrCreateState(hq), drop);
+        }
+
+        if (ecoInstance != null && GroundControlReflection.EcoConstructionSitesField?.GetValue(ecoInstance) is IList sites)
+        {
+            for (int i = 0; i < sites.Count; i++)
+            {
+                object? cs = sites[i];
+                if (cs == null || !ReferenceEquals(GroundControlReflection.SiteHqProp?.GetValue(cs) as FactionHQ, hq))
+                {
+                    continue;
+                }
+
+                List<Unit>? builders = GroundControlReflection.SiteGetBuilders(cs);
+                if (builders != null && builders.Remove(load))
+                {
+                    GroundControlReflection.MoveClearOrder(load);
+                    break;
+                }
+            }
+        }
+    }
+
+    private static bool IsUnderStaticCover(Unit unit)
+    {
+        if (unit == null)
+        {
+            return false;
+        }
+
+        Vector3 localPos = unit.transform.position;
+        RaycastHit[] hits = Physics.SphereCastAll(localPos + Vector3.up * 120f, 3.0f, Vector3.down, 118f, ~0, QueryTriggerInteraction.Ignore);
+        for (int i = 0; i < hits.Length; i++)
+        {
+            Collider col = hits[i].collider;
+            if (col == null
+                || col.isTrigger
+                || col.transform.IsChildOf(unit.transform)
+                || string.Equals(col.GetType().Name, "TerrainCollider", StringComparison.Ordinal)
+                || col.GetComponentInParent<GroundVehicle>() != null
+                || col.GetComponentInParent<Aircraft>() != null)
+            {
+                continue;
+            }
+
+            if (hits[i].point.y > localPos.y + 2.5f)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsEconomyReadyForOutpost(object ecoInstance, FactionHQ hq)
+        => Instance.IsEconomyReadyForNavalDockLevel(ecoInstance, hq, 1);
 
     private static int CountControlTowerBlueprints(object ecoInstance, FactionHQ hq)
     {
@@ -884,6 +1023,11 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
 
                 float seaDist = FastMath.Distance(seaPt, candDock);
                 float exposure = EvaluateKnownHostileExposure(hq, candTower);
+                if (!driveable && exposure >= 450f)
+                {
+                    continue;
+                }
+
                 float score = (driveable ? 2500f : 0f)
                     - nearestOwnDist * 0.08f
                     - seaDist * 0.04f

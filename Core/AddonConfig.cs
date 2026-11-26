@@ -18,6 +18,10 @@ internal static class AddonConfig
     internal static ConfigEntry<float> AiMineIncomeMultiplier { get; private set; } = null!;
     internal static ConfigEntry<int> AiMaxFactories { get; private set; } = null!;
     internal static ConfigEntry<float> AiIncomeCapMultiplier { get; private set; } = null!;
+    internal static ConfigEntry<KeyboardShortcut> EconomyTrackerKey { get; private set; } = null!;
+    internal static ConfigEntry<bool> EnableCapturedBaseIncome { get; private set; } = null!;
+    internal static ConfigEntry<float> CapturedBaseIncomePerMinute { get; private set; } = null!;
+    internal static ConfigEntry<float> BaseCaptureBounty { get; private set; } = null!;
 
     // 03 Tactical AI
     internal static ConfigEntry<bool> EnableTacticalQualityAi { get; private set; } = null!;
@@ -86,10 +90,12 @@ internal static class AddonConfig
     internal static ConfigEntry<bool> UseCustomModels { get; private set; } = null!;
     internal static ConfigEntry<bool> ApplyMilitaryTint { get; private set; } = null!;
     internal static ConfigEntry<string> PreferredStartBase { get; private set; } = null!;
+    internal static ConfigEntry<bool> DuelOppositeAirbaseStart { get; private set; } = null!;
 
     // 08 Singleplayer Cheats
     internal static ConfigEntry<bool> EnableSingleplayerCheats { get; private set; } = null!;
     internal static ConfigEntry<KeyboardShortcut> CheatMenuKey { get; private set; } = null!;
+    internal static ConfigEntry<string> HostTestCheatSteamId { get; private set; } = null!;
 
     internal static void Initialize(ConfigFile config)
     {
@@ -178,6 +184,34 @@ internal static class AddonConfig
             new ConfigDescription(
                 "Dynamic AI income target/cap multiplier vs player gross income (1.05 = player + 5%, 0 = disabled).",
                 new AcceptableValueRange<float>(0f, 3.0f)));
+
+        EconomyTrackerKey = config.Bind(
+            "02 AI Economy",
+            "EconomyTrackerKey",
+            new KeyboardShortcut(KeyCode.E, KeyCode.LeftShift),
+            "Open or close the Live Economy & Spending Budget Tracker.");
+
+        EnableCapturedBaseIncome = config.Bind(
+            "02 AI Economy",
+            "EnableCapturedBaseIncome",
+            true,
+            "Award credits for captured airbases (one-time capture bounty plus ongoing passive income/min per captured base beyond the starting home base).");
+
+        CapturedBaseIncomePerMinute = config.Bind(
+            "02 AI Economy",
+            "CapturedBaseIncomePerMinute",
+            50f,
+            new ConfigDescription(
+                "Ongoing passive credits/min granted for each additional capturable airbase held beyond a faction's starting home base.",
+                new AcceptableValueRange<float>(0f, 300f)));
+
+        BaseCaptureBounty = config.Bind(
+            "02 AI Economy",
+            "BaseCaptureBounty",
+            150f,
+            new ConfigDescription(
+                "One-time credits bounty awarded when a faction captures a neutral or enemy airbase during active play (300s anti-flip cooldown per base/faction).",
+                new AcceptableValueRange<float>(0f, 1000f)));
 
         // 03 Tactical AI
         EnableTacticalQualityAi = config.Bind(
@@ -580,7 +614,13 @@ internal static class AddonConfig
             "07 Models & Maps",
             "PreferredStartBase",
             string.Empty,
-            "Optional airbase name override for Champions mode (leave empty for random eligible base).");
+            "Optional airbase name override for Duel & Champions start base (leave empty for automatic full airbase on opposite sides).");
+
+        DuelOppositeAirbaseStart = config.Bind(
+            "07 Models & Maps",
+            "DuelOppositeAirbaseStart",
+            true,
+            "In Ground Control Duel, relocate Player and AI from small highway strips to full airbases on opposite sides of the map.");
 
         // 08 Singleplayer Cheats
         EnableSingleplayerCheats = config.Bind(
@@ -594,5 +634,11 @@ internal static class AddonConfig
             "CheatMenuKey",
             new KeyboardShortcut(KeyCode.F10, KeyCode.LeftShift),
             "Open or close the Singleplayer Cheat menu.");
+
+        HostTestCheatSteamId = config.Bind(
+            "08 Singleplayer Cheats",
+            "HostTestCheatSteamId",
+            string.Empty,
+            "Optional Steam64 ID allowed to use the Host-only test cheat menu in a self-hosted Multiplayer test lobby (leave empty for Singleplayer-only).");
     }
 }

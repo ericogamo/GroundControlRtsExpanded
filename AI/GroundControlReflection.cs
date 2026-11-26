@@ -29,6 +29,7 @@ internal static class GroundControlReflection
     internal static readonly Type? UnitCapType = AccessTools.TypeByName("GroundControlRts.CommanderUnitCap");
     internal static readonly Type? NoticeType = AccessTools.TypeByName("GroundControlRts.CommanderNotice");
     internal static readonly Type? RepairServiceType = AccessTools.TypeByName("GroundControlRts.CommanderRepairService");
+    internal static readonly Type? VictoryServiceType = AccessTools.TypeByName("GroundControlRts.CommanderVictoryService");
     internal static readonly Type? AirCommandServiceType = AccessTools.TypeByName("GroundControlRts.CommanderAirCommandService");
     internal static readonly Type? AirMissionOptionType = AccessTools.TypeByName("GroundControlRts.CommanderAirCommandService+AirMissionOption");
     internal static readonly Type? AirMissionType = AccessTools.TypeByName("GroundControlRts.CommanderAirCommandService+AirMission");
@@ -37,6 +38,7 @@ internal static class GroundControlReflection
     internal static readonly Type? InputControllerType = AccessTools.TypeByName("GroundControlRts.CommanderInputController");
     internal static readonly Type? ConstructionSiteType = AccessTools.TypeByName("GroundControlRts.CommanderEconomyService+ConstructionSite");
     internal static readonly Type? SlingLiftServiceType = AccessTools.TypeByName("GroundControlRts.CommanderSlingLiftService");
+    internal static readonly Type? SlingJobType = AccessTools.TypeByName("GroundControlRts.CommanderSlingLiftService+SlingJob");
     internal static readonly Type? LeviathanServiceType = AccessTools.TypeByName("GroundControlRts.CommanderLeviathanService");
     internal static readonly Type? GodServiceType = AccessTools.TypeByName("GroundControlRts.CommanderGodService");
     internal static readonly Type? AlertServiceType = AccessTools.TypeByName("GroundControlRts.CommanderAlertService");
@@ -112,6 +114,17 @@ internal static class GroundControlReflection
     internal static readonly MethodInfo? EcoHasBaseWithoutUpgradedDepotMethod = AccessTools.Method(EconomyServiceType, "HasBaseWithoutUpgradedDepot", new[] { typeof(FactionHQ) });
     internal static readonly MethodInfo? EcoCountBuildingsMethod = AccessTools.Method(EconomyServiceType, "CountBuildings", new[] { typeof(FactionHQ), typeof(BuildingType) });
     internal static readonly MethodInfo? EcoGetEnemyIncomeReserveMethod = FindMethodByNameAndParamCount(EconomyServiceType, "GetEnemyIncomeReserve", 2);
+    internal static readonly FieldInfo? EcoUpkeepPerMinuteField = AccessTools.Field(EconomyServiceType, "upkeepPerMinute");
+    internal static readonly FieldInfo? EcoEnemyFactoryFundsField = AccessTools.Field(EconomyServiceType, "enemyFactoryFunds");
+    internal static readonly MethodInfo? EcoGetBaseIncomePerMinuteMethod = AccessTools.Method(EconomyServiceType, "GetBaseIncomePerMinute", Type.EmptyTypes);
+    internal static readonly MethodInfo? EcoGetGodOpeningReserveMethod = AccessTools.Method(EconomyServiceType, "GetGodOpeningReserve", new[] { typeof(FactionHQ) });
+    internal static readonly PropertyInfo? EcoIncomeTickProgressProp = AccessTools.Property(EconomyServiceType, "IncomeTickProgress");
+    internal static readonly PropertyInfo? EcoFriendlyUpkeepPerMinuteProp = AccessTools.Property(EconomyServiceType, "FriendlyUpkeepPerMinute");
+    internal static readonly MethodInfo? EcoRefreshLedgerMethod = AccessTools.Method(EconomyServiceType, "RefreshLedger", Type.EmptyTypes);
+    internal static readonly FieldInfo? EcoLedgerGrossField = AccessTools.Field(EconomyServiceType, "ledgerGross");
+    internal static readonly FieldInfo? EcoNextLedgerAtField = AccessTools.Field(EconomyServiceType, "nextLedgerAt");
+    internal static readonly MethodInfo? AirbaseCaptureFactionMethod = AccessTools.Method(typeof(Airbase), "CaptureFaction", new[] { typeof(FactionHQ) });
+    internal static readonly PropertyInfo? NetworkIsGuestProp = AccessTools.Property(NetworkType, "IsGuest");
 
     // CommanderEnemyCommanderService members
     internal static readonly PropertyInfo? EnemyInstanceProp = AccessTools.Property(EnemyCommanderType, "Instance");
@@ -219,6 +232,9 @@ internal static class GroundControlReflection
     internal static readonly PropertyInfo? StateWaveMembersProp = AccessTools.Property(CommanderStateType, "WaveMembers");
     internal static readonly PropertyInfo? StateNavalRallyingProp = AccessTools.Property(CommanderStateType, "NavalRallying");
     internal static readonly PropertyInfo? StateNavalWaitingSinceProp = AccessTools.Property(CommanderStateType, "NavalWaitingSince");
+    internal static readonly PropertyInfo? StateNavalFundProp = AccessTools.Property(CommanderStateType, "NavalFund");
+    internal static readonly PropertyInfo? StateWarFundAtProp = AccessTools.Property(CommanderStateType, "WarFundAt");
+    internal static readonly PropertyInfo? StateBrokeProp = AccessTools.Property(CommanderStateType, "Broke");
 
     // Additional CommanderEnemyCommanderService tactical AI members
     internal static readonly MethodInfo? EnemyBuyAirframeMethod = FindMethodByNameAndParamCount(EnemyCommanderType, "BuyAirframe", 5);
@@ -610,6 +626,17 @@ internal static class GroundControlReflection
     internal static readonly MethodInfo? SupplyHeliGetCargoCostMethod = AccessTools.Method(SupplyHeliServiceType, "GetCargoCost", new[] { typeof(AircraftDefinition), typeof(NuclearOption.SavedMission.Loadout) });
     internal static readonly MethodInfo? SupplyHeliIsAvailableAirbaseMethod = AccessTools.Method(SupplyHeliServiceType, "IsAvailableAirbase", new[] { typeof(Airbase), typeof(FactionHQ), typeof(AircraftDefinition) });
     internal static readonly MethodInfo? SupplyHeliSpawnCargoRunMethod = FindMethodByNameAndParamCount(SupplyHeliServiceType, "SpawnCargoRun", 10);
+    internal static readonly MethodInfo? SupplyHeliCargoMountSupportsAirdropMethod = AccessTools.Method(SupplyHeliServiceType, "CargoMountSupportsAirdrop", new[] { typeof(WeaponMount) });
+    internal static readonly MethodInfo? SupplyHeliTrySpawnCargoRunAtAirbaseMethod = SupplyHeliQueuedSpawnType != null
+        ? AccessTools.Method(SupplyHeliServiceType, "TrySpawnCargoRunAtAirbase", new[] { SupplyHeliQueuedSpawnType, typeof(Airbase), typeof(FactionHQ) })
+        : null;
+    internal static readonly MethodInfo? SlingEndJobMethod = SlingJobType != null
+        ? AccessTools.Method(SlingLiftServiceType, "EndJob", new[] { SlingJobType })
+        : null;
+    internal static readonly PropertyInfo? SlingJobHeloProp = AccessTools.Property(SlingJobType, "Helo");
+    internal static readonly PropertyInfo? SlingJobLoadProp = AccessTools.Property(SlingJobType, "Load");
+    internal static readonly PropertyInfo? SlingJobCarryingProp = AccessTools.Property(SlingJobType, "Carrying");
+    internal static readonly PropertyInfo? SlingJobDropProp = AccessTools.Property(SlingJobType, "Drop");
     internal static readonly PropertyInfo? CargoAircraftDefProp = AccessTools.Property(CargoAircraftOptionType, "Definition");
     internal static readonly PropertyInfo? CargoAircraftLabelProp = AccessTools.Property(CargoAircraftOptionType, "Label");
     internal static readonly PropertyInfo? CargoAircraftRotaryProp = AccessTools.Property(CargoAircraftOptionType, "Rotary");
@@ -668,6 +695,13 @@ internal static class GroundControlReflection
     internal static readonly MethodInfo? SpawnServiceRefreshFactionVehiclesMethod = AccessTools.Method(SpawnServiceType, "RefreshFactionVehicleDefinitions", Type.EmptyTypes);
     internal static readonly MethodInfo? SpawnServiceRefreshVehiclesMethod = AccessTools.Method(SpawnServiceType, "RefreshVehicleDefinitions", Type.EmptyTypes);
     internal static readonly FieldInfo? SpawnServiceVehicleDefinitionsField = AccessTools.Field(SpawnServiceType, "vehicleDefinitions");
+    internal static readonly FieldInfo? VictoryHomeBasesField = AccessTools.Field(VictoryServiceType, "HomeBases");
+    internal static readonly MethodInfo? RepairHoldLeftBehindUnitsMethod = AccessTools.Method(RepairServiceType, "HoldLeftBehindUnits", new[] { typeof(FactionHQ), typeof(FactionHQ) });
+    internal static readonly MethodInfo? RepairSweepStandbyMethod = AccessTools.Method(RepairServiceType, "SweepStandby", new[] { typeof(FactionHQ), typeof(bool) });
+    internal static readonly FieldInfo? RepairGuestFactionsField = AccessTools.Field(RepairServiceType, "guestFactions");
+    internal static readonly MethodInfo? EcoTickStartingBuildersMethod = AccessTools.Method(EconomyServiceType, "TickStartingBuilders", Type.EmptyTypes);
+    internal static readonly MethodInfo? EcoPlaceBaseDepotsMethod = AccessTools.Method(EconomyServiceType, "PlaceBaseDepots", new[] { typeof(FactionHQ), typeof(Airbase), typeof(BuildingDefinition), typeof(BuildingDefinition), typeof(int) });
+    internal static readonly FieldInfo? EcoVehicleDepotKeysField = AccessTools.Field(EconomyServiceType, "VehicleDepotKeys");
 
     private static bool bindingsValidated;
 
@@ -705,6 +739,10 @@ internal static class GroundControlReflection
             ("CommanderEconomyService.GetBestDepotLevel", GetBestDepotLevelMethod),
             ("CommanderEconomyService.GetRequiredDepotLevel", GetRequiredDepotLevelMethod),
             ("CommanderEconomyService.PayIncome", PayIncomeMethod),
+            ("CommanderEconomyService.RefreshLedger", EcoRefreshLedgerMethod),
+            ("CommanderEconomyService.ledgerGross", EcoLedgerGrossField),
+            ("CommanderEconomyService.nextLedgerAt", EcoNextLedgerAtField),
+            ("Airbase.CaptureFaction(FactionHQ)", AirbaseCaptureFactionMethod),
             ("CommanderEconomyService.ResolveCategoryDefinition", ResolveCategoryDefinitionMethod),
             ("CommanderEconomyService.GetDepotLevel", EcoGetDepotLevelMethod),
             ("CommanderEconomyService.GetDepotUpgradeCost", EcoGetDepotUpgradeCostMethod),
@@ -1255,6 +1293,36 @@ internal static class GroundControlReflection
             ("CommanderAirCommandService.BuildSlingLoadout", AirBuildSlingLoadoutMethod),
             ("CommanderAirCommandService.CanAiFly", AirCanAiFlyMethod),
             ("CommanderEconomyService.IsStuckAiBuilder(2)", EcoIsStuckAiBuilderMethod),
+            ("CommanderEconomyService.upkeepPerMinute", EcoUpkeepPerMinuteField),
+            ("CommanderEconomyService.enemyFactoryFunds", EcoEnemyFactoryFundsField),
+            ("CommanderEconomyService.GetBaseIncomePerMinute", EcoGetBaseIncomePerMinuteMethod),
+            ("CommanderEconomyService.GetGodOpeningReserve", EcoGetGodOpeningReserveMethod),
+            ("CommanderEconomyService.IncomeTickProgress", EcoIncomeTickProgressProp),
+            ("CommanderEconomyService.FriendlyUpkeepPerMinute", EcoFriendlyUpkeepPerMinuteProp),
+            ("CommanderState.NavalFund", StateNavalFundProp),
+            ("CommanderState.WarFundAt", StateWarFundAtProp),
+            ("CommanderState.Broke", StateBrokeProp),
+            ("CommanderNetwork.IsGuest", NetworkIsGuestProp),
+            ("CommanderVictoryService", VictoryServiceType),
+            ("CommanderVictoryService.HomeBases", VictoryHomeBasesField),
+            ("CommanderRepairService.HoldLeftBehindUnits", RepairHoldLeftBehindUnitsMethod),
+            ("CommanderRepairService.SweepStandby", RepairSweepStandbyMethod),
+            ("CommanderRepairService.guestFactions", RepairGuestFactionsField),
+            ("CommanderEconomyService.TickStartingBuilders", EcoTickStartingBuildersMethod),
+            ("CommanderEconomyService.PlaceBaseDepots", EcoPlaceBaseDepotsMethod),
+            ("CommanderEconomyService.VehicleDepotKeys", EcoVehicleDepotKeysField),
+            ("CommanderFactionVehicleService", FactionVehicleServiceType),
+            ("CommanderFactionVehicleService.CanPurchase", FactionVehicleCanPurchaseMethod),
+            ("CommanderMobileEmplacementService.IsTowedBy", MobileEmplacementIsTowedByMethod),
+            ("CommanderGameAccess.SetUnitHoldPosition", GameAccessSetUnitHoldPositionMethod),
+            ("CommanderGameAccess.TryGetLocalVehicleDefinitions", GameAccessTryGetLocalVehicleDefinitionsMethod),
+            ("CommanderEconomyService.IsSupplyTruck", EcoIsSupplyTruckMethod),
+            ("CommanderSpawnService.RefreshFactionVehicleDefinitions", SpawnServiceRefreshFactionVehiclesMethod),
+            ("CommanderSpawnService.RefreshVehicleDefinitions", SpawnServiceRefreshVehiclesMethod),
+            ("CommanderSupplyHeliService.CargoMountSupportsAirdrop", SupplyHeliCargoMountSupportsAirdropMethod),
+            ("CommanderSupplyHeliService.TrySpawnCargoRunAtAirbase", SupplyHeliTrySpawnCargoRunAtAirbaseMethod),
+            ("CommanderSlingLiftService+SlingJob", SlingJobType),
+            ("CommanderSlingLiftService.EndJob", SlingEndJobMethod),
         };
 
         int present = 0;
@@ -1332,6 +1400,12 @@ internal static class GroundControlReflection
 
     internal static int CountFactories(FactionHQ hq)
         => CountFactoriesMethod?.Invoke(null, new object?[] { hq }) is int n ? n : 0;
+
+    internal static int GetEnemyFactoryTarget(object? ecoInstance, FactionHQ? hq, bool allowWait = false)
+        => ecoInstance != null && hq != null && GetEnemyFactoryTargetMethod?.Invoke(ecoInstance, new object?[] { hq, allowWait }) is int n ? n : 4;
+
+    internal static bool CargoMountSupportsAirdrop(WeaponMount? mount)
+        => mount != null && SupplyHeliCargoMountSupportsAirdropMethod?.Invoke(null, new object?[] { mount }) is bool b && b;
 
     internal static bool HoldsMostBases(FactionHQ hq)
         => HoldsMostBasesMethod?.Invoke(null, new object?[] { hq }) is bool b && b;
@@ -1439,6 +1513,83 @@ internal static class GroundControlReflection
 
     internal static IList? GetEnemyAirCandidates(object? enemyInstance)
         => enemyInstance != null ? EnemyAirCandidatesField?.GetValue(enemyInstance) as IList : null;
+
+    internal static bool GetStateBool(object? state, PropertyInfo? prop)
+        => state != null && prop?.GetValue(state) is bool b && b;
+
+    internal static string GetEnemySavingForName(object? enemyInstance)
+        => GetEnemySavingFor(enemyInstance)?.unitName ?? string.Empty;
+
+    internal static float GetBaseIncomePerMinute()
+        => EcoGetBaseIncomePerMinuteMethod?.Invoke(null, null) is float v ? v : 0f;
+
+    internal static float GetAiStipendPerMinute(FactionHQ? hq, FactionHQ? localHq)
+        => hq != null && GetAiStipendPerMinuteMethod?.Invoke(null, new object?[] { hq, localHq }) is float v ? v : 0f;
+
+    internal static float GetEnemyMineIncomeMultiplier()
+        => EnemyMineIncomeMultiplierGetter?.Invoke(null, null) is float v ? Mathf.Max(0f, v) : 1f;
+
+    internal static float GetFactionUpkeepPerMinute(object? ecoInstance, FactionHQ? hq, bool isLocal)
+    {
+        if (ecoInstance == null || hq == null)
+        {
+            return 0f;
+        }
+
+        if (EcoUpkeepPerMinuteField?.GetValue(ecoInstance) is IDictionary map && map.Contains(hq) && map[hq] is float upkeep)
+        {
+            return Mathf.Max(0f, upkeep);
+        }
+
+        if (isLocal && EcoFriendlyUpkeepPerMinuteProp?.GetValue(ecoInstance) is float friendlyUpkeep)
+        {
+            return Mathf.Max(0f, friendlyUpkeep);
+        }
+
+        return Mathf.Max(0f, GetHqIncomePerMinute(ecoInstance, hq) - GetEnemyNetIncomePerMinute(hq));
+    }
+
+    internal static float GetEnemyFactoryReserve(object? ecoInstance, FactionHQ? hq)
+        => ecoInstance != null && hq != null && GetEnemyFactoryReserveMethod?.Invoke(ecoInstance, new object?[] { hq }) is float v
+            ? Mathf.Max(0f, v)
+            : 0f;
+
+    internal static float GetEnemyFactoryFundReadOnly(object? ecoInstance, FactionHQ? hq, float grossPerMin, float factoryReserve)
+    {
+        if (ecoInstance == null || hq == null || factoryReserve <= 0f)
+        {
+            return 0f;
+        }
+
+        if (EcoEnemyFactoryFundsField?.GetValue(ecoInstance) is not IDictionary map || !map.Contains(hq))
+        {
+            return 0f;
+        }
+
+        object? boxed = map[hq];
+        if (boxed is not ValueTuple<float, float> entry)
+        {
+            return 0f;
+        }
+
+        float fund = entry.Item1;
+        float at = entry.Item2;
+        if (at > 0f)
+        {
+            fund += grossPerMin * 0.25f * (Mathf.Max(0f, Time.time - at) / 60f);
+        }
+
+        return Mathf.Clamp(fund, 0f, Mathf.Min(factoryReserve, Mathf.Max(0f, hq.factionFunds)));
+    }
+
+    internal static float GetGodOpeningReserve(FactionHQ? hq)
+        => hq != null && EcoGetGodOpeningReserveMethod?.Invoke(null, new object?[] { hq }) is float v ? Mathf.Max(0f, v) : 0f;
+
+    internal static float GetIncomeTickProgress(object? ecoInstance)
+        => ecoInstance != null && EcoIncomeTickProgressProp?.GetValue(ecoInstance) is float p ? p : -1f;
+
+    internal static bool IsNetworkGuest()
+        => NetworkIsGuestProp?.GetValue(null) is bool b && b;
 
     internal static float GetStateFloat(object? state, PropertyInfo? prop)
         => state != null && prop?.GetValue(state) is float v ? v : 0f;
@@ -2839,6 +2990,49 @@ internal static class GroundControlReflection
 
     internal static bool AirCanAiFly(AircraftDefinition? def)
         => def != null && AirCanAiFlyMethod?.Invoke(null, new object?[] { def }) is bool b && b;
+
+    internal static void SetVictoryHomeBase(FactionHQ? hq, Airbase? airbase)
+    {
+        if (hq == null || airbase == null)
+        {
+            return;
+        }
+
+        if (VictoryHomeBasesField?.GetValue(null) is System.Collections.IDictionary homeBases)
+        {
+            homeBases[hq] = airbase;
+        }
+    }
+
+    internal static void EnsureBaseDepots(object? ecoInstance, FactionHQ? hq, Airbase? airbase, int depotsWanted = 2)
+    {
+        if (ecoInstance == null
+            || hq == null
+            || airbase == null
+            || EcoPlaceBaseDepotsMethod == null
+            || Encyclopedia.i == null)
+        {
+            return;
+        }
+
+        string[] keys = EcoVehicleDepotKeysField?.GetValue(null) as string[] ?? new[] { "VehicleDepot1" };
+        BuildingDefinition? depot = EcoFindBuildingMethod?.Invoke(null, new object?[] { Encyclopedia.i, keys }) as BuildingDefinition;
+        BuildingDefinition? bunker = ResolveCategoryDefinitionMethod?.Invoke(null, new object?[] { BuildingType.AMMO, true }) as BuildingDefinition;
+        EcoPlaceBaseDepotsMethod.Invoke(ecoInstance, new object?[] { hq, airbase, depot, bunker, depotsWanted });
+    }
+
+    internal static void RemoveGuestFaction(object? repairInstance, FactionHQ? hq)
+    {
+        if (repairInstance == null || hq == null)
+        {
+            return;
+        }
+
+        if (RepairGuestFactionsField?.GetValue(repairInstance) is HashSet<FactionHQ> set)
+        {
+            set.Remove(hq);
+        }
+    }
 
     private static MethodInfo? FindMethodByNameAndParamCount(Type? type, string name, int paramCount)
     {

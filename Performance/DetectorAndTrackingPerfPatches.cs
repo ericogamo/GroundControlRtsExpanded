@@ -125,12 +125,14 @@ internal static class DetectorManagerBudgetPatches
     private static readonly List<DetectionRequest> Deferred = new(256);
     private static readonly List<DetectionRequest> ScratchPriority = new(256);
     private static readonly List<DetectionRequest> ScratchVisual = new(256);
+    private static readonly HashSet<(int DetectorId, int TargetId)> ActiveBatchKeys = new();
 
     internal static void ClearCaches()
     {
         Deferred.Clear();
         ScratchPriority.Clear();
         ScratchVisual.Clear();
+        ActiveBatchKeys.Clear();
     }
 
     [HarmonyPatch(typeof(DetectorManager), "Schedule")]
@@ -171,35 +173,39 @@ internal static class DetectorManagerBudgetPatches
 
             list.Clear();
             int maxDeferred = budget * 4;
-            int deferredStart = Deferred.Count;
+            int visualReserve = Mathf.Min(ScratchVisual.Count, Mathf.Max(32, budget / 4));
+            int priorityCap = Mathf.Max(0, budget - visualReserve);
 
-            for (int i = 0; i < ScratchPriority.Count; i++)
+            int priIdx = 0;
+            while (priIdx < ScratchPriority.Count && list.Count < priorityCap)
             {
-                if (list.Count < budget)
-                {
-                    list.Add(ScratchPriority[i]);
-                }
-                else if (Deferred.Count < maxDeferred)
-                {
-                    Deferred.Add(ScratchPriority[i]);
-                }
+                list.Add(ScratchPriority[priIdx++]);
             }
 
-            for (int i = 0; i < ScratchVisual.Count; i++)
+            int visIdx = 0;
+            while (visIdx < ScratchVisual.Count && list.Count < budget)
             {
-                if (list.Count < budget)
-                {
-                    list.Add(ScratchVisual[i]);
-                }
-                else if (Deferred.Count < maxDeferred)
-                {
-                    Deferred.Add(ScratchVisual[i]);
-                }
+                list.Add(ScratchVisual[visIdx++]);
+            }
+
+            while (priIdx < ScratchPriority.Count && list.Count < budget)
+            {
+                list.Add(ScratchPriority[priIdx++]);
+            }
+
+            while (priIdx < ScratchPriority.Count && Deferred.Count < maxDeferred)
+            {
+                Deferred.Add(ScratchPriority[priIdx++]);
+            }
+
+            while (visIdx < ScratchVisual.Count && Deferred.Count < maxDeferred)
+            {
+                Deferred.Add(ScratchVisual[visIdx++]);
             }
 
             ScratchPriority.Clear();
             ScratchVisual.Clear();
-            PerfMetricsService.Instance.NoteDetectorBatch(list.Count, Deferred.Count - deferredStart + deferredStart);
+            PerfMetricsService.Instance.NoteDetectorBatch(list.Count, Deferred.Count);
         }
     }
 
@@ -214,15 +220,32 @@ internal static class DetectorManagerBudgetPatches
             }
 
             List<DetectionRequest> list = LoSRequestsRef(__instance);
+            ActiveBatchKeys.Clear();
+            for (int i = 0; i < list.Count; i++)
+            {
+                DetectionRequest existing = list[i];
+                if (existing.Detector != null && existing.target != null)
+                {
+                    ActiveBatchKeys.Add((existing.Detector.GetInstanceID(), existing.target.GetInstanceID()));
+                }
+            }
+
             for (int i = 0; i < Deferred.Count; i++)
             {
                 DetectionRequest req = Deferred[i];
-                if (req.Detector != null && req.target != null && !req.target.disabled)
+                if (req.Detector == null || req.target == null || req.target.disabled)
+                {
+                    continue;
+                }
+
+                var key = (req.Detector.GetInstanceID(), req.target.GetInstanceID());
+                if (ActiveBatchKeys.Add(key))
                 {
                     list.Add(req);
                 }
             }
 
+            ActiveBatchKeys.Clear();
             Deferred.Clear();
         }
     }

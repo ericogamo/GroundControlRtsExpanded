@@ -130,6 +130,95 @@ internal static class TryBuildEnemyMinePatch
 
         return true;
     }
+
+    private static void Postfix(object __instance, FactionHQ? hq, bool __result)
+    {
+        if (!__result
+            || hq == null
+            || !((Mirage.NetworkBehaviour)hq).IsServer
+            || !AddonConfig.EnableTacticalQualityAi.Value
+            || AiEconomySettings.GetActiveProfile().IsVanilla)
+        {
+            return;
+        }
+
+        if (GroundControlReflection.EcoConstructionSitesField?.GetValue(__instance) is not IList sites || sites.Count == 0)
+        {
+            return;
+        }
+
+        object? newestSite = sites[sites.Count - 1];
+        if (newestSite == null
+            || !ReferenceEquals(GroundControlReflection.SiteHqProp?.GetValue(newestSite) as FactionHQ, hq)
+            || !GroundControlReflection.IsMineBuildKind(GroundControlReflection.SiteKindProp?.GetValue(newestSite))
+            || GroundControlReflection.SitePositionProp?.GetValue(newestSite) is not GlobalPosition minePos)
+        {
+            return;
+        }
+
+        if (HasFriendlyAirDefenceNear(hq, sites, minePos, 950f))
+        {
+            return;
+        }
+
+        BuildingDefinition? defBuilding = GroundControlReflection.ResolveCategoryDefinitionMethod?.Invoke(null, new object?[] { BuildingType.DEF, true }) as BuildingDefinition;
+        if (defBuilding == null)
+        {
+            return;
+        }
+
+        float defCost = GroundControlReflection.GetStructureCost(defBuilding);
+        if (hq.factionFunds < defCost + 80f || !GroundControlReflection.HasAnyBlueprintRoom(hq))
+        {
+            return;
+        }
+
+        if (GroundControlReflection.TryFindSiteNear(__instance, hq, defBuilding, minePos, out GlobalPosition defSite, 12))
+        {
+            string label = GroundControlReflection.GetStructureLabel(defBuilding);
+            GroundControlReflection.QueueEnemyStructureBlueprint(__instance, hq, defBuilding, defSite, defCost, label);
+        }
+    }
+
+    private static bool HasFriendlyAirDefenceNear(FactionHQ hq, IList sites, GlobalPosition center, float radiusMeters)
+    {
+        if (hq.factionUnits != null)
+        {
+            foreach (PersistentID pid in hq.factionUnits)
+            {
+                if (!pid.TryGetUnit(out Unit unit) || unit == null || unit.disabled)
+                {
+                    continue;
+                }
+
+                if (unit is Building && unit.definition is BuildingDefinition bd && bd.buildingType == BuildingType.DEF
+                    && FastMath.InRange(unit.GlobalPosition(), center, radiusMeters))
+                {
+                    return true;
+                }
+            }
+        }
+
+        for (int i = 0; i < sites.Count; i++)
+        {
+            object? cs = sites[i];
+            if (cs == null
+                || !ReferenceEquals(GroundControlReflection.SiteHqProp?.GetValue(cs) as FactionHQ, hq)
+                || GroundControlReflection.SiteDefinitionProp?.GetValue(cs) is not BuildingDefinition bdef
+                || bdef.buildingType != BuildingType.DEF
+                || GroundControlReflection.SitePositionProp?.GetValue(cs) is not GlobalPosition sPos)
+            {
+                continue;
+            }
+
+            if (FastMath.InRange(sPos, center, radiusMeters))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 }
 
 [HarmonyPatch]
@@ -243,8 +332,8 @@ internal static class EnemyTier3DepotHelper
             return false;
         }
 
-        if (GroundControlReflection.CountGoldMines(ecoInstance, hq) < 1
-            || GroundControlReflection.GetEnemyNetIncomePerMinute(hq) < 400f)
+        if ((GroundControlReflection.CountGoldMines(ecoInstance, hq) < 1 && GroundControlReflection.GetHqIncomePerMinute(ecoInstance, hq) < 450f)
+            || GroundControlReflection.GetEnemyNetIncomePerMinute(hq) < 350f)
         {
             return false;
         }
@@ -406,6 +495,20 @@ internal static class GetEnemyBuildReservePatch
             }
         }
 
+        if (DynamicCapAndTechService.IsActive && AddonConfig.EnableAiCityBuilding.Value && !income)
+        {
+            FactionCapSnapshot snap = DynamicCapAndTechService.Instance.GetSnapshot(hq);
+            float gross = GroundControlReflection.GetHqIncomePerMinute(eco, hq);
+            if (snap.CommandHqCount == 0 && gross >= 100f)
+            {
+                __result = Mathf.Max(__result, 180f);
+            }
+            else if (snap.CommandHqLevel == 1 && GroundControlReflection.GetBestDepotLevel(hq) >= 2 && GroundControlReflection.CountGoldMines(eco, hq) >= 1)
+            {
+                __result = Mathf.Max(__result, 320f);
+            }
+        }
+
         if (__result <= 0f
             && EnemyTier3DepotHelper.IsReadyForTier3DepotPlanning(eco, hq, out float l3Cost)
             && hq.factionFunds >= l3Cost * 0.45f)
@@ -497,11 +600,31 @@ internal static class TryBuildEnemyFactoryPatch
         AiEconomyProfile profile = AiEconomySettings.GetActiveProfile();
         if (!profile.IsVanilla && hq != null)
         {
-            int effectiveMax = AiEconomySettings.GetEffectiveMaxFactories(GroundControlReflection.GetEcoInstance(), hq, profile);
-            if (GroundControlReflection.CountFactories(hq) >= effectiveMax)
+            object? eco = GroundControlReflection.GetEcoInstance();
+            int factories = GroundControlReflection.CountFactories(hq);
+            int effectiveMax = AiEconomySettings.GetEffectiveMaxFactories(eco, hq, profile);
+            if (factories >= effectiveMax)
             {
                 __result = false;
                 return false;
+            }
+
+            if (eco != null)
+            {
+                int goldMines = GroundControlReflection.CountGoldMines(eco, hq);
+                float gross = GroundControlReflection.GetHqIncomePerMinute(eco, hq);
+                if (goldMines == 0 && gross >= 150f && !AiEconomySettings.IsMineBuildBlocked(eco, hq, profile))
+                {
+                    __result = false;
+                    return false;
+                }
+
+                int target = GroundControlReflection.GetEnemyFactoryTarget(eco, hq);
+                if (factories >= target && !(hq.factionFunds >= 1500f && goldMines >= 1 && GroundControlReflection.GetBestDepotLevel(hq) >= 3))
+                {
+                    __result = false;
+                    return false;
+                }
             }
         }
 
@@ -520,15 +643,78 @@ internal static class GetEnemyFactoryReservePatch
         AiEconomyProfile profile = AiEconomySettings.GetActiveProfile();
         if (!profile.IsVanilla && hq != null)
         {
-            int effectiveMax = AiEconomySettings.GetEffectiveMaxFactories(GroundControlReflection.GetEcoInstance(), hq, profile);
-            if (GroundControlReflection.CountFactories(hq) >= effectiveMax)
+            object? eco = GroundControlReflection.GetEcoInstance();
+            int factories = GroundControlReflection.CountFactories(hq);
+            int effectiveMax = AiEconomySettings.GetEffectiveMaxFactories(eco, hq, profile);
+            if (factories >= effectiveMax)
             {
                 __result = 0f;
                 return false;
             }
+
+            if (eco != null)
+            {
+                int goldMines = GroundControlReflection.CountGoldMines(eco, hq);
+                float gross = GroundControlReflection.GetHqIncomePerMinute(eco, hq);
+                if (goldMines == 0 && gross >= 150f && !AiEconomySettings.IsMineBuildBlocked(eco, hq, profile))
+                {
+                    __result = 0f;
+                    return false;
+                }
+
+                int target = GroundControlReflection.GetEnemyFactoryTarget(eco, hq);
+                if (factories >= target && !(hq.factionFunds >= 1500f && goldMines >= 1 && GroundControlReflection.GetBestDepotLevel(hq) >= 3))
+                {
+                    __result = 0f;
+                    return false;
+                }
+            }
         }
 
         return true;
+    }
+}
+
+[HarmonyPatch]
+internal static class EnemyReviewAirFundGuardPatch
+{
+    private static bool Prepare() => GroundControlReflection.EnemyReviewMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EnemyReviewMethod!;
+
+    private static void Postfix(object __instance, FactionHQ? hq, FactionHQ? localHq)
+    {
+        AiEconomyProfile profile = AiEconomySettings.GetActiveProfile();
+        if (profile.IsVanilla
+            || hq == null
+            || !((Mirage.NetworkBehaviour)hq).IsServer
+            || !GroundControlReflection.IsAiFaction(hq, localHq))
+        {
+            return;
+        }
+
+        object? eco = GroundControlReflection.GetEcoInstance();
+        float gross = GroundControlReflection.GetHqIncomePerMinute(eco, hq);
+        if (gross < 250f || hq.factionFunds < 350f)
+        {
+            return;
+        }
+
+        object? cmdState = GroundControlReflection.TryGetCommanderState(__instance, hq);
+        if (cmdState == null)
+        {
+            return;
+        }
+
+        float airFund = GroundControlReflection.GetStateFloat(cmdState, GroundControlReflection.StateAirFundProp);
+        if (airFund < 220f)
+        {
+            // Keep the virtual AirFund allocation hydrated from healthy faction cash so savedBuildReserve cannot starve air launches.
+            float floor = Mathf.Min(300f, hq.factionFunds * 0.35f);
+            if (floor > airFund)
+            {
+                GroundControlReflection.SetStateFloat(cmdState, GroundControlReflection.StateAirFundProp, floor);
+            }
+        }
     }
 }
 
@@ -1383,41 +1569,51 @@ internal static class TryPickEnemyBuildSiteSafePatch
             return true;
         }
 
-        float minSpacingSq = MinDispersalMeters * MinDispersalMeters;
-        for (int b = 0; b < SafeBaseScratch.Count; b++)
+        float innerSpacingSq = MinDispersalMeters * MinDispersalMeters;
+        float outerSpacingSq = 110f * 110f;
+        object? eco = GroundControlReflection.GetEcoInstance();
+        for (int ring = 0; ring < 2; ring++)
         {
-            Airbase ab = SafeBaseScratch[b];
-            if (ab == null || ab.disabled || !GroundControlReflection.IsLandBase(ab))
-            {
-                continue;
-            }
+            float minR = ring == 0 ? 220f : 450f;
+            float maxR = ring == 0 ? 450f : 900f;
+            float spacingSq = ring == 0 ? innerSpacingSq : outerSpacingSq;
+            int attempts = ring == 0 ? 10 : 8;
 
-            Transform anchorTf = ab.center != null ? ab.center : ab.transform;
-            GlobalPosition anchor = anchorTf.GlobalPosition();
-            for (int attempt = 0; attempt < 10; attempt++)
+            for (int b = 0; b < SafeBaseScratch.Count; b++)
             {
-                float angle = Random.Range(0f, Mathf.PI * 2f);
-                float radius = Random.Range(220f, 450f);
-                var probe = new GlobalPosition(
-                    anchor.x + Mathf.Cos(angle) * radius,
-                    anchor.y,
-                    anchor.z + Mathf.Sin(angle) * radius);
-                GlobalPosition candidate = GroundControlReflection.SnapToTerrain(probe);
-                if (GroundControlReflection.IsBelowSeaLevel(candidate)
-                    || GroundControlReflection.BuildPreviewIsOnLevelRoad(candidate, 24f)
-                    || !GroundControlReflection.CanDriveBetween(anchor, candidate))
+                Airbase ab = SafeBaseScratch[b];
+                if (ab == null || ab.disabled || !GroundControlReflection.IsLandBase(ab))
                 {
                     continue;
                 }
 
-                if (!HasMinOwnedBuildingSpacing(GroundControlReflection.GetEcoInstance(), hq, candidate, minSpacingSq))
+                Transform anchorTf = ab.center != null ? ab.center : ab.transform;
+                GlobalPosition anchor = anchorTf.GlobalPosition();
+                for (int attempt = 0; attempt < attempts; attempt++)
                 {
-                    continue;
-                }
+                    float angle = Random.Range(0f, Mathf.PI * 2f);
+                    float radius = Random.Range(minR, maxR);
+                    var probe = new GlobalPosition(
+                        anchor.x + Mathf.Cos(angle) * radius,
+                        anchor.y,
+                        anchor.z + Mathf.Sin(angle) * radius);
+                    GlobalPosition candidate = GroundControlReflection.SnapToTerrain(probe);
+                    if (GroundControlReflection.IsBelowSeaLevel(candidate)
+                        || GroundControlReflection.BuildPreviewIsOnLevelRoad(candidate, 24f)
+                        || !GroundControlReflection.CanDriveBetween(anchor, candidate))
+                    {
+                        continue;
+                    }
 
-                site = candidate;
-                __result = true;
-                return false;
+                    if (!HasMinOwnedBuildingSpacing(eco, hq, candidate, spacingSq))
+                    {
+                        continue;
+                    }
+
+                    site = candidate;
+                    __result = true;
+                    return false;
+                }
             }
         }
 
@@ -1477,6 +1673,16 @@ internal static class GetEnemyDockCostOutpostPatch
         if (upToLevel == 1)
         {
             __result = AiCoastalOutpostService.Instance.EvaluateDockOrOutpostCost(__instance, hq, __result);
+            return;
+        }
+
+        if (hq != null && AiCoastalOutpostService.Instance.IsEnabledFor(hq))
+        {
+            int targetLevel = Mathf.Max(upToLevel, GroundControlReflection.GetNavalDockLevel(hq) + 1);
+            if (!AiCoastalOutpostService.Instance.IsEconomyReadyForNavalDockLevel(__instance, hq, targetLevel))
+            {
+                __result = 0f;
+            }
         }
     }
 }
@@ -1493,6 +1699,38 @@ internal static class TryBuildEnemyDockOutpostPatch
         {
             __result = handled;
             return false;
+        }
+
+        if (hq != null && AiCoastalOutpostService.Instance.IsEnabledFor(hq))
+        {
+            int targetLevel = Mathf.Max(1, GroundControlReflection.GetNavalDockLevel(hq) + 1);
+            if (targetLevel <= upToLevel && !AiCoastalOutpostService.Instance.IsEconomyReadyForNavalDockLevel(__instance, hq, targetLevel))
+            {
+                __result = false;
+                return false;
+            }
+        }
+
+        return true;
+    }
+}
+
+[HarmonyPatch]
+internal static class TryUpgradeEnemyNavalDockOutpostPatch
+{
+    private static bool Prepare() => GroundControlReflection.EcoTryUpgradeEnemyNavalDockMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EcoTryUpgradeEnemyNavalDockMethod!;
+
+    private static bool Prefix(object __instance, FactionHQ hq, ref bool __result)
+    {
+        if (hq != null && AiCoastalOutpostService.Instance.IsEnabledFor(hq))
+        {
+            int targetLevel = GroundControlReflection.GetNavalDockLevel(hq) + 1;
+            if (!AiCoastalOutpostService.Instance.IsEconomyReadyForNavalDockLevel(__instance, hq, targetLevel))
+            {
+                __result = false;
+                return false;
+            }
         }
 
         return true;
@@ -1588,5 +1826,30 @@ internal static class IsStuckAiBuilderOutpostPatch
         }
 
         return true;
+    }
+}
+
+[HarmonyPatch]
+internal static class SlingEndJobOutpostPatch
+{
+    private static bool Prepare() => GroundControlReflection.SlingEndJobMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.SlingEndJobMethod!;
+
+    private static void Prefix(object? job)
+    {
+        if (job == null)
+        {
+            return;
+        }
+
+        bool carrying = GroundControlReflection.SlingJobCarryingProp?.GetValue(job) is bool c && c;
+        if (carrying)
+        {
+            return;
+        }
+
+        Unit? load = GroundControlReflection.SlingJobLoadProp?.GetValue(job) as Unit;
+        GlobalPosition drop = GroundControlReflection.SlingJobDropProp?.GetValue(job) is GlobalPosition d ? d : default;
+        AiCoastalOutpostService.Instance.NotifyFailedSlingLift(GroundControlReflection.GetEcoInstance(), load, drop);
     }
 }

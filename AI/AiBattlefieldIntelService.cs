@@ -270,16 +270,7 @@ internal sealed class AiBattlefieldIntelService : IAddonTick, IAddonResetSession
                 continue;
             }
 
-            bool isMainEffort = false;
-            if (entry.Key != null)
-            {
-                // Dictionary key is ValueTuple<Airbase, int>
-                FieldInfo? item2Field = entry.Key.GetType().GetField("Item2");
-                if (item2Field != null && item2Field.GetValue(entry.Key) is int slot && slot == -1)
-                {
-                    isMainEffort = true;
-                }
-            }
+            bool isMainEffort = entry.Key is ValueTuple<Airbase, int> slotKey && slotKey.Item2 == -1;
 
             bool isFormingOrActive = false;
             if (GroundControlReflection.DriveCommittedProp?.GetValue(driveObj) is List<Unit> committed && committed.Count > 0)
@@ -361,7 +352,9 @@ internal sealed class AiBattlefieldIntelService : IAddonTick, IAddonResetSession
 
                 float mdsRange = weaponRange > 0f
                     ? weaponRange
-                    : (radarRange > 0f ? Mathf.Min(radarRange, 35000f) : (mdsStatus.IsFireControlRadar ? mdsStatus.FcuRadiusKm * 1000f : 16000f));
+                    : (radarRange > 0f
+                        ? Mathf.Min(radarRange, 35000f)
+                        : (mdsStatus.IsFireControlRadar ? Mathf.Max(mdsStatus.FcuRadiusKm * 1000f, 32000f) : 16000f));
                 if (mdsRange <= 0f)
                 {
                     mdsRange = 16000f;
@@ -444,12 +437,12 @@ internal sealed class AiBattlefieldIntelService : IAddonTick, IAddonResetSession
             return 0f;
         }
 
-        float totalRisk = SampleSegmentSamRisk(state.SamBubbles, from, waypoint);
-        totalRisk += SampleSegmentSamRisk(state.SamBubbles, waypoint, target);
+        float totalRisk = SampleSegmentSamRisk(state.SamBubbles, from, waypoint, target);
+        totalRisk += SampleSegmentSamRisk(state.SamBubbles, waypoint, target, target);
         return totalRisk;
     }
 
-    private static float SampleSegmentSamRisk(List<SamThreatBubble> bubbles, GlobalPosition a, GlobalPosition b)
+    private static float SampleSegmentSamRisk(List<SamThreatBubble> bubbles, GlobalPosition a, GlobalPosition b, GlobalPosition excludeNearTarget)
     {
         float segDist = FastMath.Distance(a, b);
         if (segDist < 100f)
@@ -467,7 +460,7 @@ internal sealed class AiBattlefieldIntelService : IAddonTick, IAddonResetSession
             for (int i = 0; i < bubbles.Count; i++)
             {
                 SamThreatBubble bubble = bubbles[i];
-                if (bubble.WezRadiusMeters <= 100f)
+                if (bubble.WezRadiusMeters <= 100f || FastMath.InRange(bubble.Pos, excludeNearTarget, 6000f))
                 {
                     continue;
                 }

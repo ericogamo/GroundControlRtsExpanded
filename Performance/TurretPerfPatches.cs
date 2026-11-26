@@ -136,8 +136,19 @@ internal static class TurretIdleThrottlePatch
             return true;
         }
 
-        return unit.definition is VehicleDefinition vd
-            && (vd.vehicleType == VehicleType.R_SAM || vd.vehicleType == VehicleType.IR_SAM);
+        if (unit.definition is VehicleDefinition vd)
+        {
+            return vd.vehicleType == VehicleType.R_SAM
+                || vd.vehicleType == VehicleType.IR_SAM
+                || vd.vehicleType == VehicleType.AAA;
+        }
+
+        if (unit is Ship || unit is Building)
+        {
+            return unit.definition != null && unit.definition.roleIdentity.antiAir > 0f;
+        }
+
+        return false;
     }
 
     private static void PruneExpired(float now)

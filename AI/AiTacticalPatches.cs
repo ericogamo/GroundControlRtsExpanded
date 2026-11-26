@@ -51,7 +51,9 @@ internal static class TryBuyRoleSeadPriorityPatch
         }
 
         PlayerThreatSnapshot threat = AiStrategicDirectorService.Instance.ReadPlayerThreat(hq);
+        bool hasAradCapableAir = HasAradCapableAircraft(hq);
         bool urgentSead = AddonConfig.SeadBeforeStrike.Value
+            && hasAradCapableAir
             && threat.SamRadars >= 1
             && AiTacticalDoctrineService.Instance.HasDetectedEnemyRadar(hq)
             && AiTacticalDoctrineService.Instance.CountAirborneRadarHunters(hq) < Mathf.Clamp(threat.SamRadars, 1, 3);
@@ -95,6 +97,29 @@ internal static class TryBuyRoleSeadPriorityPatch
     {
         SuppressAntiShipForCurrentBuy = __state;
         return __exception;
+    }
+
+    private static bool HasAradCapableAircraft(FactionHQ hq)
+    {
+        foreach (Airbase ab in hq.GetAirbases())
+        {
+            if (ab == null || ab.disabled)
+            {
+                continue;
+            }
+
+            foreach (AircraftDefinition def in ab.GetAvailableAircraft())
+            {
+                if (def != null
+                    && def.roleIdentity.antiRadar >= 0.40f
+                    && GroundControlReflection.EnemyCanLaunchFrom(ab, hq, def))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 }
 
@@ -349,11 +374,10 @@ internal static class TaskAirWingSeadHoldPatch
         {
             __state.HoldActive = true;
             int curGoal = GroundControlReflection.StateWaveGoalProp.GetValue(state) is int g ? g : 0;
-            AiTacticalDoctrineService.Instance.NoteSavedWaveGoal(hq, curGoal);
-            GroundControlReflection.StateWaveWaitSinceProp.SetValue(state, Time.time);
-            // Prevent early launch via wave count threshold while holding for SEAD.
             if (curGoal < 99)
             {
+                AiTacticalDoctrineService.Instance.NoteSavedWaveGoal(hq, curGoal);
+                GroundControlReflection.StateWaveWaitSinceProp.SetValue(state, Time.time);
                 GroundControlReflection.StateWaveGoalProp.SetValue(state, 99);
             }
         }
@@ -450,6 +474,11 @@ internal static class TaskAirWingSeadHoldPatch
                         continue;
                     }
 
+                    if (!AiOperationalManeuverService.Instance.ShouldRetargetAirForQrf(ac, alertPos))
+                    {
+                        continue;
+                    }
+
                     // Rotary CAS gunships respond directly to rear surface QRF alert
                     GroundControlReflection.AirClearAiRoute(ac);
                     GroundControlReflection.AirClearAiForcedTarget(ac);
@@ -468,7 +497,7 @@ internal static class TaskAirWingSeadHoldPatch
                 if (role == 1)
                 {
                     // Divert every 2nd fighter on patrol to cover rear QRF airspace
-                    if ((fighterIndex++ % 2) == 0)
+                    if ((fighterIndex++ % 2) == 0 && AiOperationalManeuverService.Instance.ShouldRetargetAirForQrf(ac, alertPos))
                     {
                         GroundControlReflection.AirClearAiRoute(ac);
                         GroundControlReflection.AirClearAiForcedTarget(ac);
@@ -476,7 +505,7 @@ internal static class TaskAirWingSeadHoldPatch
                         GroundControlReflection.AirRetargetAiMission(ac, 2 /* AirGuard */, alertPos, 12000f);
                     }
                 }
-                else if (role == 0 && !isAirAttack)
+                else if (role == 0 && !isAirAttack && AiOperationalManeuverService.Instance.ShouldRetargetAirForQrf(ac, alertPos))
                 {
                     // Non-strategic CAS fixed-wing responds to rear surface threats
                     GroundControlReflection.AirClearAiRoute(ac);
@@ -656,6 +685,15 @@ internal static class PickWaveFlankSamAvoidPatch
 
         if (riskStraight <= riskLeft + 0.05f && riskStraight <= riskRight + 0.05f)
         {
+            if (AiBattlefieldIntelService.Instance.HasLongRangeSamThreat(aiHq, target, 18000f))
+            {
+                __result = riskLeft <= riskRight ? wpLeft : wpRight;
+                approach = riskLeft <= riskRight
+                    ? "round the left flank (stalled SAM avoidance)"
+                    : "round the right flank (stalled SAM avoidance)";
+                return;
+            }
+
             __result = null;
             approach = "straight in (lowest SAM risk)";
             return;
@@ -686,10 +724,14 @@ internal static class CogTargetSelectorHelper
         float score = unit.definition.value;
 
         bool isMdsRadarOrFcu = false;
+        bool isMdsWeaponSite = false;
+        bool isMdsCommandCenter = false;
         if (MdsBridgeBootstrap.IsMdsSelectableUnit?.Invoke(unit) == true && MdsBridgeBootstrap.QueryMdsSiteUiStatus != null)
         {
             var mds = MdsBridgeBootstrap.QueryMdsSiteUiStatus(unit);
             isMdsRadarOrFcu = mds.IsFireControlRadar || (mds.IsWeaponSite && unit.HasRadarEmission());
+            isMdsWeaponSite = mds.IsWeaponSite;
+            isMdsCommandCenter = mds.IsCommandCenter;
         }
 
         bool isRadarBuilding = unit is Building && unit.definition is BuildingDefinition bdr && bdr.buildingType == BuildingType.RDR;
@@ -699,6 +741,14 @@ internal static class CogTargetSelectorHelper
         if (isMdsRadarOrFcu || (unit.HasRadarEmission() && (isRadarBuilding || isSamRadarVeh)))
         {
             score += 160000f;
+        }
+        else if (isMdsWeaponSite)
+        {
+            score += 135000f;
+        }
+        else if (isMdsCommandCenter)
+        {
+            score += 120000f;
         }
         else if (TryGetCitySpec(unit, out RtsBuildingSpec spec))
         {
@@ -1524,15 +1574,16 @@ internal static class LaunchWaveCombinedArmsPatch
 
     private static void Prefix(object __instance, ref int required)
     {
-        if (!AddonConfig.EnableTacticalQualityAi.Value || required > 0)
+        if (!AddonConfig.EnableTacticalQualityAi.Value || required <= 0)
         {
             return;
         }
 
         if (GroundControlReflection.CaptureSquadField?.GetValue(__instance) is List<Unit> squad && squad.Count >= 4)
         {
-            // Keep combined-arms groups cohesive at the form-up point (respects GC's 240s form-up timeout).
-            required = Mathf.Min(squad.Count, Mathf.Max(6, Mathf.CeilToInt(squad.Count * 0.7f)));
+            // Keep combined-arms assault groups cohesive against enemy-held bases (respects GC's form-up timeout).
+            int cohesiveFloor = Mathf.Min(squad.Count, Mathf.CeilToInt(squad.Count * 0.7f));
+            required = Mathf.Max(required, cohesiveFloor);
         }
     }
 }
@@ -1875,8 +1926,10 @@ internal static class PinToManeuverGuardPatch
     private static bool Prepare() => GroundControlReflection.EnemyPinToMethod != null;
     private static MethodBase TargetMethod() => GroundControlReflection.EnemyPinToMethod!;
 
-    private static bool Prefix(Unit? unit)
-        => AiOperationalManeuverService.IsIssuingManagedOrder || !AiOperationalManeuverService.Instance.IsUnitManaged(unit);
+    private static bool Prefix(Unit? unit, GlobalPosition spot)
+        => AiOperationalManeuverService.IsIssuingManagedOrder
+            || !AiOperationalManeuverService.Instance.IsUnitManaged(unit)
+            || AiOperationalManeuverService.Instance.IsManagedExpectedDestination(unit, spot);
 }
 
 [HarmonyPatch]

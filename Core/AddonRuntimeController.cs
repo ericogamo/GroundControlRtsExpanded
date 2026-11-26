@@ -63,7 +63,9 @@ internal sealed class AddonRuntimeController : MonoBehaviour
 
     private void OnGUI()
     {
-        if (!GroundControlReflection.IsCommanderModeActive() && !PerfMetricsService.Instance.IsOverlayVisible)
+        if (!GroundControlReflection.IsCommanderModeActive()
+            && !PerfMetricsService.Instance.IsOverlayVisible
+            && !EconomyTrackerUiService.Instance.IsWindowVisible)
         {
             return;
         }
@@ -85,6 +87,8 @@ internal sealed class AddonRuntimeController : MonoBehaviour
     private void OnActiveSceneChanged(Scene previousScene, Scene newScene)
     {
         CustomPreviewService.ResetSession();
+        DuelOppositeAirbaseStartPatch.ResetSession();
+        BaseCaptureIncomeService.ResetSession();
         ModelRegistry.ClearRuntimeCache();
         for (int i = 0; i < resetServices.Count; i++)
         {

@@ -1560,7 +1560,7 @@ internal static class RoadPathfinderNoConnectionPatch
             }
 
             float startToCand = FastMath.Distance(startPos, cand.position);
-            if (startToCand >= directDist * 0.85f)
+            if (startToCand >= directDist * 0.85f || SegmentCrossesWater(startPos, cand.position))
             {
                 continue;
             }
@@ -1599,5 +1599,22 @@ internal static class RoadPathfinderNoConnectionPatch
 
         results.Clear();
         result = RoadPathfinder.PathfindResult.NoRoadNearTarget;
+    }
+
+    private static bool SegmentCrossesWater(GlobalPosition a, GlobalPosition b)
+    {
+        const int samples = 10;
+        for (int i = 1; i < samples; i++)
+        {
+            float t = (float)i / samples;
+            GlobalPosition probe = FastMath.Lerp(a, b, t);
+            GlobalPosition snapped = GroundControlReflection.SnapToTerrain(probe);
+            if (GroundControlReflection.IsBelowSeaLevel(snapped))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

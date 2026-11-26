@@ -1024,6 +1024,135 @@ internal static class RecruitAirDefenceTriadPatch
             preferSamStation: true,
             counts.Sams,
             u => AiAirDefenceHelper.IsStationCramUnit(u, catalog));
+
+        // 4. Guard exposed Gold Mines (>1200 m from existing AD stations) with 1 surplus C-RAM/SHORAD if stations are healthy.
+        GuardExposedMinesWithSurplusShorad(hq, defencePosts, sites, defenders, slots, counts.Crams, catalog);
+    }
+
+    private static void GuardExposedMinesWithSurplusShorad(
+        FactionHQ hq,
+        List<GlobalPosition> defencePosts,
+        int sites,
+        Dictionary<Unit, int> defenders,
+        IDictionary? slots,
+        int[] cramCounts,
+        List<VehicleDefinition>? catalog)
+    {
+        if (hq.factionUnits == null)
+        {
+            return;
+        }
+
+        object? eco = GroundControlReflection.GetEcoInstance();
+        if (eco == null)
+        {
+            return;
+        }
+
+        GlobalPosition? exposedMinePos = null;
+        foreach (PersistentID pid in hq.factionUnits)
+        {
+            if (!pid.TryGetUnit(out Unit unit) || unit == null || unit.disabled || !(unit is Building))
+            {
+                continue;
+            }
+
+            object? kind = GroundControlReflection.GetIncomeKind(eco, unit);
+            if (!GroundControlReflection.IsMineBuildKind(kind))
+            {
+                continue;
+            }
+
+            GlobalPosition mPos = unit.GlobalPosition();
+            bool covered = false;
+            for (int p = 0; p < sites && p < defencePosts.Count; p++)
+            {
+                if (FastMath.InRange(defencePosts[p], mPos, 1200f))
+                {
+                    covered = true;
+                    break;
+                }
+            }
+
+            if (!covered)
+            {
+                bool hasDefenderNearMine = false;
+                foreach (Unit d in defenders.Keys)
+                {
+                    if (d != null && !d.disabled && FastMath.InRange(d.GlobalPosition(), mPos, 900f))
+                    {
+                        hasDefenderNearMine = true;
+                        break;
+                    }
+                }
+
+                if (!hasDefenderNearMine)
+                {
+                    foreach (PersistentID adPid in hq.factionUnits)
+                    {
+                        if (!adPid.TryGetUnit(out Unit adUnit) || adUnit == null || adUnit.disabled)
+                        {
+                            continue;
+                        }
+
+                        bool isAd = (adUnit is GroundVehicle && adUnit.definition is VehicleDefinition adVeh && GroundControlReflection.IsAirDefence(adVeh))
+                            || (adUnit is Building && adUnit.definition is BuildingDefinition adBld && adBld.buildingType == BuildingType.DEF);
+                        if (isAd && FastMath.InRange(adUnit.GlobalPosition(), mPos, 950f))
+                        {
+                            hasDefenderNearMine = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!hasDefenderNearMine)
+                {
+                    exposedMinePos = mPos;
+                    break;
+                }
+            }
+        }
+
+        if (!exposedMinePos.HasValue)
+        {
+            return;
+        }
+
+        Unit? surplusCram = null;
+        float bestDistSq = float.MaxValue;
+        foreach (KeyValuePair<Unit, int> kv in defenders)
+        {
+            Unit u = kv.Key;
+            int post = kv.Value;
+            if (u == null || u.disabled || post < 0 || post >= sites)
+            {
+                continue;
+            }
+
+            if (!AiAirDefenceHelper.IsStationCramUnit(u, catalog) || cramCounts[post] < 2)
+            {
+                continue;
+            }
+
+            if (!GroundControlReflection.CanDriveBetween(u.GlobalPosition(), exposedMinePos.Value))
+            {
+                continue;
+            }
+
+            float dSq = FastMath.SquareDistance(u.GlobalPosition(), exposedMinePos.Value);
+            if (dSq < bestDistSq)
+            {
+                bestDistSq = dSq;
+                surplusCram = u;
+            }
+        }
+
+        if (surplusCram != null)
+        {
+            defenders.Remove(surplusCram);
+            slots?.Remove(surplusCram);
+            GroundControlReflection.EnemyHoldAt(surplusCram, exposedMinePos.Value);
+        }
     }
 
     private static void ReconcileStationRole(

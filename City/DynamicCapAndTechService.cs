@@ -96,7 +96,7 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
     private const float SnapshotTtlSeconds = 0.5f;
     private const float AdoptScanIntervalSeconds = 2.0f;
     private const float LogisticsAuraIntervalSeconds = 3.0f;
-    private const float AiCityReviewCooldownSeconds = 18.0f;
+    private const float AiCityReviewCooldownSeconds = 8.0f;
     private const float NoticeCooldownSeconds = 15.0f;
     private const int ArtilleryVehicleTypeInt = 5;
 
@@ -637,17 +637,17 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
         FactionCapSnapshot snap = GetSnapshot(hq);
         GetOwnedBuildings(hq, ownedScratch);
 
-        // 0. Faction-appropriate modular air defence / contractor batteries via MDSFramework (cooldown-gated, never starved by City steps 1-7)
-        MdsBridgeBootstrap.TickAiMdsDeploymentAction?.Invoke(hq);
-
-        // 1. Ensure a Command HQ exists first
+        // 1. Ensure a Command HQ exists first (before MDS/City expansion so TechTier never stays locked at 1)
         if (snap.CommandHqCount == 0 && CountInProgressBlueprints(hq, RtsBuildingKind.CommandHq) == 0)
         {
-            if (TryQueueAiCityBuilding(ecoInstance, hq, RtsBuildingKind.CommandHq, minReserve: 220f, isUrgentCapRelief: false))
+            if (TryQueueAiCityBuilding(ecoInstance, hq, RtsBuildingKind.CommandHq, minReserve: 180f, isUrgentCapRelief: false))
             {
                 return;
             }
         }
+
+        // 1b. Faction-appropriate modular air defence / contractor batteries via MDSFramework
+        MdsBridgeBootstrap.TickAiMdsDeploymentAction?.Invoke(hq);
 
         // 2. Expand ground capacity when close to ground cap or if no Barracks yet
         bool urgentGround = snap.GroundUsed >= snap.GroundCap - 2;
@@ -667,23 +667,26 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
             }
         }
 
-        // 3. Push Command HQ -> Lvl 2 once initial Barracks exists
-        if (snap.CommandHqLevel == 1 && snap.BarracksCount >= 1 && hq.factionFunds >= 460f)
+        // 3. Push Command HQ -> Lvl 2 cleanly once Barracks exists (or funds are healthy)
+        if (snap.CommandHqLevel == 1
+            && ((snap.BarracksCount >= 1 && hq.factionFunds >= 350f) || hq.factionFunds >= 480f))
         {
-            if (TryUpgradeAiBuilding(ecoInstance, hq, RtsBuildingKind.CommandHq, snap.TechTier, reserveFactor: 1.3f, isUrgentCapRelief: false))
+            if (TryUpgradeAiBuilding(ecoInstance, hq, RtsBuildingKind.CommandHq, snap.TechTier, reserveFactor: 1.15f, isUrgentCapRelief: false))
             {
                 return;
             }
         }
 
-        // 4. Pilot Academy for Tier-2+ air operations
-        if (snap.TechTier >= 2
-            && (snap.PilotAcademyCount == 0
-                || snap.AirUsed >= Mathf.Max(1, snap.AirCap - 1)
-                || (snap.TechTier >= 3 && snap.BestPilotAcademyLevel < 2)))
+        // 4. Pilot Academy (Tier 1 unlocked — build early when air cap tightens or HQ exists, upgrade at Tier 2+)
+        bool urgentAir = snap.AirUsed >= snap.AirCap;
+        bool needFirstAcademy = snap.PilotAcademyCount == 0
+            && (snap.AirUsed >= Mathf.Max(1, snap.AirCap - 1) || snap.CommandHqCount >= 1 || snap.TechTier >= 2);
+        bool needMoreAir = snap.TechTier >= 2
+            && (snap.AirUsed >= Mathf.Max(1, snap.AirCap - 1) || (snap.TechTier >= 3 && snap.BestPilotAcademyLevel < 2));
+        if (needFirstAcademy || needMoreAir)
         {
-            bool urgentAir = snap.AirUsed >= snap.AirCap;
-            if (TryUpgradeAiBuilding(ecoInstance, hq, RtsBuildingKind.PilotAcademy, snap.TechTier, reserveFactor: 1.4f, isUrgentCapRelief: urgentAir))
+            if (snap.TechTier >= 2
+                && TryUpgradeAiBuilding(ecoInstance, hq, RtsBuildingKind.PilotAcademy, snap.TechTier, reserveFactor: 1.2f, isUrgentCapRelief: urgentAir))
             {
                 return;
             }
@@ -692,7 +695,7 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
                 || (snap.AirUsed >= snap.AirCap - 1 && snap.BestPilotAcademyLevel >= snap.TechTier);
             if (canBuildAnotherAcademy
                 && CountInProgressBlueprints(hq, RtsBuildingKind.PilotAcademy) == 0
-                && TryQueueAiCityBuilding(ecoInstance, hq, RtsBuildingKind.PilotAcademy, minReserve: 280f, isUrgentCapRelief: urgentAir))
+                && TryQueueAiCityBuilding(ecoInstance, hq, RtsBuildingKind.PilotAcademy, minReserve: urgentAir ? 180f : 220f, isUrgentCapRelief: urgentAir))
             {
                 return;
             }
@@ -727,35 +730,35 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
             }
         }
 
-        // 7. Late-game Command HQ -> Lvl 3 when rich and established
+        // 7. Late-game Command HQ -> Lvl 3 when established
         if (snap.CommandHqLevel == 2
-            && snap.BarracksCount >= 2
+            && snap.BarracksCount >= 1
             && snap.PilotAcademyCount >= 1
-            && hq.factionFunds >= 850f)
+            && hq.factionFunds >= 700f)
         {
-            TryUpgradeAiBuilding(ecoInstance, hq, RtsBuildingKind.CommandHq, snap.TechTier, reserveFactor: 1.25f, isUrgentCapRelief: false);
+            TryUpgradeAiBuilding(ecoInstance, hq, RtsBuildingKind.CommandHq, snap.TechTier, reserveFactor: 1.15f, isUrgentCapRelief: false);
         }
 
         // 8. Late-game AI Tier-3 ABM site (max 1 Plant, 1 Radar, 1 Silo built by M12 Jackknife)
-        if (AddonConfig.AllowAiAbmSite.Value && snap.TechTier >= 3 && hq.factionFunds >= 1100f)
+        if (AddonConfig.AllowAiAbmSite.Value && snap.TechTier >= 3 && hq.factionFunds >= 550f)
         {
             if (snap.AbmPlantCount == 0
                 && CountInProgressBlueprints(hq, RtsBuildingKind.AbmPlant) == 0
-                && TryQueueAiCityBuilding(ecoInstance, hq, RtsBuildingKind.AbmPlant, minReserve: 650f, isUrgentCapRelief: false))
+                && TryQueueAiCityBuilding(ecoInstance, hq, RtsBuildingKind.AbmPlant, minReserve: 380f, isUrgentCapRelief: false))
             {
                 return;
             }
 
             if (snap.AbmRadarCount == 0
                 && CountInProgressBlueprints(hq, RtsBuildingKind.AbmRadar) == 0
-                && TryQueueAiCityBuilding(ecoInstance, hq, RtsBuildingKind.AbmRadar, minReserve: 600f, isUrgentCapRelief: false))
+                && TryQueueAiCityBuilding(ecoInstance, hq, RtsBuildingKind.AbmRadar, minReserve: 280f, isUrgentCapRelief: false))
             {
                 return;
             }
 
             if (snap.AbmSiloCount == 0
                 && CountInProgressBlueprints(hq, RtsBuildingKind.AbmSilo) == 0
-                && TryQueueAiCityBuilding(ecoInstance, hq, RtsBuildingKind.AbmSilo, minReserve: 650f, isUrgentCapRelief: false))
+                && TryQueueAiCityBuilding(ecoInstance, hq, RtsBuildingKind.AbmSilo, minReserve: 350f, isUrgentCapRelief: false))
             {
                 return;
             }
@@ -1142,7 +1145,7 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
                 {
                     groundUsed++;
                 }
-                else if (unit is Aircraft)
+                else if (unit is Aircraft aircraft && aircraft.Player == null)
                 {
                     airUsed++;
                 }

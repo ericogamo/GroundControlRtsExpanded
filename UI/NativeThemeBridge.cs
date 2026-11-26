@@ -254,6 +254,7 @@ internal static class NativeThemeBridge
     internal static bool IsAnyAddonUiUnderScreenPoint(Vector2 screenPoint)
     {
         if (RtsCityUiService.Instance.ContainsScreenPoint(screenPoint)
+            || EconomyTrackerUiService.Instance.ContainsScreenPoint(screenPoint)
             || AbmDefenseService.Instance.ContainsScreenPoint(screenPoint)
             || PioneerRoadService.Instance.ContainsScreenPoint(screenPoint)
             || MdsFlatbedHaulService.Instance.ContainsScreenPoint(screenPoint)

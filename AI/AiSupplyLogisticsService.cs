@@ -85,7 +85,7 @@ internal sealed class AiSupplyLogisticsService : IAddonTick, IAddonResetSession
     }
 
     internal static AiSupplyLogisticsService Instance { get; } = new();
-    internal static bool SuppressPlayerNotice { get; private set; }
+    internal static bool SuppressPlayerNotice { get; set; }
 
     private readonly Dictionary<(FactionHQ Hq, int CellX, int CellZ), float> stationHeliCooldownUntil = new();
     private readonly Dictionary<Unit, GlobalPosition> activeTruckDestinations = new();
@@ -238,9 +238,15 @@ internal sealed class AiSupplyLogisticsService : IAddonTick, IAddonResetSession
     private void PruneTruckStateForHq(FactionHQ hq, Unit? strikeTruck)
     {
         staleTrucksScratch.Clear();
-        foreach (Unit truck in activeTruckDestinations.Keys)
+        foreach (KeyValuePair<Unit, GlobalPosition> kv in activeTruckDestinations)
         {
-            if (truck == null || truck.disabled || truck.NetworkHQ == hq || ReferenceEquals(truck, strikeTruck))
+            Unit truck = kv.Key;
+            if (truck == null
+                || truck.disabled
+                || truck.NetworkHQ == null
+                || (ReferenceEquals(truck.NetworkHQ, hq)
+                    && (ReferenceEquals(truck, strikeTruck)
+                        || FastMath.Distance(truck.GlobalPosition(), kv.Value) <= TruckArriveRangeMeters)))
             {
                 staleTrucksScratch.Add(truck!);
             }
@@ -430,6 +436,10 @@ internal sealed class AiSupplyLogisticsService : IAddonTick, IAddonResetSession
                     reservedTrucksScratch.Add(store);
                     restockingTrucks.Remove(store);
                     activeTruckDestinations[store] = targetPos;
+                    if (dist > LocalRearmAssistMeters)
+                    {
+                        GroundControlReflection.TrySetDestination(store, targetPos);
+                    }
                 }
             }
         }
@@ -639,13 +649,19 @@ internal sealed class AiSupplyLogisticsService : IAddonTick, IAddonResetSession
                     lastRefreshedOptionsHq = hq;
                 }
 
-                HeliDispatchCandidate? candidate = SelectBestHeliCandidate(supplyHeli, hq, stationPos);
-                if (candidate == null)
+                if (!TryFindSafeSupplyLz(stationPos, out GlobalPosition lz, out bool useAirdrop))
                 {
                     return;
                 }
 
-                if (!TryFindSafeSupplyLz(stationPos, out GlobalPosition lz, out bool useAirdrop))
+                HeliDispatchCandidate? candidate = SelectBestHeliCandidate(supplyHeli, hq, stationPos, requireAirdrop: useAirdrop);
+                if (candidate == null && useAirdrop)
+                {
+                    // If no airdrop-capable cargo mount exists, still allow landing if slope isn't extreme or skip cleanly.
+                    return;
+                }
+
+                if (candidate == null)
                 {
                     return;
                 }
@@ -665,7 +681,7 @@ internal sealed class AiSupplyLogisticsService : IAddonTick, IAddonResetSession
                         true,
                         100f,
                         useAirdrop,
-                        string.Empty,
+                        "AI-Logistics",
                         false,
                         lz
                     });
@@ -824,7 +840,7 @@ internal sealed class AiSupplyLogisticsService : IAddonTick, IAddonResetSession
         return activeCount >= maxConcurrent;
     }
 
-    private static HeliDispatchCandidate? SelectBestHeliCandidate(object supplyHeli, FactionHQ hq, GlobalPosition stationPos)
+    private static HeliDispatchCandidate? SelectBestHeliCandidate(object supplyHeli, FactionHQ hq, GlobalPosition stationPos, bool requireAirdrop = false)
     {
         if (GroundControlReflection.SupplyHeliAircraftOptionsField?.GetValue(supplyHeli) is not IList options
             || GroundControlReflection.SupplyHeliCreateEmptyLoadoutMethod == null
@@ -892,6 +908,7 @@ internal sealed class AiSupplyLogisticsService : IAddonTick, IAddonResetSession
                         if (mounts[m] is not WeaponMount mount
                             || !WeaponChecker.MountAllowedHQ(mount, hq)
                             || !WeaponChecker.MountAllowedAirbase(mount, airbase)
+                            || (requireAirdrop && !GroundControlReflection.CargoMountSupportsAirdrop(mount))
                             || !GroundControlReflection.TryGetSupplyHeliAmmoCapacity(mount, out float capacityKg))
                         {
                             continue;
@@ -1074,6 +1091,29 @@ internal static class AiSupplyHeliStatusGuardPatch
     private static MethodBase TargetMethod() => GroundControlReflection.SupplyHeliSetStatusMethod!;
 
     private static bool Prefix() => !AiSupplyLogisticsService.SuppressPlayerNotice;
+}
+
+[HarmonyPatch]
+internal static class AiSupplyQueuedCargoSpawnNoticeGuardPatch
+{
+    private static bool Prepare() => GroundControlReflection.SupplyHeliTrySpawnCargoRunAtAirbaseMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.SupplyHeliTrySpawnCargoRunAtAirbaseMethod!;
+
+    private static void Prefix(FactionHQ? hq, out bool __state)
+    {
+        __state = AiSupplyLogisticsService.SuppressPlayerNotice;
+        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
+        if (hq != null && GroundControlReflection.IsAiFaction(hq, localHq))
+        {
+            AiSupplyLogisticsService.SuppressPlayerNotice = true;
+        }
+    }
+
+    private static Exception? Finalizer(Exception? __exception, bool __state)
+    {
+        AiSupplyLogisticsService.SuppressPlayerNotice = __state;
+        return __exception;
+    }
 }
 
 [HarmonyPatch]

@@ -161,6 +161,11 @@ internal static class UnitCapBuilderCapPatch
             return;
         }
 
+        if (EcoTickStartingBuildersContextGuardPatch.InTickStartingBuilders && ReviewContextGuardPatch.ActiveAiHq == null)
+        {
+            return;
+        }
+
         FactionHQ? targetHq = UnitCapHqScope.ResolveCapTargetHq();
         if (targetHq != null)
         {
@@ -181,6 +186,7 @@ internal static class EconomyReviewContextGuardPatch
     private static bool Prepare() => GroundControlReflection.ReviewEnemyMethod != null;
     private static MethodBase TargetMethod() => GroundControlReflection.ReviewEnemyMethod!;
 
+    [HarmonyPriority(Priority.First)]
     private static void Prefix(FactionHQ hq, out FactionHQ? __state)
     {
         __state = ReviewContextGuardPatch.ActiveAiHq;
@@ -190,6 +196,28 @@ internal static class EconomyReviewContextGuardPatch
     private static Exception? Finalizer(Exception? __exception, FactionHQ? __state)
     {
         ReviewContextGuardPatch.ActiveAiHq = __state;
+        return __exception;
+    }
+}
+
+[HarmonyPatch]
+internal static class EcoTickStartingBuildersContextGuardPatch
+{
+    [ThreadStatic]
+    internal static bool InTickStartingBuilders;
+
+    private static bool Prepare() => GroundControlReflection.EcoTickStartingBuildersMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EcoTickStartingBuildersMethod!;
+
+    private static void Prefix(out bool __state)
+    {
+        __state = InTickStartingBuilders;
+        InTickStartingBuilders = true;
+    }
+
+    private static Exception? Finalizer(Exception? __exception, bool __state)
+    {
+        InTickStartingBuilders = __state;
         return __exception;
     }
 }
@@ -544,7 +572,7 @@ internal static class EconomyReviewEnemyCityPatch
     private static bool Prepare() => GroundControlReflection.ReviewEnemyMethod != null;
     private static MethodBase TargetMethod() => GroundControlReflection.ReviewEnemyMethod!;
 
-    private static void Postfix(object __instance, FactionHQ hq)
+    private static void Prefix(object __instance, FactionHQ hq)
     {
         DynamicCapAndTechService.Instance.TickAiCityDecision(__instance, hq);
     }

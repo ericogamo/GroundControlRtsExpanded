@@ -22,6 +22,7 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         internal bool AutoProduce { get; set; } = true;
         internal bool PaidForCurrent { get; set; }
         internal float ProductionElapsed { get; set; }
+        internal bool SeededInitialSilo { get; set; }
     }
 
     private sealed class TrackedBallisticThreat
@@ -362,6 +363,15 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
             if (!((NetworkBehaviour)hq).IsServer)
             {
                 continue;
+            }
+
+            if (state.SiloCount > 0 && !state.SeededInitialSilo)
+            {
+                state.SeededInitialSilo = true;
+                if (state.Stockpile < 2 && state.MaxCapacity > state.Stockpile)
+                {
+                    state.Stockpile = Math.Min(state.MaxCapacity, state.Stockpile + 2);
+                }
             }
 
             if (state.Stockpile > state.MaxCapacity)
