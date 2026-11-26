@@ -45,6 +45,7 @@ internal static class AddonConfig
     internal static ConfigEntry<bool> EnableAiAmbushEmcon { get; private set; } = null!;
     internal static ConfigEntry<float> AiRadarBlinkSeconds { get; private set; } = null!;
     internal static ConfigEntry<bool> EnableAiSmartBaseLayout { get; private set; } = null!;
+    internal static ConfigEntry<bool> EnableAiCoastalOutpost { get; private set; } = null!;
 
     // 04 Performance
     internal static ConfigEntry<bool> EnableAntiLag { get; private set; } = null!;
@@ -352,6 +353,12 @@ internal static class AddonConfig
             "EnableAiSmartBaseLayout",
             true,
             "Prefer safest rear bases, threat-facing defence orientation, and dispersed placement for AI city/economy/MDS buildings.");
+
+        EnableAiCoastalOutpost = config.Bind(
+            "03 Tactical AI",
+            "EnableAiCoastalOutpost",
+            true,
+            "Plan and build a coastal forward outpost (Control Tower + Naval Dock) when an AI faction holds no bases with shoreline access.");
 
         // 04 Performance
         EnableAntiLag = config.Bind(

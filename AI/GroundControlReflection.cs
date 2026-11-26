@@ -621,6 +621,42 @@ internal static class GroundControlReflection
     private static readonly object? BuildKindStructureValue = BuildKindType != null ? Enum.Parse(BuildKindType, "Structure") : null;
     private static readonly object? BuildKindMineValue = BuildKindType != null ? Enum.Parse(BuildKindType, "Mine") : null;
     private static readonly object? BuildKindFactoryValue = BuildKindType != null ? Enum.Parse(BuildKindType, "Factory") : null;
+    private static readonly object? BuildKindNavalDockValue = BuildKindType != null ? Enum.Parse(BuildKindType, "NavalDock") : null;
+    private static readonly object? BuildKindGasTerminalValue = BuildKindType != null ? Enum.Parse(BuildKindType, "GasTerminal") : null;
+
+    // Coastal outpost & long-range builder logistics bindings
+    internal static readonly FieldInfo? EcoShoreSearchFailedField = AccessTools.Field(EconomyServiceType, "shoreSearchFailed");
+    internal static readonly FieldInfo? EcoPreviewField = AccessTools.Field(EconomyServiceType, "preview");
+    internal static readonly FieldInfo? EcoBuilderRestingField = AccessTools.Field(EconomyServiceType, "builderResting");
+    internal static readonly PropertyInfo? EcoNavalDockBuildCostProp = AccessTools.Property(EconomyServiceType, "NavalDockBuildCost");
+    internal static readonly MethodInfo? EcoResolveDefinitionMethod = BuildKindType != null
+        ? AccessTools.Method(EconomyServiceType, "ResolveDefinition", new[] { BuildKindType })
+        : null;
+    internal static readonly MethodInfo? EcoGetEnemyDockCostMethod = AccessTools.Method(EconomyServiceType, "GetEnemyDockCost", new[] { typeof(FactionHQ), typeof(int) });
+    internal static readonly MethodInfo? EcoTryBuildEnemyDockMethod = AccessTools.Method(EconomyServiceType, "TryBuildEnemyDock", new[] { typeof(FactionHQ), typeof(int) });
+    internal static readonly MethodInfo? EcoTryBuildEnemyNavalDockMethod = AccessTools.Method(EconomyServiceType, "TryBuildEnemyNavalDock", new[] { typeof(FactionHQ) });
+    internal static readonly MethodInfo? EcoHasGivenUpOnDockMethod = AccessTools.Method(EconomyServiceType, "HasGivenUpOnDock", new[] { typeof(FactionHQ) });
+    internal static readonly MethodInfo? EcoReviewBuildersMethod = AccessTools.Method(EconomyServiceType, "ReviewBuilders", Type.EmptyTypes);
+    internal static readonly MethodInfo? EcoTryGetStrandedBuilderMethod = AccessTools.Method(EconomyServiceType, "TryGetStrandedBuilder", new[] { typeof(FactionHQ), typeof(GlobalPosition).MakeByRefType(), typeof(Unit).MakeByRefType() });
+    internal static readonly MethodInfo? EcoCollectIdleBuildersMethod = AccessTools.Method(EconomyServiceType, "CollectIdleBuilders", new[] { typeof(FactionHQ), typeof(List<Unit>) });
+    internal static readonly MethodInfo? EcoHasBusyBuilderNearMethod = AccessTools.Method(EconomyServiceType, "HasBusyBuilderNear", new[] { typeof(FactionHQ), typeof(GlobalPosition) });
+    internal static readonly MethodInfo? EcoSendBuilderMethod = FindMethodByNameAndParamCount(EconomyServiceType, "SendBuilder", 2);
+    internal static readonly MethodInfo? EcoIsWaterMethod = AccessTools.Method(EconomyServiceType, "IsWater", new[] { typeof(GlobalPosition), typeof(Vector3), typeof(float) });
+    internal static readonly MethodInfo? EcoIsOpenWaterMethod = AccessTools.Method(EconomyServiceType, "IsOpenWater", new[] { typeof(GlobalPosition), typeof(Vector3), typeof(float) });
+    internal static readonly MethodInfo? EcoReachesSeaMethod = AccessTools.Method(EconomyServiceType, "ReachesSea", new[] { typeof(GlobalPosition) });
+    internal static readonly MethodInfo? EcoCountBlueprintsMethod = FindMethodByNameAndParamCount(EconomyServiceType, "CountBlueprints", 2);
+    internal static readonly MethodInfo? EcoIsNearBuiltTowerMethod = AccessTools.Method(EconomyServiceType, "IsNearBuiltTower", new[] { typeof(FactionHQ), typeof(GlobalPosition) });
+    internal static readonly PropertyInfo? SiteBuildersProp = AccessTools.Property(ConstructionSiteType, "Builders");
+    internal static readonly PropertyInfo? SiteNextBuilderSpawnAtProp = AccessTools.Property(ConstructionSiteType, "NextBuilderSpawnAt");
+    internal static readonly MethodInfo? BuildPreviewIsSiteAllowedMethod = AccessTools.Method(BuildPreviewType, "IsSiteAllowed", new[] { typeof(BuildingDefinition), typeof(GlobalPosition), typeof(FactionHQ), typeof(string).MakeByRefType(), typeof(bool), typeof(Quaternion?) });
+    internal static readonly MethodInfo? BuildPreviewIsShorelineMethod = AccessTools.Method(BuildPreviewType, "IsShoreline", new[] { typeof(GlobalPosition) });
+    internal static readonly MethodInfo? BuildPreviewIsControlTowerMethod = AccessTools.Method(BuildPreviewType, "IsControlTower", new[] { typeof(BuildingDefinition) });
+    internal static readonly MethodInfo? BuildPreviewIsControlTowerUnitMethod = AccessTools.Method(BuildPreviewType, "IsControlTowerUnit", new[] { typeof(Unit) });
+    internal static readonly MethodInfo? SettingsBuildRadiusKmGetter = AccessTools.Property(SettingsType, "BuildRadiusKm")?.GetGetMethod(true);
+    internal static readonly MethodInfo? GameAccessFindRepairVehicleDefinitionMethod = AccessTools.Method(GameAccessType, "FindRepairVehicleDefinition", new[] { typeof(FactionHQ) });
+    internal static readonly MethodInfo? MoveClearOrderMethod = AccessTools.Method(MoveServiceType, "ClearOrder", new[] { typeof(Unit) });
+    internal static readonly MethodInfo? AirBuildSlingLoadoutMethod = AccessTools.Method(AirCommandServiceType, "BuildSlingLoadout", new[] { typeof(AircraftDefinition) });
+    internal static readonly MethodInfo? AirCanAiFlyMethod = AccessTools.Method(AirCommandServiceType, "CanAiFly", new[] { typeof(AircraftDefinition) });
 
     private static bool bindingsValidated;
 
@@ -1175,6 +1211,38 @@ internal static class GroundControlReflection
             ("CommanderSupplyHeliService+PendingTargetSelection", PendingTargetSelectionType),
             ("PendingTargetSelection.Aircraft", PendingTargetSelectionAircraftProp),
             ("PendingTargetSelection.Loadout", PendingTargetSelectionLoadoutProp),
+            ("CommanderBuildKind.NavalDock", BuildKindNavalDockValue),
+            ("CommanderBuildKind.GasTerminal", BuildKindGasTerminalValue),
+            ("CommanderEconomyService.shoreSearchFailed", EcoShoreSearchFailedField),
+            ("CommanderEconomyService.preview", EcoPreviewField),
+            ("CommanderEconomyService.builderResting", EcoBuilderRestingField),
+            ("CommanderEconomyService.NavalDockBuildCost", EcoNavalDockBuildCostProp),
+            ("CommanderEconomyService.ResolveDefinition", EcoResolveDefinitionMethod),
+            ("CommanderEconomyService.GetEnemyDockCost", EcoGetEnemyDockCostMethod),
+            ("CommanderEconomyService.TryBuildEnemyDock", EcoTryBuildEnemyDockMethod),
+            ("CommanderEconomyService.TryBuildEnemyNavalDock", EcoTryBuildEnemyNavalDockMethod),
+            ("CommanderEconomyService.HasGivenUpOnDock", EcoHasGivenUpOnDockMethod),
+            ("CommanderEconomyService.ReviewBuilders", EcoReviewBuildersMethod),
+            ("CommanderEconomyService.TryGetStrandedBuilder", EcoTryGetStrandedBuilderMethod),
+            ("CommanderEconomyService.CollectIdleBuilders", EcoCollectIdleBuildersMethod),
+            ("CommanderEconomyService.HasBusyBuilderNear", EcoHasBusyBuilderNearMethod),
+            ("CommanderEconomyService.SendBuilder(2)", EcoSendBuilderMethod),
+            ("CommanderEconomyService.IsWater", EcoIsWaterMethod),
+            ("CommanderEconomyService.IsOpenWater", EcoIsOpenWaterMethod),
+            ("CommanderEconomyService.ReachesSea", EcoReachesSeaMethod),
+            ("CommanderEconomyService.CountBlueprints(2)", EcoCountBlueprintsMethod),
+            ("CommanderEconomyService.IsNearBuiltTower", EcoIsNearBuiltTowerMethod),
+            ("ConstructionSite.Builders", SiteBuildersProp),
+            ("ConstructionSite.NextBuilderSpawnAt", SiteNextBuilderSpawnAtProp),
+            ("CommanderBuildPreview.IsSiteAllowed", BuildPreviewIsSiteAllowedMethod),
+            ("CommanderBuildPreview.IsShoreline", BuildPreviewIsShorelineMethod),
+            ("CommanderBuildPreview.IsControlTower", BuildPreviewIsControlTowerMethod),
+            ("CommanderBuildPreview.IsControlTowerUnit", BuildPreviewIsControlTowerUnitMethod),
+            ("CommanderSettings.get_BuildRadiusKm", SettingsBuildRadiusKmGetter),
+            ("CommanderGameAccess.FindRepairVehicleDefinition", GameAccessFindRepairVehicleDefinitionMethod),
+            ("CommanderMoveService.ClearOrder", MoveClearOrderMethod),
+            ("CommanderAirCommandService.BuildSlingLoadout", AirBuildSlingLoadoutMethod),
+            ("CommanderAirCommandService.CanAiFly", AirCanAiFlyMethod),
         };
 
         int present = 0;
