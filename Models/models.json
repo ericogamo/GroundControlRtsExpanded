@@ -2,7 +2,7 @@
   "slots": {
     "command_hq": {
       "file": "command_hq.glb",
-      "targetMaxDimensionMeters": 28.0,
+      "targetMaxDimensionMeters": 0.0,
       "scaleMultiplier": 1.0,
       "rotationEuler": [0.0, 0.0, 0.0],
       "positionOffset": [0.0, 0.0, 0.0],
@@ -12,7 +12,7 @@
     },
     "barracks": {
       "file": "barracks.glb",
-      "targetMaxDimensionMeters": 24.0,
+      "targetMaxDimensionMeters": 0.0,
       "scaleMultiplier": 1.0,
       "rotationEuler": [0.0, 0.0, 0.0],
       "positionOffset": [0.0, 0.0, 0.0],
@@ -22,7 +22,7 @@
     },
     "pilot_academy": {
       "file": "pilot_academy.glb",
-      "targetMaxDimensionMeters": 30.0,
+      "targetMaxDimensionMeters": 0.0,
       "scaleMultiplier": 1.0,
       "rotationEuler": [0.0, 0.0, 0.0],
       "positionOffset": [0.0, 0.0, 0.0],
@@ -32,7 +32,7 @@
     },
     "logistics_camp": {
       "file": "logistics_camp.glb",
-      "targetMaxDimensionMeters": 26.0,
+      "targetMaxDimensionMeters": 0.0,
       "scaleMultiplier": 1.0,
       "rotationEuler": [0.0, 0.0, 0.0],
       "positionOffset": [0.0, 0.0, 0.0],
@@ -42,7 +42,7 @@
     },
     "naval_command": {
       "file": "naval_command.glb",
-      "targetMaxDimensionMeters": 26.0,
+      "targetMaxDimensionMeters": 0.0,
       "scaleMultiplier": 1.0,
       "rotationEuler": [0.0, 0.0, 0.0],
       "positionOffset": [0.0, 0.0, 0.0],
@@ -52,7 +52,7 @@
     },
     "abm_radar": {
       "file": "abm_radar.glb",
-      "targetMaxDimensionMeters": 22.0,
+      "targetMaxDimensionMeters": 0.0,
       "scaleMultiplier": 1.0,
       "rotationEuler": [0.0, 0.0, 0.0],
       "positionOffset": [0.0, 0.0, 0.0],
@@ -62,7 +62,7 @@
     },
     "abm_silo": {
       "file": "abm_silo.glb",
-      "targetMaxDimensionMeters": 20.0,
+      "targetMaxDimensionMeters": 0.0,
       "scaleMultiplier": 1.0,
       "rotationEuler": [0.0, 0.0, 0.0],
       "positionOffset": [0.0, 0.0, 0.0],
@@ -72,7 +72,7 @@
     },
     "abm_plant": {
       "file": "abm_plant.glb",
-      "targetMaxDimensionMeters": 32.0,
+      "targetMaxDimensionMeters": 0.0,
       "scaleMultiplier": 1.0,
       "rotationEuler": [0.0, 0.0, 0.0],
       "positionOffset": [0.0, 0.0, 0.0],

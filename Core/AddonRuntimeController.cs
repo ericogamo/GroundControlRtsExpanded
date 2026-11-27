@@ -52,6 +52,7 @@ internal sealed class AddonRuntimeController : MonoBehaviour
         if (AddonConfig.ReloadModelsKey.Value.IsDown())
         {
             ModelRegistry.ReloadAll();
+            CustomPreviewService.ResetSession();
             DynamicCapAndTechService.Instance.RefreshAllBuildingVisuals();
         }
 
@@ -84,17 +85,35 @@ internal sealed class AddonRuntimeController : MonoBehaviour
         }
     }
 
+    internal void TriggerNetworkSessionReset()
+    {
+        ExecuteSessionReset("network disconnect/stop");
+    }
+
     private void OnActiveSceneChanged(Scene previousScene, Scene newScene)
+    {
+        ExecuteSessionReset($"scene change -> {newScene.name}");
+    }
+
+    private void ExecuteSessionReset(string reason)
     {
         CustomPreviewService.ResetSession();
         DuelOppositeAirbaseStartPatch.ResetSession();
         BaseCaptureIncomeService.ResetSession();
+        ReviewContextGuardPatch.ResetSession();
+        SupplyHeliCargoGateHelpers.ClearScratch();
+        MdsLoadoutIconCache.Clear();
+        SceneComponentCache.Clear();
+        TargetDetectorAdaptiveIntervalPatch.ClearCaches();
+        RpcUpdateTrackingInfoScalePatch.ClearCaches();
+        DetectorManagerBudgetPatches.ClearCaches();
+        TurretIdleThrottlePatch.ClearCaches();
         ModelRegistry.ClearRuntimeCache();
         for (int i = 0; i < resetServices.Count; i++)
         {
             resetServices[i].ResetSession();
         }
 
-        AddonLog.Debug($"Session reset on scene change -> {newScene.name}");
+        AddonLog.Debug($"Session reset on {reason}");
     }
 }

@@ -115,7 +115,7 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
     private float nextAdoptScanAt;
     private float nextLogisticsAuraAt;
 
-    internal static bool IsActive => AddonConfig.ModEnabled.Value && AddonConfig.EnableDynamicCaps.Value;
+    internal static bool IsActive => AddonConfig.ModEnabled.Value && GcreNetworkSync.EffectiveEnableDynamicCaps;
 
     private DynamicCapAndTechService()
     {
@@ -182,11 +182,11 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
         {
             return new FactionCapSnapshot(
                 0,
-                AddonConfig.StartGroundCap.Value,
+                GcreNetworkSync.EffectiveStartGroundCap,
                 0,
-                AddonConfig.StartAirCap.Value,
+                GcreNetworkSync.EffectiveStartAirCap,
                 0,
-                AddonConfig.StartNavalCap.Value,
+                GcreNetworkSync.EffectiveStartNavalCap,
                 1,
                 0,
                 0,
@@ -297,11 +297,117 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
         return count;
     }
 
+    internal IReadOnlyCollection<RtsBuildingRecord> AllRecords => records.Values;
+
+    internal RtsBuildingRecord? FindRecordByPersistentId(uint pidId)
+    {
+        if (pidId == 0)
+        {
+            return null;
+        }
+
+        foreach (RtsBuildingRecord rec in records.Values)
+        {
+            if (rec.Unit != null && rec.Unit.persistentID.IsValid && rec.Unit.persistentID.Id == pidId)
+            {
+                return rec;
+            }
+        }
+
+        return null;
+    }
+
+    internal bool TryUpgradeRemote(FactionHQ senderHq, uint pidId, out string message)
+    {
+        if (senderHq == null || !((NetworkBehaviour)senderHq).IsServer)
+        {
+            message = "Host authority required.";
+            return false;
+        }
+
+        RtsBuildingRecord? rec = FindRecordByPersistentId(pidId);
+        if (rec == null || !ReferenceEquals(rec.Hq, senderHq))
+        {
+            message = "Building not found or not owned by your faction.";
+            return false;
+        }
+
+        return TryUpgradeBuilding(rec, out message);
+    }
+
+    internal void ApplyClientCitySync(List<(uint Pid, int KindInt, int Level)> entries)
+    {
+        if (GcreNetworkSync.IsPureClient == false)
+        {
+            return;
+        }
+
+        var syncedUnits = new HashSet<Unit>();
+        for (int i = 0; i < entries.Count; i++)
+        {
+            (uint pidId, int kindInt, int level) = entries[i];
+            if (pidId == 0 || !Enum.IsDefined(typeof(RtsBuildingKind), kindInt))
+            {
+                continue;
+            }
+
+            var pid = new PersistentID { Id = pidId };
+            if (!pid.TryGetUnit(out Unit unit) || unit == null || unit.disabled || unit.NetworkHQ == null)
+            {
+                continue;
+            }
+
+            RtsBuildingKind kind = (RtsBuildingKind)kindInt;
+            RtsBuildingSpec spec = RtsBuildingCatalog.GetSpec(kind);
+            syncedUnits.Add(unit);
+
+            if (records.TryGetValue(unit, out RtsBuildingRecord existing))
+            {
+                existing.Hq = unit.NetworkHQ;
+                existing.Spec = spec;
+                int clamped = Mathf.Clamp(level, 1, 3);
+                if (existing.Level != clamped)
+                {
+                    existing.Level = clamped;
+                    RtsBuildingCatalog.ApplyCustomVisual(unit, spec, clamped, forceReplace: true);
+                }
+            }
+            else
+            {
+                int clamped = Mathf.Clamp(level, 1, 3);
+                records[unit] = new RtsBuildingRecord
+                {
+                    Unit = unit,
+                    Hq = unit.NetworkHQ,
+                    Spec = spec,
+                    Level = clamped,
+                };
+                RtsBuildingCatalog.ApplyCustomVisual(unit, spec, clamped, forceReplace: true);
+            }
+        }
+
+        pruneScratch.Clear();
+        foreach (KeyValuePair<Unit, RtsBuildingRecord> kv in records)
+        {
+            if (kv.Key == null || kv.Key.disabled || !syncedUnits.Contains(kv.Key))
+            {
+                pruneScratch.Add(kv.Key!);
+            }
+        }
+
+        for (int i = 0; i < pruneScratch.Count; i++)
+        {
+            records.Remove(pruneScratch[i]);
+        }
+
+        InvalidateCache();
+    }
+
     internal bool CanStartBuilding(FactionHQ hq, RtsBuildingKind kind, out string reason)
     {
-        if (!((NetworkBehaviour)hq).IsServer)
+        if (!((NetworkBehaviour)hq).IsServer && !GcreNetworkSync.HostHasGcre)
         {
-            reason = "Host-only building placement.";
+            reason = "Host requires GroundControlRtsExpanded.";
             return false;
         }
 
@@ -342,9 +448,9 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
             return false;
         }
 
-        if (!((NetworkBehaviour)rec.Hq).IsServer)
+        if (!((NetworkBehaviour)rec.Hq).IsServer && !GcreNetworkSync.HostHasGcre)
         {
-            reason = "Host-only upgrade.";
+            reason = "Host requires GroundControlRtsExpanded.";
             return false;
         }
 
@@ -381,6 +487,19 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
             return false;
         }
 
+        if (!((NetworkBehaviour)rec.Hq).IsServer)
+        {
+            if (rec.Unit != null && rec.Unit.persistentID.IsValid)
+            {
+                GcreNetworkSync.RequestUpgrade(rec.Unit.persistentID.Id);
+                message = $"Upgrade requested for {rec.Spec.DisplayName}...";
+                return true;
+            }
+
+            message = "Building not synced yet.";
+            return false;
+        }
+
         float cost = rec.Spec.GetUpgradeCost(rec.Level);
         if (!GroundControlReflection.TrySpend(rec.Hq, cost))
         {
@@ -391,6 +510,7 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
         rec.Level++;
         RtsBuildingCatalog.ApplyCustomVisual(rec.Unit, rec.Spec, rec.Level, forceReplace: true);
         InvalidateCache(rec.Hq);
+        GcreNetworkSync.MarkCityDirty();
         message = $"{rec.Spec.DisplayName} upgraded to Level {rec.Level}.";
         AddonLog.Info($"[City] {rec.Hq.faction?.factionName ?? "Faction"}: {message}");
         return true;
@@ -1075,6 +1195,7 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
                 Spec = spec,
                 Level = 1,
             };
+            GcreNetworkSync.MarkCityDirty();
         }
 
         InvalidateCache(hq);
@@ -1124,6 +1245,8 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
 
             records.Remove(dead);
         }
+
+        GcreNetworkSync.MarkCityDirty();
     }
 
     private FactionCapSnapshot ComputeSnapshot(FactionHQ hq)
@@ -1231,9 +1354,9 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
             bestNavalCommandLevel = Mathf.Max(bestNavalCommandLevel, 2);
         }
 
-        int groundCap = AddonConfig.StartGroundCap.Value + groundBonus;
-        int airCap = AddonConfig.StartAirCap.Value + airBonus;
-        int navalCap = AddonConfig.StartNavalCap.Value + navalBonus;
+        int groundCap = GcreNetworkSync.EffectiveStartGroundCap + groundBonus;
+        int airCap = GcreNetworkSync.EffectiveStartAirCap + airBonus;
+        int navalCap = GcreNetworkSync.EffectiveStartNavalCap + navalBonus;
         if (SingleplayerCheatService.IsIgnoreCapsActiveFor(hq))
         {
             groundCap = Mathf.Max(groundCap, 999);
@@ -1328,6 +1451,10 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
                     {
                         part.Repair();
                         logisticsHealedAt[candidate] = now;
+                        if (candidate.persistentID.IsValid)
+                        {
+                            GcreNetworkSync.BroadcastPartHeal(candidate.persistentID.Id);
+                        }
                         break;
                     }
                 }

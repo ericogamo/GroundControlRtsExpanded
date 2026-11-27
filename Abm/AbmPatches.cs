@@ -1,5 +1,6 @@
 using System.Reflection;
 using HarmonyLib;
+using NuclearOption.Networking;
 
 namespace GroundControlRtsExpanded;
 
@@ -11,6 +12,12 @@ internal static class BallisticGuidanceInitializePatch
     private static void Postfix(BallisticMissileGuidance __instance)
     {
         if (!AddonConfig.ModEnabled.Value || __instance == null || SeekerMissileField == null)
+        {
+            return;
+        }
+
+        if (GameManager.gameState != GameState.SinglePlayer &&
+            (NetworkManagerNuclearOption.i == null || NetworkManagerNuclearOption.i.Server == null || !NetworkManagerNuclearOption.i.Server.Active))
         {
             return;
         }
@@ -28,6 +35,12 @@ internal static class MissileStartAbmPatch
     private static void Postfix(Missile __instance)
     {
         if (!AddonConfig.ModEnabled.Value || __instance == null)
+        {
+            return;
+        }
+
+        if (GameManager.gameState != GameState.SinglePlayer &&
+            (NetworkManagerNuclearOption.i == null || NetworkManagerNuclearOption.i.Server == null || !NetworkManagerNuclearOption.i.Server.Active))
         {
             return;
         }

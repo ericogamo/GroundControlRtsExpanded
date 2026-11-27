@@ -97,6 +97,8 @@ internal sealed class AiSupplyLogisticsService : IAddonTick, IAddonResetSession
     private readonly HashSet<Unit> seenUnitsScratch = new();
     private readonly HashSet<Unit> reservedTrucksScratch = new();
     private readonly List<(FactionHQ Hq, int CellX, int CellZ)> staleCooldownKeysScratch = new();
+    private readonly List<int> stationAmmoBeforeScratch = new();
+    private readonly List<(int OptionIndex, int SlotIndex, int SelectedIndex)> savedCargoSlotSelectionsScratch = new();
     private FactionHQ? lastRefreshedOptionsHq;
     private float nextTickAt;
     private float nextCooldownPruneAt;
@@ -175,13 +177,16 @@ internal sealed class AiSupplyLogisticsService : IAddonTick, IAddonResetSession
         }
 
         FactionHQ? localHq = GroundControlReflection.GetLocalHq();
-        foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
+        GroundControlReflection.NetworkRunAsHostTeam(() =>
         {
-            if (hq != null && GroundControlReflection.IsAiFaction(hq, localHq))
+            foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
             {
-                ProcessAiFaction(hq, enemyService);
+                if (hq != null && GroundControlReflection.IsSafeAiFaction(hq, localHq))
+                {
+                    ProcessAiFaction(hq, enemyService);
+                }
             }
-        }
+        });
     }
 
     private void PruneExpiredHeliCooldowns(float now)
@@ -424,7 +429,32 @@ internal sealed class AiSupplyLogisticsService : IAddonTick, IAddonResetSession
                 Rearmer? rearmer = GroundControlReflection.GetRearmer(store);
                 if (rearmer != null)
                 {
-                    GroundControlReflection.TopUpWeapons(rearmer, needyUnit);
+                    stationAmmoBeforeScratch.Clear();
+                    List<WeaponStation>? stations = needyUnit.weaponStations;
+                    int stCount = stations != null ? Math.Min(stations.Count, 255) : 0;
+                    for (int s = 0; s < stCount; s++)
+                    {
+                        stationAmmoBeforeScratch.Add(stations![s] != null ? stations[s].Ammo : 0);
+                    }
+
+                    int rearmedCount = GroundControlReflection.TopUpWeapons(rearmer, needyUnit);
+                    if (rearmedCount > 0 && stations != null)
+                    {
+                        for (int s = 0; s < stCount; s++)
+                        {
+                            WeaponStation? ws = stations[s];
+                            if (ws != null && ws.Ammo > stationAmmoBeforeScratch[s])
+                            {
+                                needyUnit.RpcSyncAmmoCount((byte)s, ws.Ammo);
+                                if (needyUnit.persistentID.IsValid)
+                                {
+                                    GcreNetworkSync.BroadcastRearmVisual(needyUnit.persistentID.Id, (byte)s, ws.Ammo - stationAmmoBeforeScratch[s]);
+                                }
+                            }
+                        }
+                    }
+
+                    stationAmmoBeforeScratch.Clear();
                 }
             }
 
@@ -438,7 +468,7 @@ internal sealed class AiSupplyLogisticsService : IAddonTick, IAddonResetSession
                     activeTruckDestinations[store] = targetPos;
                     if (dist > LocalRearmAssistMeters)
                     {
-                        GroundControlReflection.TrySetDestination(store, targetPos);
+                        GroundControlReflection.TrySetAiDestination(store, targetPos);
                     }
                 }
             }
@@ -500,7 +530,7 @@ internal sealed class AiSupplyLogisticsService : IAddonTick, IAddonResetSession
 
         if (currentDistance > TruckArriveRangeMeters)
         {
-            GroundControlReflection.TrySetDestination(truck, targetPos);
+            GroundControlReflection.TrySetAiDestination(truck, targetPos);
         }
     }
 
@@ -545,7 +575,7 @@ internal sealed class AiSupplyLogisticsService : IAddonTick, IAddonResetSession
             }
             else
             {
-                GroundControlReflection.TrySetDestination(truck, sourcePos);
+                GroundControlReflection.TrySetAiDestination(truck, sourcePos);
             }
         }
     }
@@ -629,12 +659,34 @@ internal sealed class AiSupplyLogisticsService : IAddonTick, IAddonResetSession
         Airbase? savedAirbase = null;
         string savedStatus = string.Empty;
         bool savedAirdrop = false;
+        savedCargoSlotSelectionsScratch.Clear();
         if (needsRefresh)
         {
             savedAircraftIndex = GroundControlReflection.SupplyHeliSelectedAircraftIndexProp?.GetValue(supplyHeli) is int idx ? idx : 0;
             savedAirbase = GroundControlReflection.SupplyHeliSelectedAirbaseProp?.GetValue(supplyHeli) as Airbase;
             savedStatus = GroundControlReflection.SupplyHeliStatusTextField?.GetValue(supplyHeli) as string ?? string.Empty;
             savedAirdrop = GroundControlReflection.SupplyHeliAirdropDeliveryField?.GetValue(supplyHeli) is bool ad && ad;
+
+            if (currentOptions != null && GroundControlReflection.CargoSlotSelectedIndexField != null)
+            {
+                for (int oi = 0; oi < currentOptions.Count; oi++)
+                {
+                    object? opt = currentOptions[oi];
+                    if (opt == null || GroundControlReflection.CargoAircraftCargoSlotsProp?.GetValue(opt) is not IList optSlots)
+                    {
+                        continue;
+                    }
+
+                    for (int si = 0; si < optSlots.Count; si++)
+                    {
+                        object? slot = optSlots[si];
+                        if (slot != null && GroundControlReflection.CargoSlotSelectedIndexField.GetValue(slot) is int selIdx && selIdx >= 0)
+                        {
+                            savedCargoSlotSelectionsScratch.Add((oi, si, selIdx));
+                        }
+                    }
+                }
+            }
         }
 
         bool dispatched = false;
@@ -711,12 +763,33 @@ internal sealed class AiSupplyLogisticsService : IAddonTick, IAddonResetSession
                     else
                     {
                         GroundControlReflection.SupplyHeliRefreshOptionsMethod.Invoke(supplyHeli, null);
+                        lastRefreshedOptionsHq = localHq;
                     }
 
                     GroundControlReflection.SupplyHeliSelectAircraftMethod?.Invoke(supplyHeli, new object?[] { savedAircraftIndex });
                     GroundControlReflection.SupplyHeliSelectedAirbaseProp?.SetValue(supplyHeli, savedAirbase);
                     GroundControlReflection.SupplyHeliStatusTextField?.SetValue(supplyHeli, savedStatus);
                     GroundControlReflection.SupplyHeliAirdropDeliveryField?.SetValue(supplyHeli, savedAirdrop);
+
+                    if (savedCargoSlotSelectionsScratch.Count > 0 && GroundControlReflection.CargoSlotSelectMethod != null)
+                    {
+                        IList? restoredOptions = GroundControlReflection.SupplyHeliAircraftOptionsField?.GetValue(supplyHeli) as IList;
+                        if (restoredOptions != null)
+                        {
+                            for (int ri = 0; ri < savedCargoSlotSelectionsScratch.Count; ri++)
+                            {
+                                (int oi, int si, int selIdx) = savedCargoSlotSelectionsScratch[ri];
+                                if (oi < restoredOptions.Count
+                                    && restoredOptions[oi] != null
+                                    && GroundControlReflection.CargoAircraftCargoSlotsProp?.GetValue(restoredOptions[oi]) is IList rSlots
+                                    && si < rSlots.Count
+                                    && rSlots[si] != null)
+                                {
+                                    GroundControlReflection.CargoSlotSelectMethod.Invoke(rSlots[si], new object?[] { selIdx });
+                                }
+                            }
+                        }
+                    }
                 }
             }
             catch (Exception ex)
@@ -725,6 +798,7 @@ internal sealed class AiSupplyLogisticsService : IAddonTick, IAddonResetSession
             }
             finally
             {
+                savedCargoSlotSelectionsScratch.Clear();
                 SuppressPlayerNotice = false;
             }
         }
@@ -1103,7 +1177,7 @@ internal static class AiSupplyQueuedCargoSpawnNoticeGuardPatch
     {
         __state = AiSupplyLogisticsService.SuppressPlayerNotice;
         FactionHQ? localHq = GroundControlReflection.GetLocalHq();
-        if (hq != null && GroundControlReflection.IsAiFaction(hq, localHq))
+        if (hq != null && GroundControlReflection.IsSafeAiFaction(hq, localHq))
         {
             AiSupplyLogisticsService.SuppressPlayerNotice = true;
         }
@@ -1167,5 +1241,67 @@ internal static class AiSupplyPinToGuardPatch
         }
 
         return !AiSupplyLogisticsService.Instance.IsTruckTasked(unit);
+    }
+}
+
+[HarmonyPatch]
+internal static class SupplyHeliDedicatedQueuePatch
+{
+    private static bool reentering;
+
+    private static bool Prepare() => GroundControlReflection.SupplyHeliTryProcessQueuedMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.SupplyHeliTryProcessQueuedMethod!;
+
+    private static bool Prefix(object __instance)
+    {
+        if (reentering
+            || __instance == null
+            || !AddonConfig.ModEnabled.Value
+            || GroundControlReflection.GetLocalHq() != null
+            || GroundControlReflection.NetworkRunAsMethod == null)
+        {
+            return true;
+        }
+
+        NetworkManagerNuclearOption? net = NetworkManagerNuclearOption.i;
+        if (net == null || net.Server == null || !net.Server.Active)
+        {
+            return true;
+        }
+
+        if (GroundControlReflection.SupplyHeliQueuedSpawnsField?.GetValue(__instance) is not IEnumerable queued)
+        {
+            return true;
+        }
+
+        FactionHQ? firstHq = null;
+        foreach (object? item in queued)
+        {
+            if (item != null && GroundControlReflection.QueuedSpawnHqProp?.GetValue(item) is FactionHQ qHq && qHq != null)
+            {
+                firstHq = qHq;
+                break;
+            }
+        }
+
+        if (firstHq == null)
+        {
+            return true;
+        }
+
+        reentering = true;
+        try
+        {
+            GroundControlReflection.NetworkRunAs(firstHq, () =>
+            {
+                GroundControlReflection.SupplyHeliTryProcessQueuedMethod!.Invoke(__instance, null);
+            });
+        }
+        finally
+        {
+            reentering = false;
+        }
+
+        return false;
     }
 }

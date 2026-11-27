@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Reflection;
+using System.Text;
 using HarmonyLib;
 using Mirage;
 using UnityEngine;
@@ -62,6 +64,7 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
     private const float MaxInterceptorLifetimeSeconds = 120f;
 
     private static readonly FieldInfo? MissileWarheadField = AccessTools.Field(typeof(Missile), "warhead");
+    private static readonly FieldInfo? MissileBlastYieldField = AccessTools.Field(typeof(Missile), "blastYield");
 
     internal static AbmDefenseService Instance { get; } = new();
 
@@ -74,6 +77,17 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
     private readonly List<RtsBuildingRecord> abmBuildingsScratch = new();
     private readonly List<RtsBuildingRecord> ownedUiBuffer = new();
     private readonly Dictionary<string, float> alertCooldowns = new(StringComparer.Ordinal);
+
+    private sealed class ClientReplicatedThreat
+    {
+        internal uint ThreatPid;
+        internal FactionHQ? LauncherHq;
+        internal float BlastYield;
+        internal GlobalPosition LastPos;
+    }
+
+    private readonly Dictionary<FactionHQ, int> clientInFlightByHq = new();
+    private readonly List<ClientReplicatedThreat> clientThreats = new();
 
     private MissileDefinition? cachedInterceptorDef;
     private Encyclopedia? cachedEncyclopedia;
@@ -151,6 +165,8 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         abmBuildingsScratch.Clear();
         ownedUiBuffer.Clear();
         alertCooldowns.Clear();
+        clientInFlightByHq.Clear();
+        clientThreats.Clear();
         cachedInterceptorDef = null;
         cachedEncyclopedia = null;
         nextProductionAt = 0f;
@@ -230,10 +246,141 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         return true;
     }
 
+    internal void SetAutoProduce(FactionHQ? hq, bool autoProduce)
+    {
+        if (hq == null || !((NetworkBehaviour)hq).IsServer)
+        {
+            return;
+        }
+
+        GetOrCreateState(hq).AutoProduce = autoProduce;
+    }
+
+    internal string BuildServerFactionPayload(FactionHQ hq)
+    {
+        FactionAbmState state = GetOrCreateState(hq);
+        int inFlight = CountActiveInterceptorsForFaction(hq);
+        return string.Join(",",
+            state.Stockpile.ToString(CultureInfo.InvariantCulture),
+            state.MaxCapacity.ToString(CultureInfo.InvariantCulture),
+            state.PlantCount.ToString(CultureInfo.InvariantCulture),
+            state.RadarCount.ToString(CultureInfo.InvariantCulture),
+            state.SiloCount.ToString(CultureInfo.InvariantCulture),
+            state.BestRadarLevel.ToString(CultureInfo.InvariantCulture),
+            state.ProductionRate.ToString("0.###", CultureInfo.InvariantCulture),
+            state.AutoProduce ? "1" : "0",
+            state.PaidForCurrent ? "1" : "0",
+            state.ProductionElapsed.ToString("0.##", CultureInfo.InvariantCulture),
+            inFlight.ToString(CultureInfo.InvariantCulture));
+    }
+
+    internal string BuildServerThreatsPayload()
+    {
+        if (trackedThreats.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var sb = new StringBuilder();
+        foreach (TrackedBallisticThreat t in trackedThreats.Values)
+        {
+            if (t.Missile == null || t.Missile.disabled || t.Intercepted || !t.Missile.persistentID.IsValid)
+            {
+                continue;
+            }
+
+            GlobalPosition pos = t.Missile.GlobalPosition();
+            if (sb.Length > 0) sb.Append(';');
+            sb.Append(t.Missile.persistentID.Id.ToString(CultureInfo.InvariantCulture)).Append(',')
+              .Append(t.LauncherHq?.faction?.factionName ?? string.Empty).Append(',')
+              .Append(t.BlastYield.ToString("0.#", CultureInfo.InvariantCulture)).Append(',')
+              .Append(pos.x.ToString("0.#", CultureInfo.InvariantCulture)).Append(',')
+              .Append(pos.y.ToString("0.#", CultureInfo.InvariantCulture)).Append(',')
+              .Append(pos.z.ToString("0.#", CultureInfo.InvariantCulture));
+        }
+
+        return sb.ToString();
+    }
+
+    internal void ApplyClientSnapshot(FactionHQ? hq, string statePayload, string threatsPayload)
+    {
+        if (hq != null && !string.IsNullOrEmpty(statePayload))
+        {
+            string[] f = statePayload.Split(',');
+            if (f.Length >= 11)
+            {
+                FactionAbmState state = GetOrCreateState(hq);
+                if (int.TryParse(f[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out int sp)) state.Stockpile = sp;
+                if (int.TryParse(f[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int mc)) state.MaxCapacity = mc;
+                if (int.TryParse(f[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out int pc)) state.PlantCount = pc;
+                if (int.TryParse(f[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out int rc)) state.RadarCount = rc;
+                if (int.TryParse(f[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out int sc)) state.SiloCount = sc;
+                if (int.TryParse(f[5], NumberStyles.Integer, CultureInfo.InvariantCulture, out int br)) state.BestRadarLevel = br;
+                if (float.TryParse(f[6], NumberStyles.Float, CultureInfo.InvariantCulture, out float pr)) state.ProductionRate = pr;
+                state.AutoProduce = f[7] == "1";
+                state.PaidForCurrent = f[8] == "1";
+                if (float.TryParse(f[9], NumberStyles.Float, CultureInfo.InvariantCulture, out float pe)) state.ProductionElapsed = pe;
+                if (int.TryParse(f[10], NumberStyles.Integer, CultureInfo.InvariantCulture, out int inf)) clientInFlightByHq[hq] = inf;
+            }
+        }
+
+        clientThreats.Clear();
+        if (!string.IsNullOrEmpty(threatsPayload))
+        {
+            string[] items = threatsPayload.Split(';');
+            for (int i = 0; i < items.Length; i++)
+            {
+                string[] tf = items[i].Split(',');
+                if (tf.Length >= 6 &&
+                    uint.TryParse(tf[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out uint pid) &&
+                    float.TryParse(tf[2], NumberStyles.Float, CultureInfo.InvariantCulture, out float yld) &&
+                    float.TryParse(tf[3], NumberStyles.Float, CultureInfo.InvariantCulture, out float tx) &&
+                    float.TryParse(tf[4], NumberStyles.Float, CultureInfo.InvariantCulture, out float ty) &&
+                    float.TryParse(tf[5], NumberStyles.Float, CultureInfo.InvariantCulture, out float tz))
+                {
+                    clientThreats.Add(new ClientReplicatedThreat
+                    {
+                        ThreatPid = pid,
+                        LauncherHq = GcreNetworkSync.FindHqByName(tf[1]),
+                        BlastYield = yld,
+                        LastPos = new GlobalPosition(tx, ty, tz),
+                    });
+                }
+            }
+        }
+    }
+
     internal bool HasActiveThreatForLocal()
     {
         FactionHQ? localHq = GroundControlReflection.GetLocalHq();
-        return localHq != null && TryGetTopThreatForFaction(localHq, out _);
+        return localHq != null && (TryGetTopThreatForFaction(localHq, out _) || TryGetTopClientThreat(localHq, out _));
+    }
+
+    private bool TryGetTopClientThreat(FactionHQ hq, out ClientReplicatedThreat? top)
+    {
+        top = null;
+        if (!GcreNetworkSync.IsPureClient || !GcreNetworkSync.HostHasGcre)
+        {
+            return false;
+        }
+
+        float bestYield = -1f;
+        for (int i = 0; i < clientThreats.Count; i++)
+        {
+            ClientReplicatedThreat t = clientThreats[i];
+            if (ReferenceEquals(t.LauncherHq, hq))
+            {
+                continue;
+            }
+
+            if (t.BlastYield > bestYield)
+            {
+                bestYield = t.BlastYield;
+                top = t;
+            }
+        }
+
+        return top != null;
     }
 
     internal void NotifyPotentialBallisticLaunch(Missile? missile, bool hasBallisticGuidance)
@@ -298,14 +445,20 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
             threat.NotifiedFactions.Add(hq);
             MdsBridgeBootstrap.RaiseBallisticThreatAction?.Invoke(hq, missile.GlobalPosition(), threat.BlastYield);
 
+            string missileLabel = !string.IsNullOrEmpty(missile.definition?.unitName)
+                ? missile.definition!.unitName
+                : (!string.IsNullOrEmpty(missile.unitName) ? missile.unitName : "Ballistic Missile");
+            string yieldTag = threat.BlastYield > 200f ? $" ({threat.BlastYield:0}t NUCLEAR)" : string.Empty;
+            string alertMsg = $"EARLY WARNING: {missileLabel}{yieldTag} LAUNCHED!";
+
             if (localHq != null && ReferenceEquals(hq, localHq))
             {
-                string missileLabel = !string.IsNullOrEmpty(missile.definition?.unitName)
-                    ? missile.definition!.unitName
-                    : (!string.IsNullOrEmpty(missile.unitName) ? missile.unitName : "Ballistic Missile");
-                string yieldTag = threat.BlastYield > 200f ? $" ({threat.BlastYield:0}t NUCLEAR)" : string.Empty;
-                EmitLocalAlert($"EARLY WARNING: {missileLabel}{yieldTag} LAUNCHED!");
+                EmitLocalAlert(alertMsg);
                 AddonLog.Info($"[ABM] Early warning triggered for {missileLabel} (yield={threat.BlastYield:0}t, ballistic={hasBallisticGuidance}).");
+            }
+            else
+            {
+                GcreNetworkSync.BroadcastFactionToast(hq, isAlert: true, alertMsg);
             }
         }
     }
@@ -328,6 +481,10 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         if (TryGetTopThreatForFaction(localHq, out TrackedBallisticThreat? topThreat) && topThreat != null)
         {
             DrawEarlyWarningBanner(localHq, state, topThreat);
+        }
+        else if (TryGetTopClientThreat(localHq, out ClientReplicatedThreat? clientTop) && clientTop != null)
+        {
+            DrawClientEarlyWarningBanner(localHq, state, clientTop);
         }
 
         if (!windowVisible)
@@ -384,7 +541,7 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
                 continue;
             }
 
-            float cost = AddonConfig.AbmMissileCost.Value;
+            float cost = GcreNetworkSync.EffectiveAbmMissileCost;
             if (!state.PaidForCurrent)
             {
                 if (!GroundControlReflection.TrySpend(hq, cost))
@@ -396,7 +553,7 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
                 state.ProductionElapsed = 0f;
             }
 
-            float cycleSeconds = Mathf.Max(10f, AddonConfig.AbmProductionSeconds.Value);
+            float cycleSeconds = Mathf.Max(10f, GcreNetworkSync.EffectiveAbmProductionSeconds);
             state.ProductionElapsed += dt * state.ProductionRate;
             if (state.ProductionElapsed < cycleSeconds)
             {
@@ -427,7 +584,7 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         int maxCap = 0;
         float prodRate = 0f;
 
-        int siloBaseCap = Math.Max(2, AddonConfig.AbmMaxStockPerSite.Value);
+        int siloBaseCap = Math.Max(2, GcreNetworkSync.EffectiveAbmMaxStockPerSite);
         int plantBaseCap = Math.Max(4, siloBaseCap / 2);
 
         for (int i = 0; i < abmBuildingsScratch.Count; i++)
@@ -554,9 +711,14 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
                 threat.NextSalvoAt[defenderHq] = now + ThreatSalvoCooldownSeconds;
 
                 FactionHQ? localHq = GroundControlReflection.GetLocalHq();
+                string launchAlert = $"ABM VLS LAUNCHED ({state.Stockpile} left)";
                 if (localHq != null && ReferenceEquals(defenderHq, localHq))
                 {
-                    GroundControlReflection.NotifyAlert($"ABM VLS LAUNCHED ({state.Stockpile} left)");
+                    GroundControlReflection.NotifyAlert(launchAlert);
+                }
+                else
+                {
+                    GcreNetworkSync.BroadcastFactionToast(defenderHq, isAlert: true, launchAlert);
                 }
 
                 AddonLog.Info($"[ABM] {defenderHq.faction?.factionName ?? "Faction"} launched ABM interceptor '{interceptorDef.unitName}' at '{targetMissile.unitName}'.");
@@ -636,11 +798,19 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
             GlobalPosition groundAtThreat = GroundControlReflection.SnapToTerrain(threatPos);
             float agl = threatPos.y - Mathf.Max(0f, groundAtThreat.y);
 
-            if (agl >= MinDisarmAglMeters && MissileWarheadField != null)
+            if (agl >= MinDisarmAglMeters)
             {
-                if (MissileWarheadField.GetValue(tr.TargetThreat) is Missile.Warhead warhead)
+                if (MissileWarheadField != null && MissileWarheadField.GetValue(tr.TargetThreat) is Missile.Warhead warhead)
                 {
                     warhead.Armed = false;
+                }
+
+                float curYield = MissileBlastYieldField?.GetValue(tr.TargetThreat) is float y
+                    ? y
+                    : tr.TargetThreat.GetYield();
+                if (curYield <= 200f && MissileBlastYieldField != null)
+                {
+                    MissileBlastYieldField.SetValue(tr.TargetThreat, 0f);
                 }
             }
 
@@ -656,9 +826,14 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
             }
 
             FactionHQ? localHq = GroundControlReflection.GetLocalHq();
+            string interceptAlert = $"ABM INTERCEPT SUCCESSFUL — WARHEAD DISARMED AT {agl:0}m";
             if (localHq != null && ReferenceEquals(tr.DefenderHq, localHq))
             {
-                GroundControlReflection.NotifyAlert($"ABM INTERCEPT SUCCESSFUL — WARHEAD DISARMED AT {agl:0}m");
+                GroundControlReflection.NotifyAlert(interceptAlert);
+            }
+            else
+            {
+                GcreNetworkSync.BroadcastFactionToast(tr.DefenderHq, isAlert: true, interceptAlert);
             }
 
             AddonLog.Info($"[ABM] Intercepted threat at {agl:0}m AGL (warhead disarmed={agl >= MinDisarmAglMeters}).");
@@ -842,6 +1017,31 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         return state;
     }
 
+    private void DrawClientEarlyWarningBanner(FactionHQ localHq, FactionAbmState state, ClientReplicatedThreat threat)
+    {
+        float bw = Mathf.Min(BannerWidth, NativeThemeBridge.UiWidth - 24f);
+        Rect bannerRect = new(Mathf.Round((NativeThemeBridge.UiWidth - bw) * 0.5f), 78f, bw, BannerHeight);
+        Unit? liveUnit = null;
+        if (threat.ThreatPid != 0)
+        {
+            new PersistentID { Id = threat.ThreatPid }.TryGetUnit(out liveUnit);
+        }
+
+        string mName = liveUnit != null
+            ? (!string.IsNullOrEmpty(liveUnit.definition?.unitName) ? liveUnit.definition!.unitName : liveUnit.unitName)
+            : "Ballistic Threat";
+        GlobalPosition pos = liveUnit != null && !liveUnit.disabled ? liveUnit.GlobalPosition() : threat.LastPos;
+        float distKm = ComputeNearestThreatDistanceKm(localHq, pos);
+        string distStr = distKm >= 0f ? $"{distKm:0.0} km" : "-- km";
+        int inFlight = clientInFlightByHq.TryGetValue(localHq, out int cInf) ? cInf : 0;
+        string yieldStr = threat.BlastYield > 200f ? $" | {threat.BlastYield:0}t NUCLEAR" : " | BALLISTIC";
+
+        GUI.Box(
+            bannerRect,
+            $"BALLISTIC EARLY WARNING: {mName}{yieldStr}  ·  Range {distStr}  ·  ABM {state.Stockpile}/{state.MaxCapacity}  ·  In Flight: {inFlight}",
+            NativeThemeBridge.Alert);
+    }
+
     private void DrawEarlyWarningBanner(FactionHQ localHq, FactionAbmState state, TrackedBallisticThreat threat)
     {
         float bw = Mathf.Min(BannerWidth, NativeThemeBridge.UiWidth - 24f);
@@ -887,10 +1087,14 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
             ? "Shared Stockpile: Base ABM Silos + MDS VLS"
             : "Standalone Base ABM Network Active";
 
+        int inFlightCount = ((NetworkBehaviour)localHq).IsServer
+            ? CountActiveInterceptorsForFaction(localHq)
+            : (clientInFlightByHq.TryGetValue(localHq, out int cInfCount) ? cInfCount : 0);
+
         GUI.Box(new Rect(12f, y, innerW, 64f), string.Empty, NativeThemeBridge.Panel);
         GUI.Label(
             new Rect(20f, y + 6f, innerW - 16f, 20f),
-            $"TECH TIER {capSnap.TechTier}   |   ABM STOCK {state.Stockpile}/{state.MaxCapacity}   |   IN FLIGHT {CountActiveInterceptorsForFaction(localHq)}",
+            $"TECH TIER {capSnap.TechTier}   |   ABM STOCK {state.Stockpile}/{state.MaxCapacity}   |   IN FLIGHT {inFlightCount}",
             NativeThemeBridge.Header);
         GUI.Label(
             new Rect(20f, y + 26f, innerW - 16f, 18f),
@@ -900,7 +1104,8 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         y += 72f;
 
         // Production box
-        float cycle = Mathf.Max(10f, AddonConfig.AbmProductionSeconds.Value);
+        float cycle = Mathf.Max(10f, GcreNetworkSync.EffectiveAbmProductionSeconds);
+        float missileCost = GcreNetworkSync.EffectiveAbmMissileCost;
         float prodFrac = state.PaidForCurrent ? Mathf.Clamp01(state.ProductionElapsed / cycle) : 0f;
         float stockFrac = state.MaxCapacity > 0 ? Mathf.Clamp01((float)state.Stockpile / state.MaxCapacity) : 0f;
         string prodState = state.PlantCount == 0
@@ -911,22 +1116,31 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
                     ? "Auto-production paused."
                     : (state.PaidForCurrent
                         ? $"Manufacturing ABM: {prodFrac * 100f:0}% (Rate {state.ProductionRate:0.0}x)"
-                        : $"Waiting for ${AddonConfig.AbmMissileCost.Value:0}m to start next missile...")));
+                        : $"Waiting for ${missileCost:0}m to start next missile...")));
 
         GUI.Box(new Rect(12f, y, innerW, 82f), string.Empty, NativeThemeBridge.Panel);
         GUI.Label(
             new Rect(20f, y + 6f, innerW - 140f, 18f),
-            $"INTERCEPTOR PLANT (${AddonConfig.AbmMissileCost.Value:0}m / {cycle:0}s)",
+            $"INTERCEPTOR PLANT (${missileCost:0}m / {cycle:0}s)",
             NativeThemeBridge.Caption);
         bool isServer = ((NetworkBehaviour)localHq).IsServer;
-        GUI.enabled = isServer;
+        GUI.enabled = isServer || GcreNetworkSync.HostHasGcre;
         if (GUI.Button(
                 new Rect(w - 134f, y + 4f, 114f, 22f),
                 state.AutoProduce ? "AUTO-PROD: ON" : "AUTO-PROD: OFF",
                 state.AutoProduce ? NativeThemeBridge.SelectedButton : NativeThemeBridge.Button))
         {
-            state.AutoProduce = !state.AutoProduce;
-            SetFeedback($"ABM auto-production set to {(state.AutoProduce ? "ON" : "OFF")}.");
+            bool nextAuto = !state.AutoProduce;
+            state.AutoProduce = nextAuto;
+            if (isServer)
+            {
+                SetFeedback($"ABM auto-production set to {(nextAuto ? "ON" : "OFF")}.");
+            }
+            else
+            {
+                GcreNetworkSync.RequestAbmAutoProduce(nextAuto);
+                SetFeedback($"Requested ABM auto-production {(nextAuto ? "ON" : "OFF")}...");
+            }
         }
 
         GUI.enabled = true;
@@ -1053,6 +1267,33 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
             int chasing = CountActiveInterceptorsForThreat(localHq, t.Missile);
             GUI.Label(new Rect(10f, rowY, viewRect.width - 20f, 20f), $"! {name} ({t.BlastYield:0}t) — {distKm:0.0} km · {chasing} tracking", NativeThemeBridge.WarningLabel);
             rowY += 22f;
+        }
+
+        if (threatRows == 0 && GcreNetworkSync.IsPureClient && GcreNetworkSync.HostHasGcre)
+        {
+            for (int i = 0; i < clientThreats.Count; i++)
+            {
+                ClientReplicatedThreat ct = clientThreats[i];
+                if (ReferenceEquals(ct.LauncherHq, localHq))
+                {
+                    continue;
+                }
+
+                threatRows++;
+                Unit? liveUnit = null;
+                if (ct.ThreatPid != 0)
+                {
+                    new PersistentID { Id = ct.ThreatPid }.TryGetUnit(out liveUnit);
+                }
+
+                string name = liveUnit != null
+                    ? (liveUnit.definition?.unitName ?? liveUnit.unitName ?? "Ballistic Threat")
+                    : "Ballistic Threat";
+                GlobalPosition pos = liveUnit != null && !liveUnit.disabled ? liveUnit.GlobalPosition() : ct.LastPos;
+                float distKm = ComputeNearestThreatDistanceKm(localHq, pos);
+                GUI.Label(new Rect(10f, rowY, viewRect.width - 20f, 20f), $"! {name} ({ct.BlastYield:0}t) — {distKm:0.0} km", NativeThemeBridge.WarningLabel);
+                rowY += 22f;
+            }
         }
 
         if (threatRows == 0)

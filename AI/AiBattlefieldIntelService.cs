@@ -115,13 +115,16 @@ internal sealed class AiBattlefieldIntelService : IAddonTick, IAddonResetSession
         nextTickAt = now + RefreshIntervalSeconds;
 
         FactionHQ? localHq = GroundControlReflection.GetLocalHq();
-        foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
+        GroundControlReflection.NetworkRunAsHostTeam(() =>
         {
-            if (hq != null && ((NetworkBehaviour)hq).IsServer && GroundControlReflection.IsAiFaction(hq, localHq))
+            foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
             {
-                RefreshFactionIntel(hq, now);
+                if (hq != null && ((NetworkBehaviour)hq).IsServer && GroundControlReflection.IsSafeAiFaction(hq, localHq))
+                {
+                    RefreshFactionIntel(hq, now);
+                }
             }
-        }
+        });
     }
 
     private static bool IsServerAuthorityActive()
@@ -731,8 +734,11 @@ internal sealed class AiBattlefieldIntelService : IAddonTick, IAddonResetSession
             return mainObj.center.GlobalPosition();
         }
 
-        GlobalPosition fallback = localHq != null ? GroundControlReflection.CaptureGetTerritoryCenter(localHq) : default;
-        return GetCoordinatedStrikeTarget(aiHq, localHq, fallback, includeRearQrf: false);
+        FactionHQ? hostileHq = (localHq != null && !ReferenceEquals(localHq, aiHq))
+            ? localHq
+            : GroundControlReflection.FindPrimaryHostileHq(aiHq);
+        GlobalPosition fallback = hostileHq != null ? GroundControlReflection.CaptureGetTerritoryCenter(hostileHq) : default;
+        return GetCoordinatedStrikeTarget(aiHq, hostileHq, fallback, includeRearQrf: false);
     }
 
     internal void ReportLocatedHostileArtillery(FactionHQ? aiHq, Unit? artilleryUnit)

@@ -14,6 +14,14 @@ internal static class ReviewContextGuardPatch
     internal static FactionHQ? ActiveAiHq { get; set; }
     internal static int GroundPicksThisReview { get; set; }
 
+    internal static void ResetSession()
+    {
+        InEnemyReview = false;
+        CurrentReviewHq = null;
+        ActiveAiHq = null;
+        GroundPicksThisReview = 0;
+    }
+
     private static bool Prepare() => GroundControlReflection.EnemyReviewMethod != null;
     private static MethodBase TargetMethod() => GroundControlReflection.EnemyReviewMethod!;
 
@@ -63,7 +71,7 @@ internal static class IsChallengingDecouplePatch
 
     private static void Postfix(FactionHQ? hq, ref bool __result)
     {
-        if (AddonConfig.EnableTacticalQualityAi.Value && hq != null && hq.faction != null)
+        if (AddonConfig.EnableTacticalQualityAi.Value && hq != null && hq.faction != null && ((Mirage.NetworkBehaviour)hq).IsServer)
         {
             // Unlock counter-buying, main-effort pushes, anti-ship sorties, and smart base expansion independent of cheat funding.
             __result = true;

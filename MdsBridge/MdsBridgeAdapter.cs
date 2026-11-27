@@ -1,10 +1,14 @@
 #if HAS_MDS_FRAMEWORK
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Reflection;
+using System.Text;
 using HarmonyLib;
 using MDSFramework.Api;
+using MDSFramework.Networking;
+using MDSFramework.Sensors;
 using Mirage;
 using NuclearOption.Networking;
 using NuclearOption.SavedMission;
@@ -114,6 +118,10 @@ internal static class MdsBridgeAdapter
         MdsBridgeBootstrap.GetMdsCargoUnitCost = uiTransport.GetCargoUnitCost;
         MdsBridgeBootstrap.IsMdsAirdropMount = uiTransport.IsAirdropMount;
         MdsBridgeBootstrap.GetMdsBuildCatalogDefinitionsForHq = uiTransport.GetBuildCatalogDefinitionsForHq;
+        MdsBridgeBootstrap.GetAllMdsBuildCatalogDefinitions = uiTransport.GetAllBuildCatalogDefinitions;
+        MdsBridgeBootstrap.EnsureMdsBuildCatalogLookupAction = uiTransport.EnsureBuildCatalogLookup;
+        MdsBridgeBootstrap.BuildReservedCapsSyncString = caps.BuildReservedCapsSyncString;
+        MdsBridgeBootstrap.ApplyClientReservedCapsAction = caps.ApplyClientReservedCaps;
         MdsBridgeBootstrap.IsMdsBuildDefinition = uiTransport.IsBuildDefinition;
         MdsBridgeBootstrap.IsRawMdsEncyclopediaDefinition = uiTransport.IsRawEncyclopediaDefinition;
         MdsBridgeBootstrap.GetMdsBuildCost = uiTransport.GetBuildCost;
@@ -276,7 +284,7 @@ internal static class MdsBridgeAdapter
                 return true;
             }
 
-            if (!AddonConfig.EnforceContractorFactionLock.Value)
+            if (!GcreNetworkSync.EffectiveEnforceContractorFactionLock)
             {
                 return true;
             }
@@ -524,6 +532,7 @@ internal static class MdsBridgeAdapter
             }
 
             DynamicCapAndTechService.Instance.InvalidateCache(hq);
+            GcreNetworkSync.MarkCityDirty();
             return true;
         }
 
@@ -559,6 +568,76 @@ internal static class MdsBridgeAdapter
             }
 
             DynamicCapAndTechService.Instance.InvalidateCache(hq);
+            GcreNetworkSync.MarkCityDirty();
+        }
+
+        internal string BuildReservedCapsSyncString()
+        {
+            if (reservedByHq.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            var sb = new StringBuilder();
+            foreach (KeyValuePair<FactionHQ, ReservedCaps> kv in reservedByHq)
+            {
+                FactionHQ? hq = kv.Key;
+                ReservedCaps r = kv.Value;
+                if (hq == null || hq.faction == null || string.IsNullOrEmpty(hq.faction.factionName))
+                {
+                    continue;
+                }
+
+                if (r.Ground <= 0 && r.Air <= 0 && r.Naval <= 0)
+                {
+                    continue;
+                }
+
+                if (sb.Length > 0)
+                {
+                    sb.Append(';');
+                }
+
+                sb.Append(hq.faction.factionName).Append('=')
+                  .Append(r.Ground.ToString(CultureInfo.InvariantCulture)).Append(',')
+                  .Append(r.Air.ToString(CultureInfo.InvariantCulture)).Append(',')
+                  .Append(r.Naval.ToString(CultureInfo.InvariantCulture));
+            }
+
+            return sb.ToString();
+        }
+
+        internal void ApplyClientReservedCaps(string encoded)
+        {
+            reservedByHq.Clear();
+            if (!string.IsNullOrEmpty(encoded))
+            {
+                string[] entries = encoded.Split(';');
+                for (int i = 0; i < entries.Length; i++)
+                {
+                    int eq = entries[i].IndexOf('=');
+                    if (eq <= 0)
+                    {
+                        continue;
+                    }
+
+                    string hqName = entries[i].Substring(0, eq);
+                    string[] counts = entries[i].Substring(eq + 1).Split(',');
+                    FactionHQ? hq = GcreNetworkSync.FindHqByName(hqName);
+                    if (hq == null || counts.Length < 3)
+                    {
+                        continue;
+                    }
+
+                    if (int.TryParse(counts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out int g) &&
+                        int.TryParse(counts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int a) &&
+                        int.TryParse(counts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out int n))
+                    {
+                        reservedByHq[hq] = new ReservedCaps { Ground = g, Air = a, Naval = n };
+                        DynamicCapAndTechService.Instance.InvalidateCache(hq);
+                    }
+                }
+            }
         }
     }
 
@@ -1093,7 +1172,7 @@ internal static class MdsBridgeAdapter
                     continue;
                 }
 
-                bool isAi = localHq == null || !ReferenceEquals(order.Hq, localHq);
+                bool isAi = GroundControlReflection.IsSafeAiFaction(order.Hq, localHq);
                 if (isAi && Time.time - order.CreatedAt > AiBuildTimeoutSeconds)
                 {
                     engineerOrders.RemoveAt(i);
@@ -1674,9 +1753,7 @@ internal static class MdsBridgeAdapter
         private readonly List<Airbase> safeBaseScratch = new();
         private readonly List<GlobalPosition> friendlyFcuScratch = new();
         private readonly List<WeaponCascadeRole> desiredRoleOrderScratch = new();
-        private FactionHQ? lastDestroyedSiteHq;
-        private FactionAffinity lastDestroyedSiteAffinity;
-        private int lastDestroyedSiteFrame = -1;
+        private readonly Queue<(FactionAffinity Affinity, FactionHQ Hq, int Frame)> destroyedSiteHqQueue = new();
 
         internal RtsAiThreatSinkImpl(RtsEconomyBridgeImpl ecoBridge, RtsCapBridgeImpl capBridge, RtsLogisticsBridgeImpl logisticsBridge)
         {
@@ -1687,14 +1764,22 @@ internal static class MdsBridgeAdapter
 
         internal FactionHQ? ConsumeDestroyedSiteHq(FactionAffinity faction)
         {
-            if (lastDestroyedSiteHq != null
-                && Time.frameCount - lastDestroyedSiteFrame <= 1
-                && (lastDestroyedSiteAffinity == faction || faction == FactionAffinity.Any || ToAffinity(lastDestroyedSiteHq) == faction))
+            while (destroyedSiteHqQueue.Count > 0)
             {
-                FactionHQ result = lastDestroyedSiteHq;
-                lastDestroyedSiteHq = null;
-                lastDestroyedSiteFrame = -1;
-                return result;
+                (FactionAffinity affinity, FactionHQ hq, int frame) entry = destroyedSiteHqQueue.Peek();
+                if (entry.hq == null || Time.frameCount - entry.frame > 1)
+                {
+                    destroyedSiteHqQueue.Dequeue();
+                    continue;
+                }
+
+                if (entry.affinity == faction || faction == FactionAffinity.Any || ToAffinity(entry.hq) == faction)
+                {
+                    destroyedSiteHqQueue.Dequeue();
+                    return entry.hq;
+                }
+
+                break;
             }
 
             return null;
@@ -1786,9 +1871,7 @@ internal static class MdsBridgeAdapter
             {
                 if (trackedSites.TryGetValue(siteId, out TrackedSite? dying) && dying.Hq != null)
                 {
-                    lastDestroyedSiteHq = dying.Hq;
-                    lastDestroyedSiteAffinity = dying.Faction;
-                    lastDestroyedSiteFrame = Time.frameCount;
+                    destroyedSiteHqQueue.Enqueue((dying.Faction, dying.Hq, Time.frameCount));
                 }
 
                 // Cap release is handled cleanly by MDSFramework SensorNetworkManager.UnregisterSite -> Caps.ReleaseCap.
@@ -1803,8 +1886,7 @@ internal static class MdsBridgeAdapter
             safeBaseScratch.Clear();
             friendlyFcuScratch.Clear();
             desiredRoleOrderScratch.Clear();
-            lastDestroyedSiteHq = null;
-            lastDestroyedSiteFrame = -1;
+            destroyedSiteHqQueue.Clear();
         }
 
         internal void CollectActiveFriendlyMdsEwPositions(FactionHQ hq, List<GlobalPosition> results)
@@ -3215,6 +3297,26 @@ internal static class MdsBridgeAdapter
             return null;
         }
 
+        internal IReadOnlyList<BuildingDefinition> GetAllBuildCatalogDefinitions()
+        {
+            EnsureBuildCatalogSynced();
+            var list = new List<BuildingDefinition>(buildDefsByUnitId.Count);
+            foreach (BuildingDefinition def in buildDefsByUnitId.Values)
+            {
+                if (def != null)
+                {
+                    list.Add(def);
+                }
+            }
+
+            return list;
+        }
+
+        internal void EnsureBuildCatalogLookup()
+        {
+            EnsureBuildCatalogSynced();
+        }
+
         internal IReadOnlyList<BuildingDefinition> GetBuildCatalogDefinitionsForHq(FactionHQ? hq)
         {
             EnsureBuildCatalogSynced();
@@ -3402,11 +3504,6 @@ internal static class MdsBridgeAdapter
 
             if (HasMdsComponent(unit))
             {
-                if (unit.definition != null)
-                {
-                    unit.definition.CanSlingLoad = true;
-                }
-
                 return true;
             }
 
@@ -3418,22 +3515,42 @@ internal static class MdsBridgeAdapter
 
         internal bool IsMdsContainerHauler(GroundVehicle? vehicle)
         {
+            if (vehicle == null)
+            {
+                return false;
+            }
+
             Component? siteComp = FindModularSiteComponent(vehicle);
-            return siteComp != null && SiteIsLogisticsHaulerProp?.GetValue(siteComp) is bool isHauler && isHauler;
+            if (siteComp != null)
+            {
+                return SiteIsLogisticsHaulerProp?.GetValue(siteComp) is bool isHauler && isHauler;
+            }
+
+            MdsClientSiteProxy? proxy = vehicle.GetComponent<MdsClientSiteProxy>();
+            return proxy != null && proxy.IsLogisticsHauler;
         }
 
         internal Vector3? TryGetMdsHaulerBedOffset(GroundVehicle? vehicle)
         {
-            Component? siteComp = FindModularSiteComponent(vehicle);
-            if (siteComp == null || SiteTryGetCargoDeckMethod == null)
+            if (vehicle == null)
             {
                 return null;
             }
 
-            object[] args = new object[] { Vector3.zero };
-            if (SiteTryGetCargoDeckMethod.Invoke(siteComp, args) is bool ok && ok && args[0] is Vector3 offset)
+            Component? siteComp = FindModularSiteComponent(vehicle);
+            if (siteComp != null && SiteTryGetCargoDeckMethod != null)
             {
-                return offset;
+                object[] args = new object[] { Vector3.zero };
+                if (SiteTryGetCargoDeckMethod.Invoke(siteComp, args) is bool ok && ok && args[0] is Vector3 offset)
+                {
+                    return offset;
+                }
+            }
+
+            MdsClientSiteProxy? proxy = vehicle.GetComponent<MdsClientSiteProxy>();
+            if (proxy != null && proxy.TryGetCargoDeckLocalOffset(out Vector3 proxyOffset))
+            {
+                return proxyOffset;
             }
 
             return null;
@@ -3480,6 +3597,11 @@ internal static class MdsBridgeAdapter
             if (unit == null)
             {
                 return false;
+            }
+
+            if (unit.GetComponent<MdsClientSiteProxy>() != null)
+            {
+                return true;
             }
 
             MonoBehaviour[] behaviours = unit.GetComponents<MonoBehaviour>();
@@ -3531,6 +3653,25 @@ internal static class MdsBridgeAdapter
             Component? siteComp = FindModularSiteComponent(unit);
             if (siteComp == null)
             {
+                MdsClientSiteProxy? proxy = unit != null ? unit.GetComponent<MdsClientSiteProxy>() : null;
+                if (proxy != null)
+                {
+                    return (
+                        true,
+                        proxy.IsWeaponSite,
+                        proxy.IsFireControlRadar,
+                        proxy.IsCommandCenter,
+                        proxy.RequiresFcuLink,
+                        proxy.HasActiveFcuLink,
+                        proxy.FcuLinkRadiusKm,
+                        proxy.EoIrBackupRangeKm,
+                        proxy.IsHoldFireActive,
+                        proxy.IsInCommandNet,
+                        proxy.CommandNetFcuCount,
+                        proxy.CommandNetActiveFcuCount,
+                        proxy.CommandNetEffectorCount);
+                }
+
                 return default;
             }
 
@@ -3626,6 +3767,17 @@ internal static class MdsBridgeAdapter
         {
             if (unit == null)
             {
+                return;
+            }
+
+            if (!((NetworkBehaviour)unit).IsServer)
+            {
+                if (unit.GetComponent<MdsClientSiteProxy>() != null || HasMdsComponent(unit))
+                {
+                    MdsNetworkSync.RequestClientHoldFire(unit, holdFire);
+                }
+
+                GroundControlReflection.SetUnitHoldFireStance(unit, holdFire);
                 return;
             }
 
@@ -3877,6 +4029,11 @@ internal static class MdsBridgeAdapter
                     if (plain is INetworkDefinition srcNet && clone is INetworkDefinition dstNet)
                     {
                         dstNet.LookupIndex = srcNet.LookupIndex;
+                    }
+
+                    if (Encyclopedia.Lookup != null)
+                    {
+                        Encyclopedia.Lookup[clone.jsonKey] = clone;
                     }
 
                     buildDefsByUnitId[spec.UnitId] = clone;

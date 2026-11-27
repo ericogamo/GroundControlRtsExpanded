@@ -93,8 +93,8 @@ internal static class RpcUpdateTrackingInfoScalePatch
             return true;
         }
 
-        // Aircraft and missiles stay unthrottled (handled only by GC's default 1s floor).
-        if (id.TryGetUnit(out Unit unit) && (unit is Aircraft || unit is Missile))
+        // Aircraft, missiles, and ships stay unthrottled (handled only by GC's default 1s floor).
+        if (id.TryGetUnit(out Unit unit) && (unit is Aircraft || unit is Missile || unit is Ship))
         {
             return true;
         }
@@ -141,6 +141,11 @@ internal static class DetectorManagerBudgetPatches
         [HarmonyPriority(Priority.High)]
         private static void Prefix(DetectorManager __instance)
         {
+            if (GroundControlReflection.IsNetworkGuest())
+            {
+                return;
+            }
+
             List<DetectionRequest> list = LoSRequestsRef(__instance);
             int budget = AddonConfig.MaxDetectorLoSPerFrame.Value;
 

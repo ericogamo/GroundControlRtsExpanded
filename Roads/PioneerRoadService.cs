@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Reflection;
+using System.Text;
 using HarmonyLib;
 using Mirage;
 using RoadPathfinding;
@@ -50,6 +52,9 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
     private readonly List<RoadSample> plannedSamples = new();
     private readonly List<RoadConstructionProject> activeProjects = new();
     private readonly List<GameObject> completedRoadObjects = new();
+    private readonly List<(int Id, List<RoadSample> Samples)> completedRoads = new();
+    private readonly HashSet<int> appliedCompletedRoadIds = new();
+    private readonly List<RoadSample> remoteSamplesScratch = new();
     private readonly List<Unit> builderCandidateScratch = new();
 
     private bool forceNextSegmentBridge;
@@ -93,14 +98,86 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
             return true;
         }
 
-        return activeProjects.Count > 0 && NativeThemeBridge.VisualRect(ActiveProgressWindowId, progressRect).Contains(guiPt);
+        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
+        for (int i = 0; i < activeProjects.Count; i++)
+        {
+            if (ShouldShowProjectInHud(activeProjects[i], localHq))
+            {
+                return NativeThemeBridge.VisualRect(ActiveProgressWindowId, progressRect).Contains(guiPt);
+            }
+        }
+
+        return false;
     }
 
     internal bool IsMouseOverUi() => ContainsScreenPoint(Input.mousePosition);
 
+    private static bool ShouldShowProjectInHud(RoadConstructionProject project, FactionHQ? localHq)
+        => project.Hq == null || localHq == null || ReferenceEquals(project.Hq, localHq);
+
+    internal IReadOnlyList<(int Id, List<RoadSample> Samples)> GetCompletedRoads() => completedRoads;
+
+    internal IReadOnlyList<RoadConstructionProject> GetActiveProjects() => activeProjects;
+
+    internal static string SerializeSamples(IReadOnlyList<RoadSample> samples)
+    {
+        if (samples == null || samples.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var sb = new StringBuilder(samples.Count * 28);
+        for (int i = 0; i < samples.Count; i++)
+        {
+            if (i > 0)
+            {
+                sb.Append(';');
+            }
+
+            RoadSample s = samples[i];
+            sb.Append(s.Pos.x.ToString("0.##", CultureInfo.InvariantCulture)).Append(',')
+              .Append(s.Pos.y.ToString("0.##", CultureInfo.InvariantCulture)).Append(',')
+              .Append(s.Pos.z.ToString("0.##", CultureInfo.InvariantCulture)).Append(',')
+              .Append(s.IsBridge ? '1' : '0').Append(',')
+              .Append(s.GroundY.ToString("0.##", CultureInfo.InvariantCulture));
+        }
+
+        return sb.ToString();
+    }
+
+    internal static List<RoadSample> DeserializeSamples(string data)
+    {
+        var result = new List<RoadSample>();
+        if (string.IsNullOrEmpty(data))
+        {
+            return result;
+        }
+
+        string[] parts = data.Split(';');
+        for (int i = 0; i < parts.Length; i++)
+        {
+            string[] f = parts[i].Split(',');
+            if (f.Length >= 5 &&
+                float.TryParse(f[0], NumberStyles.Float, CultureInfo.InvariantCulture, out float x) &&
+                float.TryParse(f[1], NumberStyles.Float, CultureInfo.InvariantCulture, out float y) &&
+                float.TryParse(f[2], NumberStyles.Float, CultureInfo.InvariantCulture, out float z) &&
+                float.TryParse(f[4], NumberStyles.Float, CultureInfo.InvariantCulture, out float gy))
+            {
+                result.Add(new RoadSample
+                {
+                    Pos = new GlobalPosition(x, y, z),
+                    IsBridge = f[3] == "1",
+                    GroundY = gy,
+                });
+            }
+        }
+
+        return result;
+    }
+
     internal void CompleteAllActiveProjectsForHq(FactionHQ? hq)
     {
-        if (hq == null)
+        if (hq == null || GcreNetworkSync.IsPureClient)
         {
             return;
         }
@@ -184,6 +261,12 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
 
         KeepObjectsAttachedToDatum();
 
+        if (GcreNetworkSync.IsPureClient)
+        {
+            nextProjectTickAt = 0f;
+            return;
+        }
+
         float now = Time.unscaledTime;
         if (activeProjects.Count > 0 && now >= nextProjectTickAt)
         {
@@ -219,9 +302,19 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
                 "PIONEER ROADS & BRIDGES");
         }
 
-        if (activeProjects.Count > 0)
+        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
+        int visibleCount = 0;
+        for (int i = 0; i < activeProjects.Count; i++)
         {
-            float dynamicHeight = Mathf.Clamp(44f + activeProjects.Count * 54f, 96f, 280f);
+            if (ShouldShowProjectInHud(activeProjects[i], localHq))
+            {
+                visibleCount++;
+            }
+        }
+
+        if (visibleCount > 0)
+        {
+            float dynamicHeight = Mathf.Clamp(44f + visibleCount * 54f, 96f, 280f);
             if (!progressPositioned)
             {
                 progressRect = new Rect(14f, 80f, 356f, dynamicHeight);
@@ -271,6 +364,9 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
         }
 
         completedRoadObjects.Clear();
+        completedRoads.Clear();
+        appliedCompletedRoadIds.Clear();
+        remoteSamplesScratch.Clear();
         RoadMeshBuilder.ClearMaterials();
         nextProjectId = 1;
         nextProjectTickAt = 0f;
@@ -405,7 +501,7 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
             previewLine.SetPosition(1, new Vector3(plannedCursorPos.x, cursorY + 1.1f, plannedCursorPos.z));
         }
 
-        Color lineColor = plannedMaxLandGradePercent > AddonConfig.MaxRoadGradePercent.Value
+        Color lineColor = plannedMaxLandGradePercent > GcreNetworkSync.EffectiveMaxRoadGradePercent
             ? new Color(1f, 0.30f, 0.25f, 0.95f)
             : plannedBridgeMeters > 1f
                 ? new Color(1f, 0.78f, 0.25f, 0.95f)
@@ -417,23 +513,46 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
 
     private void RebuildPlannedRoute()
     {
-        plannedSamples.Clear();
-        plannedTotalMeters = 0f;
-        plannedBridgeMeters = 0f;
-        plannedMaxLandGradePercent = 0f;
-        plannedCost = 0f;
+        ComputeRoadRoute(
+            controlWaypoints,
+            segmentForcedBridge,
+            GcreNetworkSync.EffectiveRoadCostPer100m,
+            GcreNetworkSync.EffectiveBridgeCostPer100m,
+            plannedSamples,
+            out plannedTotalMeters,
+            out plannedBridgeMeters,
+            out plannedMaxLandGradePercent,
+            out plannedCost);
+    }
 
-        if (controlWaypoints.Count < 2)
+    private static void ComputeRoadRoute(
+        IReadOnlyList<GlobalPosition> waypoints,
+        IReadOnlyList<bool> forcedBridges,
+        float roadCostPer100m,
+        float bridgeCostPer100m,
+        List<RoadSample> outSamples,
+        out float totalMeters,
+        out float bridgeMeters,
+        out float maxLandGradePercent,
+        out float cost)
+    {
+        outSamples.Clear();
+        totalMeters = 0f;
+        bridgeMeters = 0f;
+        maxLandGradePercent = 0f;
+        cost = 0f;
+
+        if (waypoints.Count < 2)
         {
             return;
         }
 
         // 1. Subdivide waypoint segments at ~16 m spacing
-        for (int seg = 0; seg < controlWaypoints.Count - 1; seg++)
+        for (int seg = 0; seg < waypoints.Count - 1; seg++)
         {
-            GlobalPosition a = controlWaypoints[seg];
-            GlobalPosition b = controlWaypoints[seg + 1];
-            bool forcedBridge = seg < segmentForcedBridge.Count && segmentForcedBridge[seg];
+            GlobalPosition a = waypoints[seg];
+            GlobalPosition b = waypoints[seg + 1];
+            bool forcedBridge = seg < forcedBridges.Count && forcedBridges[seg];
 
             Vector3 flat = new Vector3(b.x - a.x, 0f, b.z - a.z);
             float horiz = flat.magnitude;
@@ -447,7 +566,7 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
                 float gz = Mathf.Lerp(a.z, b.z, t);
                 GlobalPosition sampled = SampleGroundHeight(new GlobalPosition(gx, Mathf.Lerp(a.y, b.y, t), gz), out bool underwater);
                 bool bridge = forcedBridge || underwater;
-                plannedSamples.Add(new RoadSample
+                outSamples.Add(new RoadSample
                 {
                     Pos = sampled,
                     IsBridge = bridge,
@@ -456,58 +575,58 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
             }
         }
 
-        if (plannedSamples.Count < 2)
+        if (outSamples.Count < 2)
         {
             return;
         }
 
         // 2. Detect deep gullies compared to local endpoint chord & resolve smooth bridge deck heights
-        for (int i = 0; i < plannedSamples.Count; i++)
+        for (int i = 0; i < outSamples.Count; i++)
         {
-            if (plannedSamples[i].IsBridge)
+            if (outSamples[i].IsBridge)
             {
                 continue;
             }
 
             // Look back & ahead 3 samples (~48 m): if local terrain dips > 4.5 m beneath chord, elevate as bridge span
             int prevIdx = Mathf.Max(0, i - 3);
-            int nextIdx = Mathf.Min(plannedSamples.Count - 1, i + 3);
+            int nextIdx = Mathf.Min(outSamples.Count - 1, i + 3);
             if (nextIdx > prevIdx)
             {
                 float t = (float)(i - prevIdx) / (nextIdx - prevIdx);
-                float chordY = Mathf.Lerp(plannedSamples[prevIdx].GroundY, plannedSamples[nextIdx].GroundY, t);
-                if (chordY - plannedSamples[i].GroundY > GorgeBridgeThresholdMeters)
+                float chordY = Mathf.Lerp(outSamples[prevIdx].GroundY, outSamples[nextIdx].GroundY, t);
+                if (chordY - outSamples[i].GroundY > GorgeBridgeThresholdMeters)
                 {
-                    RoadSample rs = plannedSamples[i];
+                    RoadSample rs = outSamples[i];
                     rs.IsBridge = true;
-                    plannedSamples[i] = rs;
+                    outSamples[i] = rs;
                 }
             }
         }
 
         // Smooth bridge deck elevations across contiguous bridge runs with bank-level approaches
         int idx = 0;
-        while (idx < plannedSamples.Count)
+        while (idx < outSamples.Count)
         {
-            if (!plannedSamples[idx].IsBridge)
+            if (!outSamples[idx].IsBridge)
             {
                 idx++;
                 continue;
             }
 
             int runStart = idx;
-            while (idx < plannedSamples.Count && plannedSamples[idx].IsBridge)
+            while (idx < outSamples.Count && outSamples[idx].IsBridge)
             {
                 idx++;
             }
 
             int runEnd = idx - 1;
             float leftBankY = runStart > 0
-                ? plannedSamples[runStart - 1].GroundY
-                : Mathf.Max(plannedSamples[runStart].GroundY, Datum.SeaLevel.y + BridgeMinimumClearanceAboveSea);
-            float rightBankY = runEnd + 1 < plannedSamples.Count
-                ? plannedSamples[runEnd + 1].GroundY
-                : Mathf.Max(plannedSamples[runEnd].GroundY, Datum.SeaLevel.y + BridgeMinimumClearanceAboveSea);
+                ? outSamples[runStart - 1].GroundY
+                : Mathf.Max(outSamples[runStart].GroundY, Datum.SeaLevel.y + BridgeMinimumClearanceAboveSea);
+            float rightBankY = runEnd + 1 < outSamples.Count
+                ? outSamples[runEnd + 1].GroundY
+                : Mathf.Max(outSamples[runEnd].GroundY, Datum.SeaLevel.y + BridgeMinimumClearanceAboveSea);
 
             float minSeaDeck = Datum.SeaLevel.y + BridgeMinimumClearanceAboveSea;
             for (int k = runStart; k <= runEnd; k++)
@@ -515,57 +634,57 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
                 float t = runEnd > runStart ? (float)(k - runStart) / (runEnd - runStart) : 0.5f;
                 float rampEdge = Mathf.Min(1f, Mathf.Min(k - runStart + 1, runEnd - k + 1) / 2.5f);
                 float spanY = Mathf.Max(Mathf.Lerp(leftBankY, rightBankY, t), minSeaDeck);
-                RoadSample rs = plannedSamples[k];
+                RoadSample rs = outSamples[k];
                 rs.Pos = new GlobalPosition(rs.Pos.x, Mathf.Lerp(Mathf.Lerp(leftBankY, rightBankY, t), spanY, rampEdge), rs.Pos.z);
-                plannedSamples[k] = rs;
+                outSamples[k] = rs;
             }
         }
 
         // Keep start/end anchors firmly as land/approach if on dry ground so RoadNodes blend smoothly with existing roads
-        RoadSample first = plannedSamples[0];
+        RoadSample first = outSamples[0];
         if (first.GroundY > Datum.SeaLevel.y + 0.5f)
         {
             first.IsBridge = false;
             first.Pos = new GlobalPosition(first.Pos.x, first.GroundY, first.Pos.z);
-            plannedSamples[0] = first;
+            outSamples[0] = first;
         }
 
-        RoadSample last = plannedSamples[plannedSamples.Count - 1];
+        RoadSample last = outSamples[outSamples.Count - 1];
         if (last.GroundY > Datum.SeaLevel.y + 0.5f)
         {
             last.IsBridge = false;
             last.Pos = new GlobalPosition(last.Pos.x, last.GroundY, last.Pos.z);
-            plannedSamples[plannedSamples.Count - 1] = last;
+            outSamples[outSamples.Count - 1] = last;
         }
 
         // 3. Measure total length, bridge share, max land grade %, and credits cost
-        for (int i = 0; i < plannedSamples.Count - 1; i++)
+        for (int i = 0; i < outSamples.Count - 1; i++)
         {
-            RoadSample s0 = plannedSamples[i];
-            RoadSample s1 = plannedSamples[i + 1];
+            RoadSample s0 = outSamples[i];
+            RoadSample s1 = outSamples[i + 1];
             float d = FastMath.Distance(s0.Pos, s1.Pos);
-            plannedTotalMeters += d;
+            totalMeters += d;
 
             bool segBridge = s0.IsBridge || s1.IsBridge;
             if (segBridge)
             {
-                plannedBridgeMeters += d;
+                bridgeMeters += d;
             }
             else
             {
                 float horiz = Vector2.Distance(new Vector2(s0.Pos.x, s0.Pos.z), new Vector2(s1.Pos.x, s1.Pos.z));
                 float grade = horiz > 1f ? Mathf.Abs(s1.Pos.y - s0.Pos.y) / horiz * 100f : 0f;
-                if (grade > plannedMaxLandGradePercent)
+                if (grade > maxLandGradePercent)
                 {
-                    plannedMaxLandGradePercent = grade;
+                    maxLandGradePercent = grade;
                 }
             }
         }
 
-        float roadOnlyMeters = Mathf.Max(0f, plannedTotalMeters - plannedBridgeMeters);
-        float rawCost = roadOnlyMeters * 0.01f * AddonConfig.RoadCostPer100m.Value
-            + plannedBridgeMeters * 0.01f * AddonConfig.BridgeCostPer100m.Value;
-        plannedCost = Mathf.Max(MinimumCostCredits, Mathf.Ceil(rawCost));
+        float roadOnlyMeters = Mathf.Max(0f, totalMeters - bridgeMeters);
+        float rawCost = roadOnlyMeters * 0.01f * roadCostPer100m
+            + bridgeMeters * 0.01f * bridgeCostPer100m;
+        cost = Mathf.Max(MinimumCostCredits, Mathf.Ceil(rawCost));
     }
 
     private bool CanCommitPlannedRoad(out string reason)
@@ -577,9 +696,9 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
             return false;
         }
 
-        if (!((NetworkBehaviour)localHq).IsServer)
+        if (GcreNetworkSync.IsPureClient && !GcreNetworkSync.HostHasGcre)
         {
-            reason = "Host-only road construction.";
+            reason = "Host requires GroundControlRtsExpanded.";
             return false;
         }
 
@@ -595,9 +714,10 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
             return false;
         }
 
-        if (plannedMaxLandGradePercent > AddonConfig.MaxRoadGradePercent.Value)
+        float maxGrade = GcreNetworkSync.EffectiveMaxRoadGradePercent;
+        if (plannedMaxLandGradePercent > maxGrade)
         {
-            reason = $"Land grade {plannedMaxLandGradePercent:0}% > {AddonConfig.MaxRoadGradePercent.Value:0}% max! Toggle Bridge Span or reroute.";
+            reason = $"Land grade {plannedMaxLandGradePercent:0}% > {maxGrade:0}% max! Toggle Bridge Span or reroute.";
             return false;
         }
 
@@ -619,6 +739,14 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
             return;
         }
 
+        if (GcreNetworkSync.IsPureClient)
+        {
+            GcreNetworkSync.RequestBuildRoad(controlWaypoints, segmentForcedBridge);
+            CancelPlanning();
+            SetFeedback("Road construction order sent to host.", 4f);
+            return;
+        }
+
         FactionHQ localHq = GroundControlReflection.GetLocalHq()!;
         if (!GroundControlReflection.TrySpend(localHq, plannedCost))
         {
@@ -627,26 +755,109 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
         }
 
         var samplesCopy = new List<RoadSample>(plannedSamples);
+        float totalM = plannedTotalMeters;
+        float bridgeM = plannedBridgeMeters;
+        float paid = plannedCost;
+        CancelPlanning();
+
+        string msg = StartServerProject(localHq, samplesCopy, totalM, bridgeM, paid);
+        SetFeedback(msg, 6f);
+    }
+
+    internal bool TryCommitRemoteRoad(
+        FactionHQ hq,
+        List<GlobalPosition> waypoints,
+        List<bool> forcedBridges,
+        out string reply)
+    {
+        if (hq == null || !((NetworkBehaviour)hq).IsServer)
+        {
+            reply = "Host authority required for road construction.";
+            return false;
+        }
+
+        if (waypoints == null || waypoints.Count < 2)
+        {
+            reply = "Place at least 2 waypoints.";
+            return false;
+        }
+
+        ComputeRoadRoute(
+            waypoints,
+            forcedBridges ?? (IReadOnlyList<bool>)Array.Empty<bool>(),
+            AddonConfig.RoadCostPer100m.Value,
+            AddonConfig.BridgeCostPer100m.Value,
+            remoteSamplesScratch,
+            out float totalMeters,
+            out float bridgeMeters,
+            out float maxGrade,
+            out float cost);
+
+        if (remoteSamplesScratch.Count < 2 || totalMeters < MinimumRoadLengthMeters)
+        {
+            reply = $"Route too short ({totalMeters:0}/{MinimumRoadLengthMeters:0} m).";
+            return false;
+        }
+
+        if (maxGrade > AddonConfig.MaxRoadGradePercent.Value)
+        {
+            reply = $"Land grade {maxGrade:0}% exceeds {AddonConfig.MaxRoadGradePercent.Value:0}% max.";
+            return false;
+        }
+
+        if (hq.factionFunds < cost || !GroundControlReflection.TrySpend(hq, cost))
+        {
+            reply = $"Insufficient funds ({cost:0} Cr needed).";
+            return false;
+        }
+
+        var samplesCopy = new List<RoadSample>(remoteSamplesScratch);
+        remoteSamplesScratch.Clear();
+        reply = StartServerProject(hq, samplesCopy, totalMeters, bridgeMeters, cost);
+        return true;
+    }
+
+    internal bool TryCancelRemoteRoad(FactionHQ hq, int projectId, out string reply)
+    {
+        for (int i = 0; i < activeProjects.Count; i++)
+        {
+            if (activeProjects[i].Id == projectId && ReferenceEquals(activeProjects[i].Hq, hq))
+            {
+                CancelProjectAndRefund(i);
+                reply = $"Road #{projectId} cancelled.";
+                return true;
+            }
+        }
+
+        reply = string.Empty;
+        return false;
+    }
+
+    private string StartServerProject(
+        FactionHQ hq,
+        List<RoadSample> samplesCopy,
+        float totalMeters,
+        float bridgeMeters,
+        float costPaid)
+    {
         int id = nextProjectId++;
         var project = new RoadConstructionProject
         {
             Id = id,
-            Hq = localHq,
+            Hq = hq,
             Samples = samplesCopy,
-            TotalLengthMeters = plannedTotalMeters,
-            BridgeLengthMeters = plannedBridgeMeters,
-            CostPaid = plannedCost,
+            TotalLengthMeters = totalMeters,
+            BridgeLengthMeters = bridgeMeters,
+            CostPaid = costPaid,
             BuiltLengthMeters = 0f,
             LastRebuiltSamples = 0,
             NextDispatchAt = 0f,
         };
 
-        CancelPlanning();
-
         if (!AddonConfig.RequirePhysicalConstruction.Value)
         {
             FinalizeProject(project);
-            return;
+            return $"Road #{id} completed immediately ({totalMeters:0} m).";
         }
 
         project.BlueprintRoot = RoadMeshBuilder.BuildRoadObject(
@@ -658,13 +869,14 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
 
         activeProjects.Add(project);
         DispatchNearestEngineers(project, GetWorkHeadPosition(project));
+        GcreNetworkSync.BroadcastRoadProgress(project.Id, project.Hq, project.TotalLengthMeters, 0f, cancelled: false, project.Samples);
 
         int dispatched = project.AssignedBuilders.Count;
         string msg = dispatched > 0
             ? $"Road #{id} blueprint placed ({project.TotalLengthMeters:0} m). {dispatched} M12 Jackknife(s) en route."
             : $"Road #{id} blueprint placed ({project.TotalLengthMeters:0} m). Move an M12 Jackknife near the road start!";
-        SetFeedback(msg, 6f);
         AddonLog.Info($"[Roads] {msg}");
+        return msg;
     }
 
     private void TickProjects(float now, float dt)
@@ -738,6 +950,13 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
                         isBlueprint: false,
                         addColliders: false);
                     project.LastRebuiltSamples = builtSampleCount;
+                    GcreNetworkSync.BroadcastRoadProgress(
+                        project.Id,
+                        project.Hq,
+                        project.TotalLengthMeters,
+                        project.BuiltLengthMeters,
+                        cancelled: false,
+                        samples: null);
                 }
             }
 
@@ -784,6 +1003,14 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
             project.Hq.AddFunds(refund);
         }
 
+        GcreNetworkSync.BroadcastRoadProgress(
+            project.Id,
+            project.Hq,
+            project.TotalLengthMeters,
+            project.BuiltLengthMeters,
+            cancelled: true,
+            samples: null);
+
         AddonLog.Info($"[Roads] Road #{project.Id} cancelled; refunded {refund:0} Cr.");
     }
 
@@ -799,6 +1026,11 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
         {
             UnityEngine.Object.Destroy(project.BuiltRoot);
             project.BuiltRoot = null;
+        }
+
+        if (appliedCompletedRoadIds.Add(project.Id))
+        {
+            completedRoads.Add((project.Id, new List<RoadSample>(project.Samples)));
         }
 
         GameObject finishedObj = RoadMeshBuilder.BuildRoadObject(
@@ -821,6 +1053,8 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
         int injectedSegments = InjectIntoRoadNetwork(project);
         project.Completed = true;
 
+        GcreNetworkSync.BroadcastRoadCompleted(project.Id, project.Samples);
+
         string summary = $"Road #{project.Id} completed ({project.TotalLengthMeters:0} m, {project.BridgeLengthMeters:0} m bridge) · {injectedSegments} nav segment(s) linked!";
         AddonLog.Info($"[Roads] {summary}");
 
@@ -828,6 +1062,144 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
         if (localHq != null && ReferenceEquals(localHq, project.Hq))
         {
             GroundControlReflection.NoticeFail(summary);
+        }
+
+        GcreNetworkSync.BroadcastFactionToast(project.Hq, isAlert: false, summary);
+    }
+
+    internal void ApplyClientCompletedRoad(int id, List<RoadSample> samples)
+    {
+        if (!GcreNetworkSync.IsPureClient || samples == null || samples.Count < 2)
+        {
+            return;
+        }
+
+        for (int i = activeProjects.Count - 1; i >= 0; i--)
+        {
+            if (activeProjects[i].Id == id)
+            {
+                RoadConstructionProject p = activeProjects[i];
+                if (p.BlueprintRoot != null) UnityEngine.Object.Destroy(p.BlueprintRoot);
+                if (p.BuiltRoot != null) UnityEngine.Object.Destroy(p.BuiltRoot);
+                activeProjects.RemoveAt(i);
+            }
+        }
+
+        if (!appliedCompletedRoadIds.Add(id))
+        {
+            return;
+        }
+
+        completedRoads.Add((id, samples));
+        GameObject finishedObj = RoadMeshBuilder.BuildRoadObject(
+            $"GCE_RoadComplete_{id}",
+            samples,
+            samples.Count,
+            isBlueprint: false,
+            addColliders: true);
+        completedRoadObjects.Add(finishedObj);
+
+        var tempProject = new RoadConstructionProject
+        {
+            Id = id,
+            Samples = samples,
+        };
+        InjectIntoRoadNetwork(tempProject);
+    }
+
+    internal void ApplyClientRoadProgress(
+        int id,
+        string hqName,
+        float totalLen,
+        float builtLen,
+        bool cancelled,
+        List<RoadSample>? samples)
+    {
+        if (!GcreNetworkSync.IsPureClient)
+        {
+            return;
+        }
+
+        int existingIdx = -1;
+        for (int i = 0; i < activeProjects.Count; i++)
+        {
+            if (activeProjects[i].Id == id)
+            {
+                existingIdx = i;
+                break;
+            }
+        }
+
+        if (cancelled || appliedCompletedRoadIds.Contains(id))
+        {
+            if (existingIdx >= 0)
+            {
+                RoadConstructionProject p = activeProjects[existingIdx];
+                if (p.BlueprintRoot != null) UnityEngine.Object.Destroy(p.BlueprintRoot);
+                if (p.BuiltRoot != null) UnityEngine.Object.Destroy(p.BuiltRoot);
+                activeProjects.RemoveAt(existingIdx);
+            }
+
+            return;
+        }
+
+        RoadConstructionProject project;
+        if (existingIdx >= 0)
+        {
+            project = activeProjects[existingIdx];
+        }
+        else
+        {
+            if (samples == null || samples.Count < 2)
+            {
+                return;
+            }
+
+            project = new RoadConstructionProject
+            {
+                Id = id,
+                Hq = GcreNetworkSync.FindHqByName(hqName)!,
+                Samples = samples,
+                TotalLengthMeters = totalLen,
+                BuiltLengthMeters = builtLen,
+                LastRebuiltSamples = 0,
+            };
+            project.BlueprintRoot = RoadMeshBuilder.BuildRoadObject(
+                $"GCE_RoadBlueprint_{id}",
+                project.Samples,
+                project.Samples.Count,
+                isBlueprint: true,
+                addColliders: false);
+            activeProjects.Add(project);
+        }
+
+        if (project.Hq == null && !string.IsNullOrEmpty(hqName))
+        {
+            project.Hq = GcreNetworkSync.FindHqByName(hqName)!;
+        }
+
+        project.TotalLengthMeters = totalLen;
+        project.BuiltLengthMeters = builtLen;
+
+        if (project.Samples.Count >= 2 && project.BuiltLengthMeters > 0.1f)
+        {
+            int curSampleIdx = GetWorkHeadSampleIndex(project);
+            int builtSampleCount = Mathf.Clamp(curSampleIdx + 1, 2, project.Samples.Count);
+            if (builtSampleCount >= project.LastRebuiltSamples + 2)
+            {
+                if (project.BuiltRoot != null)
+                {
+                    UnityEngine.Object.Destroy(project.BuiltRoot);
+                }
+
+                project.BuiltRoot = RoadMeshBuilder.BuildRoadObject(
+                    $"GCE_RoadPartial_{project.Id}",
+                    project.Samples,
+                    builtSampleCount,
+                    isBlueprint: false,
+                    addColliders: false);
+                project.LastRebuiltSamples = builtSampleCount;
+            }
         }
     }
 
@@ -1321,7 +1693,7 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
             NativeThemeBridge.Header);
         GUI.Label(
             new Rect(20f, y + 28f, innerW - 16f, 20f),
-            $"Max Grade: {plannedMaxLandGradePercent:0.#}% (Limit {AddonConfig.MaxRoadGradePercent.Value:0}%)   |   Cost: ${plannedCost:0}m",
+            $"Max Grade: {plannedMaxLandGradePercent:0.#}% (Limit {GcreNetworkSync.EffectiveMaxRoadGradePercent:0}%)   |   Cost: ${plannedCost:0}m",
             NativeThemeBridge.Caption);
         y += 64f;
 
@@ -1382,12 +1754,18 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
         float w = progressRect.width;
         float innerW = w - 24f;
         float y = 34f;
+        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
 
         for (int i = 0; i < activeProjects.Count; i++)
         {
             RoadConstructionProject p = activeProjects[i];
+            if (!ShouldShowProjectInHud(p, localHq))
+            {
+                continue;
+            }
+
             float frac = p.TotalLengthMeters > 0.1f ? Mathf.Clamp01(p.BuiltLengthMeters / p.TotalLengthMeters) : 0f;
-            int working = CountWorkingEngineersNear(p.Hq, GetWorkHeadPosition(p));
+            int working = p.Hq != null ? CountWorkingEngineersNear(p.Hq, GetWorkHeadPosition(p)) : 0;
 
             GUI.Box(new Rect(12f, y, innerW, 46f), string.Empty, NativeThemeBridge.Inset);
             GUI.Label(
@@ -1401,7 +1779,15 @@ internal sealed class PioneerRoadService : IAddonTick, IAddonGui, IAddonResetSes
 
             if (GUI.Button(new Rect(w - 86f, y + 9f, 68f, 28f), "CANCEL", NativeThemeBridge.DangerButton))
             {
-                CancelProjectAndRefund(i);
+                if (GcreNetworkSync.IsPureClient)
+                {
+                    GcreNetworkSync.RequestCancelRoad(p.Id);
+                }
+                else
+                {
+                    CancelProjectAndRefund(i);
+                }
+
                 break;
             }
 

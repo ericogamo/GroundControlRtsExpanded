@@ -34,12 +34,14 @@ public sealed class AddonPlugin : BaseUnityPlugin
         PluginDirectory = Path.GetDirectoryName(Info.Location) ?? AppContext.BaseDirectory;
 
         GroundControlReflection.ValidateAllBindings();
+        GcreNetworkSync.Initialize();
 
         harmony = new Harmony(PluginInfo.Guid);
         harmony.PatchAll();
 
         ModelRegistry.Initialize(PluginDirectory);
         RuntimeController = gameObject.AddComponent<AddonRuntimeController>();
+        RuntimeController.Register(GcreNetworkSync.Instance);
         RuntimeController.Register(AiStrategicDirectorService.Instance);
         RuntimeController.Register(AiCoastalOutpostService.Instance);
         RuntimeController.Register(AiBattlefieldIntelService.Instance);
@@ -47,6 +49,7 @@ public sealed class AddonPlugin : BaseUnityPlugin
         RuntimeController.Register(AiOperationalManeuverService.Instance);
         RuntimeController.Register(AiRadarEmconService.Instance);
         RuntimeController.Register(AiSupplyLogisticsService.Instance);
+        RuntimeController.Register(HangarSpawnSafetyService.Instance);
         RuntimeController.Register(PerfMetricsService.Instance);
         RuntimeController.Register(WreckCleanupService.Instance);
         RuntimeController.Register(DynamicCapAndTechService.Instance);

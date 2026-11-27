@@ -54,6 +54,7 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
 
     private readonly Dictionary<FactionHQ, CoastalOutpostState> states = new();
     private readonly Dictionary<Unit, float> failedLiftBuildersUntil = new();
+    private readonly List<Unit> staleFailedLiftScratch = new();
     private readonly Dictionary<(int CellX, int CellZ), int> failedLiftSiteCounts = new();
     private readonly List<Airbase> ownBasesScratch = new(16);
     private readonly List<(GlobalPosition Pos, float OwnDistSq, int BaseIndex)> seaCandidateScratch = new(128);
@@ -107,7 +108,7 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
             return false;
         }
 
-        return GroundControlReflection.IsAiFaction(hq, GroundControlReflection.GetLocalHq());
+        return GroundControlReflection.IsSafeAiFaction(hq, GroundControlReflection.GetLocalHq());
     }
 
     internal float EvaluateDockOrOutpostCost(object ecoInstance, FactionHQ? hq, float vanillaCost)
@@ -360,130 +361,162 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
         Dictionary<Unit, float>? resting = GroundControlReflection.EcoGetBuilderResting(ecoInstance);
         float now = Time.time;
 
-        for (int i = 0; i < sites.Count; i++)
+        if (failedLiftBuildersUntil.Count > 0)
         {
-            object? cs = sites[i];
-            if (cs == null)
+            staleFailedLiftScratch.Clear();
+            foreach (KeyValuePair<Unit, float> kv in failedLiftBuildersUntil)
             {
-                continue;
-            }
-
-            FactionHQ? hq = GroundControlReflection.SiteHqProp?.GetValue(cs) as FactionHQ;
-            BuildingDefinition? def = GroundControlReflection.SiteDefinitionProp?.GetValue(cs) as BuildingDefinition;
-            if (hq == null || def == null || !(hq is NetworkBehaviour nb) || !nb.IsServer || !GroundControlReflection.IsAiFaction(hq, localHq))
-            {
-                continue;
-            }
-
-            bool isCoastalCandidate = GroundControlReflection.BuildPreviewIsControlTower(def)
-                || GroundControlReflection.IsSiteKindNavalDock(cs);
-            if (!isCoastalCandidate)
-            {
-                continue;
-            }
-
-            List<Unit>? builders = GroundControlReflection.SiteGetBuilders(cs);
-            if (builders == null || builders.Count > 0)
-            {
-                continue;
-            }
-
-            if (GroundControlReflection.SitePositionProp?.GetValue(cs) is not GlobalPosition sitePos)
-            {
-                continue;
-            }
-
-            GroundControlReflection.EcoCollectIdleBuilders(hq, idleBuilderScratch);
-            if (resting != null)
-            {
-                for (int r = idleBuilderScratch.Count - 1; r >= 0; r--)
+                if (kv.Key == null || kv.Key.disabled || now >= kv.Value)
                 {
-                    if (resting.TryGetValue(idleBuilderScratch[r], out float restUntil) && now < restUntil)
-                    {
-                        idleBuilderScratch.RemoveAt(r);
-                    }
+                    staleFailedLiftScratch.Add(kv.Key!);
                 }
             }
 
-            Unit? bestDriveable = null;
-            float bestDriveSq = float.MaxValue;
-            Unit? bestAny = null;
-            float bestAnySq = float.MaxValue;
-
-            for (int j = 0; j < idleBuilderScratch.Count; j++)
+            for (int r = 0; r < staleFailedLiftScratch.Count; r++)
             {
-                Unit candidate = idleBuilderScratch[j];
-                if (candidate == null || candidate.disabled)
+                failedLiftBuildersUntil.Remove(staleFailedLiftScratch[r]);
+            }
+
+            staleFailedLiftScratch.Clear();
+        }
+
+        try
+        {
+            for (int i = 0; i < sites.Count; i++)
+            {
+                object? cs = sites[i];
+                if (cs == null)
                 {
                     continue;
                 }
 
-                GlobalPosition cPos = candidate.GlobalPosition();
-                float distSq = FastMath.SquareDistance(cPos, sitePos);
-                if (distSq < bestAnySq)
+                FactionHQ? hq = GroundControlReflection.SiteHqProp?.GetValue(cs) as FactionHQ;
+                BuildingDefinition? def = GroundControlReflection.SiteDefinitionProp?.GetValue(cs) as BuildingDefinition;
+                if (hq == null || def == null || !(hq is NetworkBehaviour nb) || !nb.IsServer || !GroundControlReflection.IsSafeAiFaction(hq, localHq))
                 {
-                    bestAnySq = distSq;
-                    bestAny = candidate;
+                    continue;
                 }
 
-                if (distSq < bestDriveSq && GroundControlReflection.CanDriveBetween(cPos, sitePos))
+                bool isCoastalCandidate = GroundControlReflection.BuildPreviewIsControlTower(def)
+                    || GroundControlReflection.IsSiteKindNavalDock(cs);
+                if (!isCoastalCandidate)
                 {
-                    bestDriveSq = distSq;
-                    bestDriveable = candidate;
-                }
-            }
-
-            Unit? chosen = bestDriveable ?? bestAny;
-            if (chosen != null)
-            {
-                GlobalPosition chosenPos = chosen.GlobalPosition();
-                GroundControlReflection.EcoSendBuilder(cs, chosen);
-                if (!GroundControlReflection.CanDriveBetween(chosenPos, sitePos))
-                {
-                    GroundControlReflection.MoveClearOrder(chosen);
-                    GroundControlReflection.TrySetDestination(chosen, chosenPos);
+                    continue;
                 }
 
-                continue;
-            }
+                List<Unit>? builders = GroundControlReflection.SiteGetBuilders(cs);
+                if (builders == null || builders.Count > 0)
+                {
+                    continue;
+                }
 
-            if (GroundControlReflection.EcoHasBusyBuilderNear(ecoInstance, hq, sitePos))
-            {
-                continue;
-            }
+                if (GroundControlReflection.SitePositionProp?.GetValue(cs) is not GlobalPosition sitePos)
+                {
+                    continue;
+                }
 
-            if (now < GroundControlReflection.SiteGetNextBuilderSpawnAt(cs) || GroundControlReflection.UnitCapIsGroundFull(hq))
-            {
-                continue;
-            }
+                GroundControlReflection.EcoCollectIdleBuilders(hq, idleBuilderScratch);
+                if (resting != null)
+                {
+                    for (int r = idleBuilderScratch.Count - 1; r >= 0; r--)
+                    {
+                        if (resting.TryGetValue(idleBuilderScratch[r], out float restUntil) && now < restUntil)
+                        {
+                            idleBuilderScratch.RemoveAt(r);
+                        }
+                    }
+                }
 
-            VehicleDefinition? repairDef = GroundControlReflection.FindRepairVehicleDefinition(hq);
-            if (repairDef == null)
-            {
-                continue;
-            }
+                Unit? bestDriveable = null;
+                float bestDriveSq = float.MaxValue;
+                Unit? bestAny = null;
+                float bestAnySq = float.MaxValue;
 
-            float builderCost = Mathf.Max(0f, repairDef.value);
-            if (hq.factionFunds < builderCost)
-            {
-                continue;
-            }
+                for (int j = 0; j < idleBuilderScratch.Count; j++)
+                {
+                    Unit candidate = idleBuilderScratch[j];
+                    if (candidate == null || candidate.disabled)
+                    {
+                        continue;
+                    }
 
-            if (!hq.TryGetNearestDepot(sitePos.ToLocalPosition(), float.MaxValue, out VehicleDepot depot) || depot == null)
-            {
-                continue;
-            }
+                    GlobalPosition cPos = candidate.GlobalPosition();
+                    float distSq = FastMath.SquareDistance(cPos, sitePos);
+                    if (distSq < bestAnySq)
+                    {
+                        bestAnySq = distSq;
+                        bestAny = candidate;
+                    }
 
-            if (GroundControlReflection.EcoTryGiveStartingBuilders(ecoInstance, hq, depot, 1)
-                && GroundControlReflection.TrySpend(hq, builderCost))
-            {
-                GroundControlReflection.SiteSetNextBuilderSpawnAt(cs, now + 60f);
-                AddonLog.Info(
-                    $"[AI Outpost] {hq.faction?.name ?? "AI"} rolled out a remote builder at {depot.name} for {def.unitName} ({builderCost:0} Cr).");
+                    if (distSq < bestDriveSq && GroundControlReflection.CanDriveBetween(cPos, sitePos))
+                    {
+                        bestDriveSq = distSq;
+                        bestDriveable = candidate;
+                    }
+                }
+
+                Unit? chosen = bestDriveable ?? bestAny;
+                if (chosen != null)
+                {
+                    GlobalPosition chosenPos = chosen.GlobalPosition();
+                    GroundControlReflection.EcoSendBuilder(cs, chosen);
+                    if (!GroundControlReflection.CanDriveBetween(chosenPos, sitePos))
+                    {
+                        GroundControlReflection.MoveClearOrder(chosen);
+                        GroundControlReflection.TrySetAiDestination(chosen, chosenPos);
+                    }
+
+                    continue;
+                }
+
+                if (GroundControlReflection.EcoHasBusyBuilderNear(ecoInstance, hq, sitePos))
+                {
+                    continue;
+                }
+
+                if (now < GroundControlReflection.SiteGetNextBuilderSpawnAt(cs) || GroundControlReflection.UnitCapIsGroundFull(hq))
+                {
+                    continue;
+                }
+
+                VehicleDefinition? repairDef = GroundControlReflection.FindRepairVehicleDefinition(hq);
+                if (repairDef == null)
+                {
+                    continue;
+                }
+
+                float builderCost = Mathf.Max(0f, repairDef.value);
+                if (hq.factionFunds < builderCost)
+                {
+                    continue;
+                }
+
+                if (!hq.TryGetNearestDepot(sitePos.ToLocalPosition(), float.MaxValue, out VehicleDepot depot) || depot == null)
+                {
+                    continue;
+                }
+
+                if (!GroundControlReflection.TrySpend(hq, builderCost))
+                {
+                    continue;
+                }
+
+                if (GroundControlReflection.EcoTryGiveStartingBuilders(ecoInstance, hq, depot, 1))
+                {
+                    GroundControlReflection.SiteSetNextBuilderSpawnAt(cs, now + 60f);
+                    AddonLog.Info(
+                        $"[AI Outpost] {hq.faction?.name ?? "AI"} rolled out a remote builder at {depot.name} for {def.unitName} ({builderCost:0} Cr).");
+                }
+                else
+                {
+                    hq.AddFunds(builderCost);
+                }
             }
         }
-
-        idleBuilderScratch.Clear();
+        finally
+        {
+            idleBuilderScratch.Clear();
+        }
     }
 
     internal bool TryFindStrandedRemoteBuilder(
@@ -899,8 +932,7 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
         }
 
         ownAnchorsScratch.Clear();
-        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
-        FactionHQ? enemyHq = ReferenceEquals(localHq, hq) ? null : localHq;
+        FactionHQ? enemyHq = GroundControlReflection.FindPrimaryHostileHq(hq);
         AiBattlefieldIntelService.Instance.GetAirbasesOrderedBySafety(hq, enemyHq, ownBasesScratch);
         for (int i = 0; i < ownBasesScratch.Count; i++)
         {

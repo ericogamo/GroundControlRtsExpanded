@@ -67,27 +67,54 @@ internal sealed class SingleplayerCheatService : IAddonTick, IAddonGui, IAddonRe
 
     internal static bool IsUnlockTier3ActiveFor(FactionHQ? hq)
     {
-        if (!IsAllowed || !Instance.unlockTier3 || hq == null)
+        if (hq == null)
+        {
+            return false;
+        }
+
+        if (GcreNetworkSync.IsPureClient && GcreNetworkSync.HostHasGcre)
+        {
+            return !string.IsNullOrEmpty(GcreNetworkSync.RemoteCheatTier3HqName) &&
+                   hq.faction != null &&
+                   string.Equals(hq.faction.factionName, GcreNetworkSync.RemoteCheatTier3HqName, System.StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (!IsAllowed || !Instance.unlockTier3)
         {
             return false;
         }
 
         FactionHQ? localHq = GroundControlReflection.GetLocalHq();
-        return localHq == null || ReferenceEquals(hq, localHq);
+        return localHq != null && ReferenceEquals(hq, localHq);
     }
 
     internal static bool IsIgnoreCapsActiveFor(FactionHQ? hq)
     {
-        if (!IsAllowed || !Instance.ignoreCaps || hq == null)
+        if (hq == null)
+        {
+            return false;
+        }
+
+        if (GcreNetworkSync.IsPureClient && GcreNetworkSync.HostHasGcre)
+        {
+            return !string.IsNullOrEmpty(GcreNetworkSync.RemoteCheatIgnoreCapsHqName) &&
+                   hq.faction != null &&
+                   string.Equals(hq.faction.factionName, GcreNetworkSync.RemoteCheatIgnoreCapsHqName, System.StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (!IsAllowed || !Instance.ignoreCaps)
         {
             return false;
         }
 
         FactionHQ? localHq = GroundControlReflection.GetLocalHq();
-        return localHq == null || ReferenceEquals(hq, localHq);
+        return localHq != null && ReferenceEquals(hq, localHq);
     }
 
-    internal static bool IsIgnoreFactionLockActive => IsAllowed && Instance.ignoreFactionLock;
+    internal static bool IsIgnoreFactionLockActive =>
+        (GcreNetworkSync.IsPureClient && GcreNetworkSync.HostHasGcre)
+            ? GcreNetworkSync.RemoteCheatIgnoreFactionLock
+            : (IsAllowed && Instance.ignoreFactionLock);
     internal static bool IsInstantBuildActive => IsAllowed && Instance.instantBuild;
     internal static bool IsRevealMapActive => IsAllowed && Instance.revealMap;
 
@@ -409,6 +436,10 @@ internal sealed class SingleplayerCheatService : IAddonTick, IAddonGui, IAddonRe
             if (touched)
             {
                 repairedCount++;
+                if (unit.persistentID.IsValid)
+                {
+                    GcreNetworkSync.BroadcastPartHeal(unit.persistentID.Id);
+                }
             }
         }
 

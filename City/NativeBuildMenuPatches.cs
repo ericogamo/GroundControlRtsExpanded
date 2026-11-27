@@ -51,7 +51,7 @@ internal static class EconomyCatalogUiInjectionPatch
         for (int i = 0; i < __result.Count; i++)
         {
             BuildingDefinition b = __result[i];
-            if (b == null || IsRawMdsEntry(b))
+            if (b == null || IsRawMdsEntry(b) || (!NativeBuildMenuState.InUiDrawCatalog && IsCustomCityOrMdsEntry(b)))
             {
                 continue;
             }
@@ -68,6 +68,9 @@ internal static class EconomyCatalogUiInjectionPatch
             __result = merged;
             return;
         }
+
+        RtsBuildingCatalog.EnsureLookupEntries();
+        MdsBridgeBootstrap.EnsureMdsBuildCatalogLookupAction?.Invoke();
 
         IReadOnlyList<RtsBuildingSpec> rtsSpecs = RtsBuildingCatalog.AllSpecs;
         for (int i = 0; i < rtsSpecs.Count; i++)
@@ -107,6 +110,23 @@ internal static class EconomyCatalogUiInjectionPatch
         __result = merged;
     }
 
+    private static bool IsCustomCityOrMdsEntry(BuildingDefinition def)
+    {
+        if (RtsBuildingCatalog.TryGetSpec(def, out _))
+        {
+            return true;
+        }
+
+        if (MdsBridgeBootstrap.IsMdsBuildDefinition?.Invoke(def) == true)
+        {
+            return true;
+        }
+
+        return !string.IsNullOrEmpty(def.jsonKey) &&
+               (def.jsonKey.StartsWith(RtsBuildingCatalog.JsonKeyPrefix, StringComparison.OrdinalIgnoreCase) ||
+                def.jsonKey.StartsWith("mds_build_", StringComparison.OrdinalIgnoreCase));
+    }
+
     private static bool IsRawMdsEntry(BuildingDefinition def)
     {
         if (MdsBridgeBootstrap.IsRawMdsEncyclopediaDefinition != null)
@@ -128,6 +148,65 @@ internal static class EconomyCatalogUiInjectionPatch
 
         return !string.IsNullOrEmpty(def.unitName)
             && def.unitName.StartsWith("[MDS]", StringComparison.OrdinalIgnoreCase);
+    }
+}
+
+[HarmonyPatch]
+internal static class EconomyRefreshCatalogInjectCustomPatch
+{
+    private static bool Prepare() =>
+        GroundControlReflection.EcoRefreshCatalogMethod != null &&
+        GroundControlReflection.EcoCatalogListField != null;
+
+    private static MethodBase TargetMethod() => GroundControlReflection.EcoRefreshCatalogMethod!;
+
+    private static void Postfix(object __instance)
+    {
+        if (!AddonConfig.ModEnabled.Value || __instance == null)
+        {
+            return;
+        }
+
+        if (GroundControlReflection.EcoCatalogListField?.GetValue(__instance) is not List<BuildingDefinition> list)
+        {
+            return;
+        }
+
+        RtsBuildingCatalog.EnsureLookupEntries();
+        MdsBridgeBootstrap.EnsureMdsBuildCatalogLookupAction?.Invoke();
+
+        var existingKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < list.Count; i++)
+        {
+            BuildingDefinition b = list[i];
+            if (b != null && !string.IsNullOrEmpty(b.jsonKey))
+            {
+                existingKeys.Add(b.jsonKey);
+            }
+        }
+
+        IReadOnlyList<RtsBuildingSpec> specs = RtsBuildingCatalog.AllSpecs;
+        for (int i = 0; i < specs.Count; i++)
+        {
+            BuildingDefinition? def = RtsBuildingCatalog.GetOrCreateDefinition(specs[i].Kind);
+            if (def != null && !string.IsNullOrEmpty(def.jsonKey) && existingKeys.Add(def.jsonKey))
+            {
+                list.Add(def);
+            }
+        }
+
+        if (MdsBridgeBootstrap.GetAllMdsBuildCatalogDefinitions != null)
+        {
+            IReadOnlyList<BuildingDefinition> mdsDefs = MdsBridgeBootstrap.GetAllMdsBuildCatalogDefinitions();
+            for (int i = 0; i < mdsDefs.Count; i++)
+            {
+                BuildingDefinition? def = mdsDefs[i];
+                if (def != null && !string.IsNullOrEmpty(def.jsonKey) && existingKeys.Add(def.jsonKey))
+                {
+                    list.Add(def);
+                }
+            }
+        }
     }
 }
 
@@ -331,8 +410,8 @@ internal static class SupplyHeliGetCargoMountsFilterPatch
             return;
         }
 
-        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
-        if (localHq == null)
+        FactionHQ? targetHq = SupplyHeliHostCargoRunGatePatch.ActiveGuestCargoHq ?? GroundControlReflection.GetLocalHq();
+        if (targetHq == null)
         {
             return;
         }
@@ -340,7 +419,7 @@ internal static class SupplyHeliGetCargoMountsFilterPatch
         for (int i = __result.Count - 1; i >= 0; i--)
         {
             WeaponMount? mount = __result[i];
-            if (mount != null && !filter(mount, localHq))
+            if (mount != null && !filter(mount, targetHq))
             {
                 __result.RemoveAt(i);
             }
@@ -449,6 +528,8 @@ internal static class SupplyHeliCargoGateHelpers
 {
     private static readonly List<WeaponMount> MountScratch = new();
 
+    internal static void ClearScratch() => MountScratch.Clear();
+
     internal static bool TryGetBlockedSelectedReason(object? supplyService, out string reason)
         => TryGetBlockedReason(supplyService, GroundControlReflection.CollectSupplyHeliSelectedMounts, out reason);
 
@@ -481,6 +562,74 @@ internal static class SupplyHeliCargoGateHelpers
 
         reason = block!;
         return true;
+    }
+}
+
+[HarmonyPatch]
+internal static class SupplyHeliHostCargoRunGatePatch
+{
+    [ThreadStatic]
+    internal static FactionHQ? ActiveGuestCargoHq;
+
+    private static bool Prepare() => GroundControlReflection.SupplyHeliHostCargoRunMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.SupplyHeliHostCargoRunMethod!;
+
+    private static bool Prefix(FactionHQ? hq, string[]? args, out FactionHQ? __state)
+    {
+        __state = ActiveGuestCargoHq;
+        ActiveGuestCargoHq = hq;
+
+        if (!AddonConfig.ModEnabled.Value || hq == null || args == null || args.Length <= 3 || MdsBridgeBootstrap.GetMdsAirdropLoadoutBlockReason == null)
+        {
+            return true;
+        }
+
+        string rawMounts = args[3] ?? string.Empty;
+        if (rawMounts.Length == 0 || Encyclopedia.i?.weaponMounts == null)
+        {
+            return true;
+        }
+
+        string[] keys = rawMounts.Split(',');
+        var mounts = new List<WeaponMount>(keys.Length);
+        List<WeaponMount> allMounts = Encyclopedia.i.weaponMounts;
+        for (int k = 0; k < keys.Length; k++)
+        {
+            string key = keys[k];
+            if (string.IsNullOrEmpty(key))
+            {
+                continue;
+            }
+
+            for (int m = 0; m < allMounts.Count; m++)
+            {
+                WeaponMount wm = allMounts[m];
+                if (wm != null && string.Equals(wm.jsonKey, key, StringComparison.Ordinal))
+                {
+                    mounts.Add(wm);
+                    break;
+                }
+            }
+        }
+
+        if (mounts.Count > 0)
+        {
+            string? reason = MdsBridgeBootstrap.GetMdsAirdropLoadoutBlockReason(mounts, hq);
+            if (!string.IsNullOrEmpty(reason))
+            {
+                GroundControlReflection.NoticeFail(reason!);
+                ActiveGuestCargoHq = __state;
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static Exception? Finalizer(Exception? __exception, FactionHQ? __state)
+    {
+        ActiveGuestCargoHq = __state;
+        return __exception;
     }
 }
 

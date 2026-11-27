@@ -1133,100 +1133,106 @@ internal static class PickJammerTargetsDeconflictPatch
 
         jammers.Clear();
 
-        float levelNow = Time.timeSinceLevelLoad;
-        foreach (FactionHQ aiHq in FactionRegistry.GetAllHQs())
+        try
         {
-            if (aiHq == null
-                || ReferenceEquals(aiHq, localHq)
-                || !((NetworkBehaviour)aiHq).IsServer
-                || !GroundControlReflection.IsAiFaction(aiHq, localHq)
-                || aiHq.faction == null
-                || aiHq.factionUnits == null)
+            float levelNow = Time.timeSinceLevelLoad;
+            foreach (FactionHQ aiHq in FactionRegistry.GetAllHQs())
             {
-                continue;
-            }
-
-            GlobalPosition primaryObj = AiBattlefieldIntelService.Instance.GetPrimaryObjectivePos(aiHq, localHq);
-            RadarScratch.Clear();
-            AssignedRadarScratch.Clear();
-
-            if (aiHq.trackingDatabase != null)
-            {
-                foreach (KeyValuePair<PersistentID, TrackingInfo> kv in aiHq.trackingDatabase)
-                {
-                    TrackingInfo info = kv.Value;
-                    if (info == null || !info.TryGetUnit(out Unit r) || r == null || r.disabled)
-                    {
-                        continue;
-                    }
-
-                    if (r.NetworkHQ == null
-                        || ReferenceEquals(r.NetworkHQ, aiHq)
-                        || !r.HasRadarEmission()
-                        || (!(r is Building) && levelNow - info.lastSpottedTime > 90f))
-                    {
-                        continue;
-                    }
-
-                    GlobalPosition pos = info.GetPosition();
-                    float distCorr = !primaryObj.Equals(default) ? FastMath.Distance(pos, primaryObj) : 0f;
-                    RadarScratch.Add((r, pos, distCorr));
-                }
-            }
-
-            if (RadarScratch.Count == 0)
-            {
-                continue;
-            }
-
-            RadarScratch.Sort((a, b) => a.DistToCorr.CompareTo(b.DistToCorr));
-
-            foreach (PersistentID pid in aiHq.factionUnits)
-            {
-                if (!pid.TryGetUnit(out Unit u) || u is not Aircraft ac || ac.disabled || ac.Player != null)
+                if (aiHq == null
+                    || ReferenceEquals(aiHq, localHq)
+                    || !((NetworkBehaviour)aiHq).IsServer
+                    || !GroundControlReflection.IsSafeAiFaction(aiHq, localHq)
+                    || aiHq.faction == null
+                    || aiHq.factionUnits == null)
                 {
                     continue;
                 }
 
-                if (GroundControlReflection.EnemyIsRadarPicket(ac.definition, aiHq) || ((Unit)ac).weaponStations == null)
+                GlobalPosition primaryObj = AiBattlefieldIntelService.Instance.GetPrimaryObjectivePos(aiHq, localHq);
+                RadarScratch.Clear();
+                AssignedRadarScratch.Clear();
+
+                if (aiHq.trackingDatabase != null)
                 {
-                    continue;
-                }
-
-                List<WeaponStation> stations = ((Unit)ac).weaponStations;
-                for (int s = 0; s < stations.Count; s++)
-                {
-                    WeaponStation? station = stations[s];
-                    WeaponInfo? wi = station?.WeaponInfo;
-                    if (station == null || wi == null || !wi.jammer)
+                    foreach (KeyValuePair<PersistentID, TrackingInfo> kv in aiHq.trackingDatabase)
                     {
-                        continue;
-                    }
-
-                    float maxRange = wi.targetRequirements.maxRange;
-                    Unit? chosen = PickRadarForJammerPod(ac, maxRange, primaryObj);
-                    if (chosen == null)
-                    {
-                        continue;
-                    }
-
-                    AssignedRadarScratch.Add(chosen);
-                    for (int w = 0; w < station.Weapons.Count; w++)
-                    {
-                        if (station.Weapons[w] is JammingPod pod)
+                        TrackingInfo info = kv.Value;
+                        if (info == null || !info.TryGetUnit(out Unit r) || r == null || r.disabled)
                         {
-                            pod.SetTarget(chosen);
-                            object activeJammer = GroundControlReflection.ActiveJammerCtor.Invoke(new object[] { ac, station, pod, chosen });
-                            jammers.Add(activeJammer);
+                            continue;
+                        }
+
+                        if (r.NetworkHQ == null
+                            || ReferenceEquals(r.NetworkHQ, aiHq)
+                            || !r.HasRadarEmission()
+                            || (!(r is Building) && levelNow - info.lastSpottedTime > 90f))
+                        {
+                            continue;
+                        }
+
+                        GlobalPosition pos = info.GetPosition();
+                        float distCorr = !primaryObj.Equals(default) ? FastMath.Distance(pos, primaryObj) : 0f;
+                        RadarScratch.Add((r, pos, distCorr));
+                    }
+                }
+
+                if (RadarScratch.Count == 0)
+                {
+                    continue;
+                }
+
+                RadarScratch.Sort((a, b) => a.DistToCorr.CompareTo(b.DistToCorr));
+
+                foreach (PersistentID pid in aiHq.factionUnits)
+                {
+                    if (!pid.TryGetUnit(out Unit u) || u is not Aircraft ac || ac.disabled || ac.Player != null)
+                    {
+                        continue;
+                    }
+
+                    if (GroundControlReflection.EnemyIsRadarPicket(ac.definition, aiHq) || ((Unit)ac).weaponStations == null)
+                    {
+                        continue;
+                    }
+
+                    List<WeaponStation> stations = ((Unit)ac).weaponStations;
+                    for (int s = 0; s < stations.Count; s++)
+                    {
+                        WeaponStation? station = stations[s];
+                        WeaponInfo? wi = station?.WeaponInfo;
+                        if (station == null || wi == null || !wi.jammer)
+                        {
+                            continue;
+                        }
+
+                        float maxRange = wi.targetRequirements.maxRange;
+                        Unit? chosen = PickRadarForJammerPod(ac, maxRange, primaryObj);
+                        if (chosen == null)
+                        {
+                            continue;
+                        }
+
+                        AssignedRadarScratch.Add(chosen);
+                        for (int w = 0; w < station.Weapons.Count; w++)
+                        {
+                            if (station.Weapons[w] is JammingPod pod)
+                            {
+                                pod.SetTarget(chosen);
+                                object activeJammer = GroundControlReflection.ActiveJammerCtor.Invoke(new object[] { ac, station, pod, chosen });
+                                jammers.Add(activeJammer);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        RadarScratch.Clear();
-        AssignedRadarScratch.Clear();
-        return false;
+            return false;
+        }
+        finally
+        {
+            RadarScratch.Clear();
+            AssignedRadarScratch.Clear();
+        }
     }
 
     private static Unit? PickRadarForJammerPod(Aircraft ac, float maxRange, GlobalPosition primaryObj)
@@ -1391,7 +1397,7 @@ internal static class ReleaseNavalWaveTacticalPatch
 
     private static bool Prefix(FactionHQ? hq, FactionHQ? localHq, object? state)
     {
-        if (!AddonConfig.EnableTacticalQualityAi.Value || hq == null || state == null)
+        if (!AddonConfig.EnableTacticalQualityAi.Value || hq == null || state == null || !((NetworkBehaviour)hq).IsServer)
         {
             return true;
         }
@@ -1422,7 +1428,7 @@ internal static class ReleaseNavalWaveTacticalPatch
                     && !FastMath.InRange(u.GlobalPosition(), rallyLanePoint, 2500f)
                     && AiTacticalDoctrineService.Instance.ShouldIssueNavalRetreat(u, now))
                 {
-                    GroundControlReflection.TrySetDestination(u, rallyLanePoint);
+                    GroundControlReflection.TrySetAiDestination(u, rallyLanePoint);
                 }
             }
         }
@@ -1467,21 +1473,27 @@ internal static class ReleaseNavalWaveTacticalPatch
         }
 
         StaleShipsScratch.Clear();
-        foreach (Ship ship in rallying)
+        try
         {
-            if (FastMath.InRange(((Unit)ship).GlobalPosition(), rallyLanePoint, 2500f))
+            foreach (Ship ship in rallying)
             {
-                GroundControlReflection.TrySetDestination((Unit)ship, targetLanePoint);
-                StaleShipsScratch.Add(ship);
+                if (FastMath.InRange(((Unit)ship).GlobalPosition(), rallyLanePoint, 2500f))
+                {
+                    GroundControlReflection.TrySetAiDestination((Unit)ship, targetLanePoint);
+                    StaleShipsScratch.Add(ship);
+                }
+            }
+
+            for (int i = 0; i < StaleShipsScratch.Count; i++)
+            {
+                rallying.Remove(StaleShipsScratch[i]);
             }
         }
-
-        for (int i = 0; i < StaleShipsScratch.Count; i++)
+        finally
         {
-            rallying.Remove(StaleShipsScratch[i]);
+            StaleShipsScratch.Clear();
         }
 
-        StaleShipsScratch.Clear();
         GroundControlReflection.SetStateFloat(
             state,
             GroundControlReflection.StateNavalWaitingSinceProp,
@@ -1555,10 +1567,13 @@ internal static class ReleaseNavalWaveTacticalPatch
             return true;
         }
 
-        if (localHq != null)
+        FactionHQ? hostileHq = (localHq != null && !ReferenceEquals(localHq, aiHq))
+            ? localHq
+            : GroundControlReflection.FindPrimaryHostileHq(aiHq);
+        if (hostileHq != null)
         {
             return GroundControlReflection.NavalTryGetSeaLanePoint(
-                GroundControlReflection.CaptureGetTerritoryCenter(localHq),
+                GroundControlReflection.CaptureGetTerritoryCenter(hostileHq),
                 out targetLane);
         }
 

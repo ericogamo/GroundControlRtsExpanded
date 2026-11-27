@@ -53,7 +53,7 @@ internal static class BaseCaptureIncomeService
 
     internal static int CountCapturedBonusBases(FactionHQ? hq)
     {
-        if (!AddonConfig.ModEnabled.Value || !AddonConfig.EnableCapturedBaseIncome.Value || hq == null)
+        if (!AddonConfig.ModEnabled.Value || !GcreNetworkSync.EffectiveEnableCapturedBaseIncome || hq == null)
         {
             return 0;
         }
@@ -69,13 +69,13 @@ internal static class BaseCaptureIncomeService
             return 0f;
         }
 
-        return bonusBases * Mathf.Max(0f, AddonConfig.CapturedBaseIncomePerMinute.Value);
+        return bonusBases * Mathf.Max(0f, GcreNetworkSync.EffectiveCapturedBaseIncomePerMinute);
     }
 
     internal static void OnAirbaseCaptured(Airbase airbase, FactionHQ? previousHq, FactionHQ? newHq)
     {
         if (!AddonConfig.ModEnabled.Value
-            || !AddonConfig.EnableCapturedBaseIncome.Value
+            || !GcreNetworkSync.EffectiveEnableCapturedBaseIncome
             || !IsEligibleCapturableBase(airbase)
             || newHq == null
             || ReferenceEquals(previousHq, newHq)
@@ -106,7 +106,7 @@ internal static class BaseCaptureIncomeService
             paidBounty = true;
         }
 
-        float rate = Mathf.Max(0f, AddonConfig.CapturedBaseIncomePerMinute.Value);
+        float rate = Mathf.Max(0f, GcreNetworkSync.EffectiveCapturedBaseIncomePerMinute);
         int bonusCount = CountCapturedBonusBases(newHq);
         if (!paidBounty && rate <= 0f)
         {
@@ -121,24 +121,27 @@ internal static class BaseCaptureIncomeService
         AddonLog.Info(
             $"[Economy] {factionName} captured {label}: bounty={(paidBounty ? $"+${bounty:0}m" : "$0m (cd)")}, ongoing=+${rate:0}m/min ({bonusCount} extra bases).");
 
-        if (!ReferenceEquals(newHq, GroundControlReflection.GetLocalHq()))
-        {
-            return;
-        }
-
         string upperLabel = label.ToUpperInvariant();
+        string toastText;
         if (paidBounty && rate > 0f)
         {
-            GroundControlReflection.NotifyAlert($"BASE CAPTURED: {upperLabel} (+${bounty:0}m | +${rate:0}m/min)");
+            toastText = $"BASE CAPTURED: {upperLabel} (+${bounty:0}m | +${rate:0}m/min)";
         }
         else if (paidBounty)
         {
-            GroundControlReflection.NotifyAlert($"BASE CAPTURED: {upperLabel} (+${bounty:0}m)");
+            toastText = $"BASE CAPTURED: {upperLabel} (+${bounty:0}m)";
         }
         else
         {
-            GroundControlReflection.NotifyAlert($"BASE CAPTURED: {upperLabel} (+${rate:0}m/min)");
+            toastText = $"BASE CAPTURED: {upperLabel} (+${rate:0}m/min)";
         }
+
+        if (ReferenceEquals(newHq, GroundControlReflection.GetLocalHq()))
+        {
+            GroundControlReflection.NotifyAlert(toastText);
+        }
+
+        GcreNetworkSync.BroadcastFactionToast(newHq, isAlert: true, toastText);
     }
 
     private static void PruneStaleCooldowns()
@@ -230,7 +233,7 @@ internal static class RefreshLedgerBaseBonusPatch
     {
         if (__instance == null
             || !AddonConfig.ModEnabled.Value
-            || !AddonConfig.EnableCapturedBaseIncome.Value
+            || !GcreNetworkSync.EffectiveEnableCapturedBaseIncome
             || GroundControlReflection.EcoNextLedgerAtField?.GetValue(__instance) is not float after
             || Mathf.Approximately(after, __state))
         {

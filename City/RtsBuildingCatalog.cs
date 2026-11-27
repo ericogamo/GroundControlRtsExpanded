@@ -284,9 +284,71 @@ internal static class RtsBuildingCatalog
             dstNet.LookupIndex = srcNet.LookupIndex;
         }
 
+        if (Encyclopedia.Lookup != null)
+        {
+            Encyclopedia.Lookup[clone.jsonKey] = clone;
+        }
+
         ClonedDefs[kind] = clone;
         AddonLog.Debug($"[City] Registered cloned BuildingDefinition '{spec.JsonKey}' from '{plain.jsonKey}'.");
         return clone;
+    }
+
+    internal static void EnsureLookupEntries()
+    {
+        for (int i = 0; i < Specs.Length; i++)
+        {
+            GetOrCreateDefinition(Specs[i].Kind);
+        }
+    }
+
+    internal static void SetCustomVisualVisible(Unit unit, RtsBuildingSpec spec, int level, bool visible)
+    {
+        if (unit == null)
+        {
+            return;
+        }
+
+        bool foundCustom = false;
+        for (int i = unit.transform.childCount - 1; i >= 0; i--)
+        {
+            Transform child = unit.transform.GetChild(i);
+            if (child != null && child.name.StartsWith(CustomVisualPrefix, StringComparison.Ordinal))
+            {
+                foundCustom = true;
+                if (child.gameObject.activeSelf != visible)
+                {
+                    child.gameObject.SetActive(visible);
+                }
+            }
+        }
+
+        if (visible)
+        {
+            if (!foundCustom)
+            {
+                ApplyCustomVisual(unit, spec, level, forceReplace: true);
+                return;
+            }
+
+            MeshRenderer[] renderers = unit.GetComponentsInChildren<MeshRenderer>(true);
+            for (int i = 0; i < renderers.Length; i++)
+            {
+                if (renderers[i] != null && !IsUnderCustomVisual(renderers[i].transform))
+                {
+                    renderers[i].enabled = false;
+                }
+            }
+
+            SkinnedMeshRenderer[] skinned = unit.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+            for (int i = 0; i < skinned.Length; i++)
+            {
+                if (skinned[i] != null && !IsUnderCustomVisual(skinned[i].transform))
+                {
+                    skinned[i].enabled = false;
+                }
+            }
+        }
     }
 
     internal static void ApplyCustomVisual(Unit unit, RtsBuildingSpec spec, int level = 1, bool forceReplace = false)
@@ -347,7 +409,7 @@ internal static class RtsBuildingCatalog
         }
 
         Vector3 centerGroundLocal = GroundControlReflection.SnapToTerrain(unit.GlobalPosition()).ToLocalPosition();
-        float centerDeltaY = Mathf.Clamp(centerGroundLocal.y - unit.transform.position.y, -18f, 4f) - 0.12f;
+        float centerDeltaY = Mathf.Clamp(centerGroundLocal.y - unit.transform.position.y, -18f, 4f) + 0.02f;
         visual.transform.localPosition = new Vector3(0f, centerDeltaY, 0f);
 
         Bounds normBounds = ModelRegistry.GetNormalizedBounds(spec.ModelSlotId, level);
@@ -395,12 +457,12 @@ internal static class RtsBuildingCatalog
 
         plinth.transform.SetParent(visual.transform, false);
         plinth.transform.localScale = new Vector3(
-            Mathf.Max(2f, normBounds.size.x * 0.96f) / scaleX,
+            Mathf.Max(2f, normBounds.size.x * 0.88f) / scaleX,
             plinthHeightWorld / scaleY,
-            Mathf.Max(2f, normBounds.size.z * 0.96f) / scaleZ);
+            Mathf.Max(2f, normBounds.size.z * 0.88f) / scaleZ);
         plinth.transform.localPosition = new Vector3(
             normBounds.center.x / scaleX,
-            -(plinthHeightWorld * 0.5f - 0.1f) / scaleY,
+            -(plinthHeightWorld * 0.5f + 0.02f) / scaleY,
             normBounds.center.z / scaleZ);
 
         if (plinth.TryGetComponent<MeshRenderer>(out MeshRenderer mr))
@@ -577,5 +639,46 @@ internal static class RtsBuildingCatalog
         }
 
         return false;
+    }
+}
+
+[HarmonyPatch(typeof(Encyclopedia), "AfterLoad")]
+internal static class RtsBuildingCatalogAfterLoadPatch
+{
+    private static void Postfix()
+    {
+        if (!AddonConfig.ModEnabled.Value)
+        {
+            return;
+        }
+
+        RtsBuildingCatalog.EnsureLookupEntries();
+        MdsBridgeBootstrap.EnsureMdsBuildCatalogLookupAction?.Invoke();
+    }
+}
+
+[HarmonyPatch(typeof(Building), nameof(Building.UnitDisabled), new[] { typeof(bool), typeof(bool) })]
+internal static class RtsBuildingUnitDisabledVisualPatch
+{
+    private static void Postfix(Building __instance, bool oldState, bool newState)
+    {
+        if (!AddonConfig.ModEnabled.Value || __instance == null)
+        {
+            return;
+        }
+
+        RtsBuildingRecord? rec = __instance.persistentID.IsValid
+            ? DynamicCapAndTechService.Instance.FindRecordByPersistentId(__instance.persistentID.Id)
+            : null;
+        if (rec == null && __instance.definition is BuildingDefinition bd && RtsBuildingCatalog.TryGetSpec(bd, out RtsBuildingSpec specByDef))
+        {
+            RtsBuildingCatalog.SetCustomVisualVisible(__instance, specByDef, level: 1, visible: !newState);
+            return;
+        }
+
+        if (rec != null)
+        {
+            RtsBuildingCatalog.SetCustomVisualVisible(__instance, rec.Spec, rec.Level, visible: !newState);
+        }
     }
 }

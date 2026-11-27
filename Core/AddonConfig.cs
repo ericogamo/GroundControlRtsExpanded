@@ -50,6 +50,9 @@ internal static class AddonConfig
     internal static ConfigEntry<float> AiRadarBlinkSeconds { get; private set; } = null!;
     internal static ConfigEntry<bool> EnableAiSmartBaseLayout { get; private set; } = null!;
     internal static ConfigEntry<bool> EnableAiCoastalOutpost { get; private set; } = null!;
+    internal static ConfigEntry<bool> EnableHangarSpawnSafety { get; private set; } = null!;
+    internal static ConfigEntry<float> HangarAiPlayerSafetySeconds { get; private set; } = null!;
+    internal static ConfigEntry<float> HangarSafetyClearanceMeters { get; private set; } = null!;
 
     // 04 Performance
     internal static ConfigEntry<bool> EnableAntiLag { get; private set; } = null!;
@@ -393,6 +396,28 @@ internal static class AddonConfig
             "EnableAiCoastalOutpost",
             true,
             "Plan and build a coastal forward outpost (Control Tower + Naval Dock) when an AI faction holds no bases with shoreline access.");
+
+        EnableHangarSpawnSafety = config.Bind(
+            "03 Tactical AI",
+            "EnableHangarSpawnSafety",
+            true,
+            "Lock hangar bays against player spawns while an AI aircraft is spawning or rolling out, and block spawns into physically occupied or wrecked bays.");
+
+        HangarAiPlayerSafetySeconds = config.Bind(
+            "03 Tactical AI",
+            "HangarAiPlayerSafetySeconds",
+            12f,
+            new ConfigDescription(
+                "Minimum seconds a hangar bay stays locked for player spawns after an AI aircraft spawns in it (automatically extended until the AI aircraft clears the bay).",
+                new AcceptableValueRange<float>(0f, 60f)));
+
+        HangarSafetyClearanceMeters = config.Bind(
+            "03 Tactical AI",
+            "HangarSafetyClearanceMeters",
+            48f,
+            new ConfigDescription(
+                "Minimum horizontal distance (m) a hangar's own spawned AI aircraft must clear before a player may spawn in that bay.",
+                new AcceptableValueRange<float>(20f, 120f)));
 
         // 04 Performance
         EnableAntiLag = config.Bind(

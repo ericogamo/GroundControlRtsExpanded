@@ -125,7 +125,7 @@ internal sealed class RtsCityUiService : IAddonTick, IAddonGui, IAddonResetSessi
 
         float btnAreaW = showCheats ? 378f : 298f;
         float textAreaW = Mathf.Max(140f, barW - btnAreaW - 24f);
-        string statusText = AddonConfig.EnableDynamicCaps.Value
+        string statusText = GcreNetworkSync.EffectiveEnableDynamicCaps
             ? $"TECH T{snap.TechTier}   |   GND {snap.GroundUsed}/{snap.GroundCap}   |   AIR {snap.AirUsed}/{snap.AirCap}   |   NAV {snap.NavalUsed}/{snap.NavalCap}"
             : $"TECH T{snap.TechTier}   |   DYNAMIC CAPS OFF";
         GUI.Label(new Rect(x, subBarRect.y + 4f, textAreaW, 20f), statusText, NativeThemeBridge.Caption);

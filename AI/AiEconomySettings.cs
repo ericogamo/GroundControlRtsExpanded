@@ -48,7 +48,7 @@ internal static class AiEconomySettings
 {
     internal static AiEconomyProfile GetActiveProfile()
     {
-        string preset = AddonConfig.EconomyPreset.Value ?? "Fair";
+        string preset = GcreNetworkSync.EffectiveEconomyPreset;
         if (string.Equals(preset, "Vanilla", StringComparison.OrdinalIgnoreCase))
         {
             return new AiEconomyProfile(
@@ -128,7 +128,7 @@ internal static class AiEconomySettings
 
         bool foundAny = false;
         FactionHQ? localHq = GroundControlReflection.GetLocalHq();
-        if (localHq != null && !GroundControlReflection.IsAiFaction(localHq, localHq))
+        if (localHq != null && !GroundControlReflection.IsSafeAiFaction(localHq, localHq))
         {
             foundAny = true;
             playerGross = GroundControlReflection.GetHqIncomePerMinute(ecoInstance, localHq);
@@ -138,7 +138,9 @@ internal static class AiEconomySettings
 
         foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
         {
-            if (hq == null || ReferenceEquals(hq, localHq) || GroundControlReflection.IsAiFaction(hq, localHq))
+            if (hq == null
+                || ReferenceEquals(hq, localHq)
+                || (GroundControlReflection.IsSafeAiFaction(hq, localHq) && !GroundControlReflection.HasHumanPlayers(hq)))
             {
                 continue;
             }

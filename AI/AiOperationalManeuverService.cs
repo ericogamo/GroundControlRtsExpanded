@@ -176,36 +176,39 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         object? enemyService = GroundControlReflection.GetEnemyInstance();
         object? captureService = GroundControlReflection.GetCaptureInstance();
         FactionHQ? localHq = GroundControlReflection.GetLocalHq();
-
-        foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
+        GroundControlReflection.NetworkRunAsHostTeam(() =>
         {
-            if (hq == null || !((NetworkBehaviour)hq).IsServer || !GroundControlReflection.IsAiFaction(hq, localHq))
+            foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
             {
-                continue;
-            }
+                if (hq == null || !((NetworkBehaviour)hq).IsServer || !GroundControlReflection.IsSafeAiFaction(hq, localHq))
+                {
+                    continue;
+                }
 
-            object? cmdState = GroundControlReflection.TryGetCommanderState(enemyService, hq);
+                FactionHQ? hostileHq = GroundControlReflection.FindPrimaryHostileHq(hq);
+                object? cmdState = GroundControlReflection.TryGetCommanderState(enemyService, hq);
 
-            if (AddonConfig.EnableAiUnitPreservation.Value)
-            {
-                TickUnitPreservation(hq, cmdState, captureService, now);
-            }
+                if (AddonConfig.EnableAiUnitPreservation.Value)
+                {
+                    TickUnitPreservation(hq, cmdState, captureService, now);
+                }
 
-            if (AddonConfig.EnableAiArtilleryShootAndScoot.Value && cmdState != null)
-            {
-                TickArtilleryShootAndScoot(hq, localHq, cmdState, now);
-            }
+                if (AddonConfig.EnableAiArtilleryShootAndScoot.Value && cmdState != null)
+                {
+                    TickArtilleryShootAndScoot(hq, hostileHq, cmdState, now);
+                }
 
-            if (AddonConfig.EnableAiRearQrf.Value)
-            {
-                TickRearQrf(hq, cmdState, captureService, now);
-            }
+                if (AddonConfig.EnableAiRearQrf.Value)
+                {
+                    TickRearQrf(hq, cmdState, captureService, now);
+                }
 
-            if (AddonConfig.EnableTacticalQualityAi.Value && cmdState != null)
-            {
-                TickDynamicReconPosts(hq, localHq, cmdState, now);
+                if (AddonConfig.EnableTacticalQualityAi.Value && cmdState != null)
+                {
+                    TickDynamicReconPosts(hq, hostileHq, cmdState, now);
+                }
             }
-        }
+        });
     }
 
     private static bool IsServerAuthorityActive()

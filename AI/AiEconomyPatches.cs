@@ -40,7 +40,7 @@ internal static class GetAiStipendPerMinutePatch
             return true;
         }
 
-        if (!GroundControlReflection.IsAiFaction(hq, localHq))
+        if (!GroundControlReflection.IsSafeAiFaction(hq, localHq))
         {
             __result = 0f;
             return false;
@@ -687,7 +687,7 @@ internal static class EnemyReviewAirFundGuardPatch
         if (profile.IsVanilla
             || hq == null
             || !((Mirage.NetworkBehaviour)hq).IsServer
-            || !GroundControlReflection.IsAiFaction(hq, localHq))
+            || !GroundControlReflection.IsSafeAiFaction(hq, localHq))
         {
             return;
         }
@@ -1483,7 +1483,7 @@ internal static class PayIncomeAdjustPatch
             }
 
             FactionHQ? hq = unit.NetworkHQ;
-            if (hq == null || !hq.IsServer || !GroundControlReflection.IsAiFaction(hq, localHq))
+            if (hq == null || !hq.IsServer || !GroundControlReflection.IsSafeAiFaction(hq, localHq))
             {
                 continue;
             }
@@ -1526,7 +1526,7 @@ internal static class PrepareDuelHeadStartPatch
     private static void Postfix(FactionHQ hq, float __state)
     {
         AiEconomyProfile profile = AiEconomySettings.GetActiveProfile();
-        if (profile.IsVanilla || hq == null)
+        if (profile.IsVanilla || hq == null || !((Mirage.NetworkBehaviour)hq).IsServer)
         {
             return;
         }
@@ -1561,63 +1561,69 @@ internal static class TryPickEnemyBuildSiteSafePatch
             return true;
         }
 
-        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
-        FactionHQ? enemyHq = ReferenceEquals(localHq, hq) ? null : localHq;
-        AiBattlefieldIntelService.Instance.GetAirbasesOrderedBySafety(hq, enemyHq, SafeBaseScratch);
-        if (SafeBaseScratch.Count == 0)
+        FactionHQ? enemyHq = GroundControlReflection.FindPrimaryHostileHq(hq);
+        try
         {
-            return true;
-        }
-
-        float innerSpacingSq = MinDispersalMeters * MinDispersalMeters;
-        float outerSpacingSq = 110f * 110f;
-        object? eco = GroundControlReflection.GetEcoInstance();
-        for (int ring = 0; ring < 2; ring++)
-        {
-            float minR = ring == 0 ? 220f : 450f;
-            float maxR = ring == 0 ? 450f : 900f;
-            float spacingSq = ring == 0 ? innerSpacingSq : outerSpacingSq;
-            int attempts = ring == 0 ? 10 : 8;
-
-            for (int b = 0; b < SafeBaseScratch.Count; b++)
+            AiBattlefieldIntelService.Instance.GetAirbasesOrderedBySafety(hq, enemyHq, SafeBaseScratch);
+            if (SafeBaseScratch.Count == 0)
             {
-                Airbase ab = SafeBaseScratch[b];
-                if (ab == null || ab.disabled || !GroundControlReflection.IsLandBase(ab))
-                {
-                    continue;
-                }
+                return true;
+            }
 
-                Transform anchorTf = ab.center != null ? ab.center : ab.transform;
-                GlobalPosition anchor = anchorTf.GlobalPosition();
-                for (int attempt = 0; attempt < attempts; attempt++)
+            float innerSpacingSq = MinDispersalMeters * MinDispersalMeters;
+            float outerSpacingSq = 110f * 110f;
+            object? eco = GroundControlReflection.GetEcoInstance();
+            for (int ring = 0; ring < 2; ring++)
+            {
+                float minR = ring == 0 ? 220f : 450f;
+                float maxR = ring == 0 ? 450f : 900f;
+                float spacingSq = ring == 0 ? innerSpacingSq : outerSpacingSq;
+                int attempts = ring == 0 ? 10 : 8;
+
+                for (int b = 0; b < SafeBaseScratch.Count; b++)
                 {
-                    float angle = Random.Range(0f, Mathf.PI * 2f);
-                    float radius = Random.Range(minR, maxR);
-                    var probe = new GlobalPosition(
-                        anchor.x + Mathf.Cos(angle) * radius,
-                        anchor.y,
-                        anchor.z + Mathf.Sin(angle) * radius);
-                    GlobalPosition candidate = GroundControlReflection.SnapToTerrain(probe);
-                    if (GroundControlReflection.IsBelowSeaLevel(candidate)
-                        || GroundControlReflection.BuildPreviewIsOnLevelRoad(candidate, 24f)
-                        || !GroundControlReflection.CanDriveBetween(anchor, candidate))
+                    Airbase ab = SafeBaseScratch[b];
+                    if (ab == null || ab.disabled || !GroundControlReflection.IsLandBase(ab))
                     {
                         continue;
                     }
 
-                    if (!HasMinOwnedBuildingSpacing(eco, hq, candidate, spacingSq))
+                    Transform anchorTf = ab.center != null ? ab.center : ab.transform;
+                    GlobalPosition anchor = anchorTf.GlobalPosition();
+                    for (int attempt = 0; attempt < attempts; attempt++)
                     {
-                        continue;
-                    }
+                        float angle = Random.Range(0f, Mathf.PI * 2f);
+                        float radius = Random.Range(minR, maxR);
+                        var probe = new GlobalPosition(
+                            anchor.x + Mathf.Cos(angle) * radius,
+                            anchor.y,
+                            anchor.z + Mathf.Sin(angle) * radius);
+                        GlobalPosition candidate = GroundControlReflection.SnapToTerrain(probe);
+                        if (GroundControlReflection.IsBelowSeaLevel(candidate)
+                            || GroundControlReflection.BuildPreviewIsOnLevelRoad(candidate, 24f)
+                            || !GroundControlReflection.CanDriveBetween(anchor, candidate))
+                        {
+                            continue;
+                        }
 
-                    site = candidate;
-                    __result = true;
-                    return false;
+                        if (!HasMinOwnedBuildingSpacing(eco, hq, candidate, spacingSq))
+                        {
+                            continue;
+                        }
+
+                        site = candidate;
+                        __result = true;
+                        return false;
+                    }
                 }
             }
-        }
 
-        return true;
+            return true;
+        }
+        finally
+        {
+            SafeBaseScratch.Clear();
+        }
     }
 
     private static bool HasMinOwnedBuildingSpacing(object? ecoInstance, FactionHQ hq, GlobalPosition candidate, float minSpacingSq)
@@ -1840,6 +1846,15 @@ internal static class SlingEndJobOutpostPatch
         if (job == null)
         {
             return;
+        }
+
+        if (GameManager.gameState != GameState.SinglePlayer)
+        {
+            NuclearOption.Networking.NetworkManagerNuclearOption? net = NuclearOption.Networking.NetworkManagerNuclearOption.i;
+            if (net == null || net.Server == null || !net.Server.Active)
+            {
+                return;
+            }
         }
 
         bool carrying = GroundControlReflection.SlingJobCarryingProp?.GetValue(job) is bool c && c;

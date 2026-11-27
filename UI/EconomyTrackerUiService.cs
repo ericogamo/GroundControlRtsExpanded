@@ -268,7 +268,7 @@ internal sealed class EconomyTrackerUiService : IAddonTick, IAddonGui, IAddonRes
         {
             FactionHQ hq = hqSortBuffer[i];
             bool isLocal = localHq != null && ReferenceEquals(hq, localHq);
-            bool isAi = GroundControlReflection.IsAiFaction(hq, localHq);
+            bool isAi = IsFactionDisplayAi(hq, localHq);
             bool canInspect = CanInspectFaction(hq, localHq);
 
             CashflowTracker? cf = null;
@@ -686,6 +686,16 @@ internal sealed class EconomyTrackerUiService : IAddonTick, IAddonGui, IAddonRes
         GUI.EndScrollView();
     }
 
+    private static bool IsFactionDisplayAi(FactionHQ hq, FactionHQ? localHq)
+    {
+        if (!GroundControlReflection.IsNetworkGuest())
+        {
+            return GroundControlReflection.IsSafeAiFaction(hq, localHq);
+        }
+
+        return hq != null && !ReferenceEquals(hq, localHq) && !GroundControlReflection.HasHumanPlayers(hq);
+    }
+
     private static bool CanInspectFaction(FactionHQ hq, FactionHQ? localHq)
     {
         if (ReferenceEquals(hq, localHq) || GameManager.gameState == GameState.SinglePlayer)
@@ -694,7 +704,7 @@ internal sealed class EconomyTrackerUiService : IAddonTick, IAddonGui, IAddonRes
         }
 
         return !GroundControlReflection.IsNetworkGuest()
-            && GroundControlReflection.IsAiFaction(hq, localHq);
+            && GroundControlReflection.IsSafeAiFaction(hq, localHq);
     }
 
     private static int GetFactionSortRank(FactionHQ hq, FactionHQ? localHq)
@@ -704,7 +714,7 @@ internal sealed class EconomyTrackerUiService : IAddonTick, IAddonGui, IAddonRes
             return 0;
         }
 
-        return GroundControlReflection.IsAiFaction(hq, localHq) ? 2 : 1;
+        return IsFactionDisplayAi(hq, localHq) ? 2 : 1;
     }
 
     private static string FormatPhaseShort(AiStrategicPhase phase) => phase switch

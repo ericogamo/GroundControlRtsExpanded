@@ -47,7 +47,7 @@ internal static class TurretIdleThrottlePatch
         ActiveConeMaxRangeSqr = 0f;
         ActiveConeHq = null;
 
-        if (!AddonConfig.EnableAntiLag.Value || !AddonConfig.IdleTurretThrottle.Value || __instance == null)
+        if (!AddonConfig.EnableAntiLag.Value || !AddonConfig.IdleTurretThrottle.Value || __instance == null || GroundControlReflection.IsNetworkGuest())
         {
             return true;
         }

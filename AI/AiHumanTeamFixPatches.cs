@@ -17,7 +17,7 @@ internal static class RepairHoldLeftBehindUnitsAiGuardPatch
         }
 
         FactionHQ? localHq = GroundControlReflection.GetLocalHq();
-        if (GroundControlReflection.IsAiFaction(hq, localHq))
+        if (!GroundControlReflection.HasHumanPlayers(hq) && GroundControlReflection.IsSafeAiFaction(hq, localHq))
         {
             GroundControlReflection.RemoveGuestFaction(__instance, hq);
             return false;
@@ -41,7 +41,7 @@ internal static class RepairSweepStandbyAiGuardPatch
         }
 
         FactionHQ? localHq = GroundControlReflection.GetLocalHq();
-        if (GroundControlReflection.IsAiFaction(hq, localHq))
+        if (!GroundControlReflection.HasHumanPlayers(hq) && GroundControlReflection.IsSafeAiFaction(hq, localHq))
         {
             human = false;
         }

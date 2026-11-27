@@ -702,6 +702,8 @@ internal static class ModelRegistry
                 tex = new Texture2D(2, 2, TextureFormat.RGBA32, mipChain: true)
                 {
                     name = $"{sub.Name}_tex",
+                    wrapMode = TextureWrapMode.Repeat,
+                    anisoLevel = 4,
                     hideFlags = HideFlags.DontUnloadUnusedAsset,
                 };
                 if (!tex.LoadImage(sub.Material.BaseColorTextureBytes, markNonReadable: true))

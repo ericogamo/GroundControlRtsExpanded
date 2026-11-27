@@ -95,74 +95,74 @@ internal sealed class ModelManifest
         manifest.Slots["command_hq"] = new ModelSlotEntry
         {
             File = "command_hq.glb",
-            TargetMaxDimensionMeters = 28f,
+            TargetMaxDimensionMeters = 0f,
             ScaleMultiplier = 1f,
             AutoGround = true,
-            TintHex = "#8C9484",
-            SmoothnessOverride = 0.25f,
+            TintHex = null,
+            SmoothnessOverride = null,
         };
         manifest.Slots["barracks"] = new ModelSlotEntry
         {
             File = "barracks.glb",
-            TargetMaxDimensionMeters = 24f,
+            TargetMaxDimensionMeters = 0f,
             ScaleMultiplier = 1f,
             AutoGround = true,
-            TintHex = "#8F937F",
-            SmoothnessOverride = 0.22f,
+            TintHex = null,
+            SmoothnessOverride = null,
         };
         manifest.Slots["pilot_academy"] = new ModelSlotEntry
         {
             File = "pilot_academy.glb",
-            TargetMaxDimensionMeters = 30f,
+            TargetMaxDimensionMeters = 0f,
             ScaleMultiplier = 1f,
             AutoGround = true,
-            TintHex = "#8C98A0",
-            SmoothnessOverride = 0.30f,
+            TintHex = null,
+            SmoothnessOverride = null,
         };
         manifest.Slots["logistics_camp"] = new ModelSlotEntry
         {
             File = "logistics_camp.glb",
-            TargetMaxDimensionMeters = 26f,
+            TargetMaxDimensionMeters = 0f,
             ScaleMultiplier = 1f,
             AutoGround = true,
-            TintHex = "#95927E",
-            SmoothnessOverride = 0.22f,
+            TintHex = null,
+            SmoothnessOverride = null,
         };
         manifest.Slots["naval_command"] = new ModelSlotEntry
         {
             File = "naval_command.glb",
-            TargetMaxDimensionMeters = 26f,
+            TargetMaxDimensionMeters = 0f,
             ScaleMultiplier = 1f,
             AutoGround = true,
-            TintHex = "#849099",
-            SmoothnessOverride = 0.28f,
+            TintHex = null,
+            SmoothnessOverride = null,
         };
         manifest.Slots["abm_radar"] = new ModelSlotEntry
         {
             File = "abm_radar.glb",
-            TargetMaxDimensionMeters = 22f,
+            TargetMaxDimensionMeters = 0f,
             ScaleMultiplier = 1f,
             AutoGround = true,
-            TintHex = "#929894",
-            SmoothnessOverride = 0.32f,
+            TintHex = null,
+            SmoothnessOverride = null,
         };
         manifest.Slots["abm_silo"] = new ModelSlotEntry
         {
             File = "abm_silo.glb",
-            TargetMaxDimensionMeters = 20f,
+            TargetMaxDimensionMeters = 0f,
             ScaleMultiplier = 1f,
             AutoGround = true,
-            TintHex = "#898E88",
-            SmoothnessOverride = 0.25f,
+            TintHex = null,
+            SmoothnessOverride = null,
         };
         manifest.Slots["abm_plant"] = new ModelSlotEntry
         {
             File = "abm_plant.glb",
-            TargetMaxDimensionMeters = 32f,
+            TargetMaxDimensionMeters = 0f,
             ScaleMultiplier = 1f,
             AutoGround = true,
-            TintHex = "#8E9187",
-            SmoothnessOverride = 0.24f,
+            TintHex = null,
+            SmoothnessOverride = null,
         };
         manifest.Slots["sam_kit"] = new ModelSlotEntry
         {

@@ -15,7 +15,18 @@ internal static class CustomPreviewService
 
     internal static void ResetSession()
     {
-        if (GroundControlReflection.UnitPreviewPartsField?.GetValue(null) is not IDictionary partsDict)
+        ClearCustomDictEntries(GroundControlReflection.UnitPreviewPartsField?.GetValue(null) as IDictionary);
+
+        object? previewObj = GroundControlReflection.EcoGetPreview(GroundControlReflection.GetEcoInstance());
+        if (previewObj != null)
+        {
+            ClearCustomDictEntries(GroundControlReflection.BuildPreviewPartsField?.GetValue(previewObj) as IDictionary);
+        }
+    }
+
+    private static void ClearCustomDictEntries(IDictionary? partsDict)
+    {
+        if (partsDict == null || partsDict.Count == 0)
         {
             return;
         }

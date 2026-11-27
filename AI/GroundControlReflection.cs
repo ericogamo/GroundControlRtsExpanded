@@ -123,12 +123,17 @@ internal static class GroundControlReflection
     internal static readonly MethodInfo? EcoRefreshLedgerMethod = AccessTools.Method(EconomyServiceType, "RefreshLedger", Type.EmptyTypes);
     internal static readonly FieldInfo? EcoLedgerGrossField = AccessTools.Field(EconomyServiceType, "ledgerGross");
     internal static readonly FieldInfo? EcoNextLedgerAtField = AccessTools.Field(EconomyServiceType, "nextLedgerAt");
+    internal static readonly MethodInfo? EcoRefreshCatalogMethod = AccessTools.Method(EconomyServiceType, "RefreshCatalog", Type.EmptyTypes);
+    internal static readonly FieldInfo? EcoCatalogListField = AccessTools.Field(EconomyServiceType, "catalog");
     internal static readonly MethodInfo? AirbaseCaptureFactionMethod = AccessTools.Method(typeof(Airbase), "CaptureFaction", new[] { typeof(FactionHQ) });
     internal static readonly PropertyInfo? NetworkIsGuestProp = AccessTools.Property(NetworkType, "IsGuest");
 
     // CommanderEnemyCommanderService members
     internal static readonly PropertyInfo? EnemyInstanceProp = AccessTools.Property(EnemyCommanderType, "Instance");
     internal static readonly MethodInfo? IsAiFactionMethod = AccessTools.Method(EnemyCommanderType, "IsAiFaction", new[] { typeof(FactionHQ), typeof(FactionHQ) });
+    internal static readonly MethodInfo? EnemyHasHumanPlayersMethod = AccessTools.Method(EnemyCommanderType, "HasHumanPlayers", new[] { typeof(FactionHQ) });
+    internal static readonly PropertyInfo? EnemyBothSidesProp = AccessTools.Property(EnemyCommanderType, "BothSides");
+    internal static readonly PropertyInfo? SettingsHumanTeamsProp = AccessTools.Property(SettingsType, "EnemyCommanderHumanTeams");
     internal static readonly MethodInfo? IsChallengingMethod = AccessTools.Method(EnemyCommanderType, "IsChallenging", new[] { typeof(FactionHQ) });
     internal static readonly PropertyInfo? IsChampionsMissionProp = AccessTools.Property(EnemyCommanderType, "IsChampionsMission");
     internal static readonly PropertyInfo? IsDuelMissionProp = AccessTools.Property(EnemyCommanderType, "IsDuelMission");
@@ -591,6 +596,10 @@ internal static class GroundControlReflection
         AccessTools.Property(CargoSlotOptionType, "SelectedMount");
     internal static readonly PropertyInfo? CargoSlotHardpointIndexProp =
         AccessTools.Property(CargoSlotOptionType, "HardpointIndex");
+    internal static readonly MethodInfo? CargoSlotSelectMethod =
+        AccessTools.Method(CargoSlotOptionType, "Select", new[] { typeof(int) });
+    internal static readonly FieldInfo? CargoSlotSelectedIndexField =
+        AccessTools.Field(CargoSlotOptionType, "selectedIndex");
     internal static readonly Type? PendingTargetSelectionType =
         AccessTools.TypeByName("GroundControlRts.CommanderSupplyHeliService+PendingTargetSelection");
     internal static readonly PropertyInfo? PendingTargetSelectionAircraftProp =
@@ -608,7 +617,11 @@ internal static class GroundControlReflection
     internal static readonly MethodInfo? SupplyStoreIsDumpMethod = AccessTools.Method(SupplyStoreServiceType, "IsDump", new[] { typeof(Unit) });
     internal static readonly MethodInfo? EcoPriceOfMethod = AccessTools.Method(EconomyServiceType, "PriceOf", new[] { typeof(UnitDefinition) });
     internal static readonly MethodInfo? GameAccessGetUnitAmmoMethod = AccessTools.Method(GameAccessType, "GetUnitAmmo", new[] { typeof(Unit) });
+    internal static readonly MethodInfo? GameAccessSendDestinationMethod = AccessTools.Method(GameAccessType, "SendDestination", new[] { typeof(Unit), typeof(GlobalPosition), typeof(bool) });
     internal static readonly MethodInfo? NetworkRunAsMethod = AccessTools.Method(NetworkType, "RunAs", new[] { typeof(FactionHQ), typeof(Action) });
+    internal static readonly MethodInfo? NetworkRunAsHostTeamMethod = AccessTools.Method(NetworkType, "RunAsHostTeam", new[] { typeof(Action) });
+    internal static readonly MethodInfo? SupplyHeliHostCargoRunMethod = AccessTools.Method(SupplyHeliServiceType, "HostCargoRun", new[] { typeof(FactionHQ), typeof(string[]) });
+    internal static readonly MethodInfo? SupplyHeliTryProcessQueuedMethod = AccessTools.Method(SupplyHeliServiceType, "TryProcessQueuedCargoSpawns", Type.EmptyTypes);
     internal static readonly PropertyInfo? SupplyHeliInstanceProp = AccessTools.Property(SupplyHeliServiceType, "Instance");
     internal static readonly FieldInfo? SupplyHeliAircraftOptionsField = AccessTools.Field(SupplyHeliServiceType, "aircraftOptions");
     internal static readonly FieldInfo? SupplyHeliAssignedMissionsField = AccessTools.Field(SupplyHeliServiceType, "assignedMissions");
@@ -1360,6 +1373,74 @@ internal static class GroundControlReflection
     internal static bool IsAiFaction(FactionHQ? hq, FactionHQ? localHq)
         => hq != null && IsAiFactionMethod?.Invoke(null, new object?[] { hq, localHq }) is bool b && b;
 
+    internal static bool HasHumanPlayers(FactionHQ? hq)
+    {
+        if (hq == null)
+        {
+            return false;
+        }
+
+        if (EnemyHasHumanPlayersMethod != null)
+        {
+            return EnemyHasHumanPlayersMethod.Invoke(null, new object?[] { hq }) is bool b && b;
+        }
+
+        return hq.GetPlayers(false).Count > 0;
+    }
+
+    internal static bool IsBothSidesMode()
+        => EnemyBothSidesProp?.GetValue(null) is bool b && b;
+
+    internal static bool IsHumanTeamAiEnabled()
+        => SettingsHumanTeamsProp?.GetValue(null) is bool b && b;
+
+    internal static bool IsSafeAiFaction(FactionHQ? hq, FactionHQ? localHq)
+    {
+        if (hq == null || !IsAiFaction(hq, localHq))
+        {
+            return false;
+        }
+
+        if (HasHumanPlayers(hq) && !IsHumanTeamAiEnabled() && !IsBothSidesMode())
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    internal static FactionHQ? FindPrimaryHostileHq(FactionHQ? ownHq)
+    {
+        if (ownHq == null)
+        {
+            return null;
+        }
+
+        FactionHQ? localHq = GetLocalHq();
+        if (localHq != null && !ReferenceEquals(localHq, ownHq) && localHq.faction != null)
+        {
+            return localHq;
+        }
+
+        FactionHQ? fallback = null;
+        foreach (FactionHQ cand in FactionRegistry.GetAllHQs())
+        {
+            if (cand == null || ReferenceEquals(cand, ownHq) || cand.faction == null)
+            {
+                continue;
+            }
+
+            if (HasHumanPlayers(cand))
+            {
+                return cand;
+            }
+
+            fallback ??= cand;
+        }
+
+        return fallback;
+    }
+
     internal static int CountMines(object? ecoInstance, FactionHQ hq)
         => ecoInstance != null && CountMinesMethod?.Invoke(ecoInstance, new object?[] { hq, null }) is int n ? n : 0;
 
@@ -1749,6 +1830,21 @@ internal static class GroundControlReflection
 
     internal static bool TrySetDestination(Unit? unit, GlobalPosition destination)
         => unit != null && TrySetDestinationMethod?.Invoke(null, new object?[] { unit, destination }) is bool ok && ok;
+
+    internal static bool TrySetAiDestination(Unit? unit, GlobalPosition destination)
+    {
+        if (unit == null)
+        {
+            return false;
+        }
+
+        if (GameAccessSendDestinationMethod != null)
+        {
+            return GameAccessSendDestinationMethod.Invoke(null, new object?[] { unit, destination, false }) is bool ok && ok;
+        }
+
+        return TrySetDestination(unit, destination);
+    }
 
     internal static float GetUnitCondition(Unit? unit)
         => unit != null && GetUnitConditionMethod?.Invoke(null, new object?[] { unit }) is float cond ? cond : 1f;
@@ -2479,6 +2575,23 @@ internal static class GroundControlReflection
         if (NetworkRunAsMethod != null)
         {
             NetworkRunAsMethod.Invoke(null, new object?[] { hq, action });
+        }
+    }
+
+    internal static void NetworkRunAsHostTeam(Action action)
+    {
+        if (action == null)
+        {
+            return;
+        }
+
+        if (NetworkRunAsHostTeamMethod != null)
+        {
+            NetworkRunAsHostTeamMethod.Invoke(null, new object?[] { action });
+        }
+        else
+        {
+            action();
         }
     }
 

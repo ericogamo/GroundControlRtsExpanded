@@ -384,9 +384,11 @@ internal static class DuelOppositeAirbaseStartPatch
         string localName = localHq.faction != null ? localHq.faction.factionName : "Player";
         string enemyName = enemyHq.faction != null ? enemyHq.faction.factionName : "AI";
 
+        string duelAlert = $"DUEL START: {playerLabel.ToUpperInvariant()} vs {enemyLabel.ToUpperInvariant()} ({distKm:0.0} km)";
         AddonLog.Info(
             $"[Maps] Duel opposite-side airbase start dealt: {localName}={playerLabel} vs {enemyName}={enemyLabel} ({distKm:0.0} km, cleared={clearedBldgs}, rebuilt={rebuiltBldgs}, movedVeh={movedVehs}).");
-        GroundControlReflection.NotifyAlert($"DUEL START: {playerLabel.ToUpperInvariant()} vs {enemyLabel.ToUpperInvariant()} ({distKm:0.0} km)");
+        GroundControlReflection.NotifyAlert(duelAlert);
+        GcreNetworkSync.BroadcastGlobalToast(isAlert: true, duelAlert);
     }
 
     private static void RelocateOldBaseAssets(
@@ -505,6 +507,9 @@ internal static class DuelOppositeAirbaseStartPatch
                 GlobalPosition snapped = GroundControlReflection.SnapToTerrain(targetProbe);
                 Vector3 localPos = snapped.ToLocalPosition() + Vector3.up * 0.5f;
 
+                veh.NetworknetworkStationary = false;
+                veh.NetworkstartPosition = snapped;
+                veh.NetworkstartRotation = veh.transform.rotation;
                 veh.transform.position = localPos;
                 if (veh.rb != null)
                 {

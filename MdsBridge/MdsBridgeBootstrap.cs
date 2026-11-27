@@ -61,6 +61,10 @@ internal static class MdsBridgeBootstrap
     internal static Func<VehicleDefinition?, FactionHQ?, bool?>? TryCanPurchaseMdsVehicle { get; set; }
     internal static Func<VehicleDefinition?, bool>? IsMdsMobileVehicleDefinition { get; set; }
     internal static Func<VehicleDefinition?, int?>? GetMdsVehicleRequiredDepotLevel { get; set; }
+    internal static Action? EnsureMdsBuildCatalogLookupAction { get; set; }
+    internal static Func<System.Collections.Generic.IReadOnlyList<BuildingDefinition>>? GetAllMdsBuildCatalogDefinitions { get; set; }
+    internal static Func<string>? BuildReservedCapsSyncString { get; set; }
+    internal static Action<string>? ApplyClientReservedCapsAction { get; set; }
 
     internal static bool IsMdsPluginPresent()
     {
@@ -170,6 +174,10 @@ internal static class MdsBridgeBootstrap
         TryCanPurchaseMdsVehicle = null;
         IsMdsMobileVehicleDefinition = null;
         GetMdsVehicleRequiredDepotLevel = null;
+        EnsureMdsBuildCatalogLookupAction = null;
+        GetAllMdsBuildCatalogDefinitions = null;
+        BuildReservedCapsSyncString = null;
+        ApplyClientReservedCapsAction = null;
     }
 
 #if HAS_MDS_FRAMEWORK

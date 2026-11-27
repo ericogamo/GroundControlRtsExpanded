@@ -103,14 +103,17 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
         PruneStaleArmSweeps(now);
 
         FactionHQ? localHq = GroundControlReflection.GetLocalHq();
-        foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
+        GroundControlReflection.NetworkRunAsHostTeam(() =>
         {
-            if (hq != null && ((NetworkBehaviour)hq).IsServer && GroundControlReflection.IsAiFaction(hq, localHq))
+            foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
             {
-                RefreshFactionRadarEntries(hq);
-                ProcessFactionEmcon(hq, now);
+                if (hq != null && ((NetworkBehaviour)hq).IsServer && GroundControlReflection.IsSafeAiFaction(hq, localHq))
+                {
+                    RefreshFactionRadarEntries(hq);
+                    ProcessFactionEmcon(hq, now);
+                }
             }
-        }
+        });
     }
 
     internal void OnArmSeekerTrack(Missile? missile, Radar? targetedRadar)
@@ -137,7 +140,7 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
                 && !(directOwner is Ship)
                 && directOwner.NetworkHQ != null
                 && !ReferenceEquals(directOwner.NetworkHQ, missile.NetworkHQ)
-                && GroundControlReflection.IsAiFaction(directOwner.NetworkHQ, localHq)
+                && GroundControlReflection.IsSafeAiFaction(directOwner.NetworkHQ, localHq)
                 && !IsMdsSite(directOwner))
             {
                 RadarUnitEntry? directEntry = GetOrRegisterEntry(directOwner);
@@ -216,7 +219,7 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
         {
             if (hq == null
                 || !((NetworkBehaviour)hq).IsServer
-                || !GroundControlReflection.IsAiFaction(hq, localHq)
+                || !GroundControlReflection.IsSafeAiFaction(hq, localHq)
                 || hq.trackingDatabase == null)
             {
                 continue;
@@ -757,7 +760,7 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
             }
 
             anyOperational = true;
-            bool wantEnabled = (active || r.IsJammed()) && !GameManager.IsHeadless;
+            bool wantEnabled = r.IsJammed() || (active && !GameManager.IsHeadless);
             if (r.activated != active || r.enabled != wantEnabled)
             {
                 r.activated = active;
@@ -783,6 +786,11 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
         else if (anyChanged)
         {
             entry.CurrentlyActive = false;
+        }
+
+        if (anyChanged && entry.Unit != null && entry.Unit.persistentID.IsValid)
+        {
+            GcreNetworkSync.BroadcastRadarEmcon(entry.Unit.persistentID.Id, active);
         }
     }
 
