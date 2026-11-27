@@ -6,7 +6,7 @@
       "scaleMultiplier": 1.0,
       "rotationEuler": [0.0, 0.0, 0.0],
       "positionOffset": [0.0, 0.0, 0.0],
-      "autoGround": true,
+      "autoGround": false,
       "tintHex": null,
       "smoothnessOverride": null
     },
@@ -16,7 +16,7 @@
       "scaleMultiplier": 1.0,
       "rotationEuler": [0.0, 0.0, 0.0],
       "positionOffset": [0.0, 0.0, 0.0],
-      "autoGround": true,
+      "autoGround": false,
       "tintHex": null,
       "smoothnessOverride": null
     },
@@ -26,7 +26,7 @@
       "scaleMultiplier": 1.0,
       "rotationEuler": [0.0, 0.0, 0.0],
       "positionOffset": [0.0, 0.0, 0.0],
-      "autoGround": true,
+      "autoGround": false,
       "tintHex": null,
       "smoothnessOverride": null
     },
@@ -36,7 +36,7 @@
       "scaleMultiplier": 1.0,
       "rotationEuler": [0.0, 0.0, 0.0],
       "positionOffset": [0.0, 0.0, 0.0],
-      "autoGround": true,
+      "autoGround": false,
       "tintHex": null,
       "smoothnessOverride": null
     },
@@ -46,7 +46,7 @@
       "scaleMultiplier": 1.0,
       "rotationEuler": [0.0, 0.0, 0.0],
       "positionOffset": [0.0, 0.0, 0.0],
-      "autoGround": true,
+      "autoGround": false,
       "tintHex": null,
       "smoothnessOverride": null
     },
@@ -56,7 +56,7 @@
       "scaleMultiplier": 1.0,
       "rotationEuler": [0.0, 0.0, 0.0],
       "positionOffset": [0.0, 0.0, 0.0],
-      "autoGround": true,
+      "autoGround": false,
       "tintHex": null,
       "smoothnessOverride": null
     },
@@ -66,7 +66,7 @@
       "scaleMultiplier": 1.0,
       "rotationEuler": [0.0, 0.0, 0.0],
       "positionOffset": [0.0, 0.0, 0.0],
-      "autoGround": true,
+      "autoGround": false,
       "tintHex": null,
       "smoothnessOverride": null
     },
@@ -76,7 +76,7 @@
       "scaleMultiplier": 1.0,
       "rotationEuler": [0.0, 0.0, 0.0],
       "positionOffset": [0.0, 0.0, 0.0],
-      "autoGround": true,
+      "autoGround": false,
       "tintHex": null,
       "smoothnessOverride": null
     },

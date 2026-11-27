@@ -97,7 +97,7 @@ internal sealed class ModelManifest
             File = "command_hq.glb",
             TargetMaxDimensionMeters = 0f,
             ScaleMultiplier = 1f,
-            AutoGround = true,
+            AutoGround = false,
             TintHex = null,
             SmoothnessOverride = null,
         };
@@ -106,7 +106,7 @@ internal sealed class ModelManifest
             File = "barracks.glb",
             TargetMaxDimensionMeters = 0f,
             ScaleMultiplier = 1f,
-            AutoGround = true,
+            AutoGround = false,
             TintHex = null,
             SmoothnessOverride = null,
         };
@@ -115,7 +115,7 @@ internal sealed class ModelManifest
             File = "pilot_academy.glb",
             TargetMaxDimensionMeters = 0f,
             ScaleMultiplier = 1f,
-            AutoGround = true,
+            AutoGround = false,
             TintHex = null,
             SmoothnessOverride = null,
         };
@@ -124,7 +124,7 @@ internal sealed class ModelManifest
             File = "logistics_camp.glb",
             TargetMaxDimensionMeters = 0f,
             ScaleMultiplier = 1f,
-            AutoGround = true,
+            AutoGround = false,
             TintHex = null,
             SmoothnessOverride = null,
         };
@@ -133,7 +133,7 @@ internal sealed class ModelManifest
             File = "naval_command.glb",
             TargetMaxDimensionMeters = 0f,
             ScaleMultiplier = 1f,
-            AutoGround = true,
+            AutoGround = false,
             TintHex = null,
             SmoothnessOverride = null,
         };
@@ -142,7 +142,7 @@ internal sealed class ModelManifest
             File = "abm_radar.glb",
             TargetMaxDimensionMeters = 0f,
             ScaleMultiplier = 1f,
-            AutoGround = true,
+            AutoGround = false,
             TintHex = null,
             SmoothnessOverride = null,
         };
@@ -151,7 +151,7 @@ internal sealed class ModelManifest
             File = "abm_silo.glb",
             TargetMaxDimensionMeters = 0f,
             ScaleMultiplier = 1f,
-            AutoGround = true,
+            AutoGround = false,
             TintHex = null,
             SmoothnessOverride = null,
         };
@@ -160,7 +160,7 @@ internal sealed class ModelManifest
             File = "abm_plant.glb",
             TargetMaxDimensionMeters = 0f,
             ScaleMultiplier = 1f,
-            AutoGround = true,
+            AutoGround = false,
             TintHex = null,
             SmoothnessOverride = null,
         };

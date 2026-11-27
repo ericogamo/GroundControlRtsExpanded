@@ -409,34 +409,46 @@ internal static class RtsBuildingCatalog
         }
 
         Vector3 centerGroundLocal = GroundControlReflection.SnapToTerrain(unit.GlobalPosition()).ToLocalPosition();
-        float centerDeltaY = Mathf.Clamp(centerGroundLocal.y - unit.transform.position.y, -18f, 4f) + 0.02f;
-        visual.transform.localPosition = new Vector3(0f, centerDeltaY, 0f);
-
         Bounds normBounds = ModelRegistry.GetNormalizedBounds(spec.ModelSlotId, level);
         float halfX = Mathf.Max(2f, normBounds.extents.x * 0.85f);
         float halfZ = Mathf.Max(2f, normBounds.extents.z * 0.85f);
         Quaternion rot = unit.transform.rotation;
 
-        float minCornerGround = centerGroundLocal.y;
-        for (int sx = -1; sx <= 1; sx += 2)
+        float minGround = centerGroundLocal.y;
+        float maxGround = centerGroundLocal.y;
+        for (int sx = -1; sx <= 1; sx++)
         {
-            for (int sz = -1; sz <= 1; sz += 2)
+            for (int sz = -1; sz <= 1; sz++)
             {
+                if (sx == 0 && sz == 0)
+                {
+                    continue;
+                }
+
                 Vector3 cornerLocalOffset = rot * new Vector3(
                     normBounds.center.x + sx * halfX,
                     0f,
                     normBounds.center.z + sz * halfZ);
                 GlobalPosition cornerGlobal = (unit.transform.position + cornerLocalOffset).ToGlobalPosition();
-                float cornerGroundY = GroundControlReflection.SnapToTerrain(cornerGlobal).ToLocalPosition().y;
-                if (cornerGroundY < minCornerGround)
+                float sampleGroundY = GroundControlReflection.SnapToTerrain(cornerGlobal).ToLocalPosition().y;
+                if (sampleGroundY < minGround)
                 {
-                    minCornerGround = cornerGroundY;
+                    minGround = sampleGroundY;
+                }
+
+                if (sampleGroundY > maxGround)
+                {
+                    maxGround = sampleGroundY;
                 }
             }
         }
 
-        float slopeDrop = Mathf.Clamp(centerGroundLocal.y - minCornerGround, 0f, 8f);
-        if (slopeDrop <= 0.15f)
+        float targetYardY = Mathf.Min(maxGround, centerGroundLocal.y + 6.5f) + 0.08f;
+        float centerDeltaY = Mathf.Clamp(targetYardY - unit.transform.position.y, -18f, 10f);
+        visual.transform.localPosition = new Vector3(0f, centerDeltaY, 0f);
+
+        float slopeDrop = targetYardY - minGround;
+        if (slopeDrop <= 9.5f)
         {
             return;
         }
@@ -444,7 +456,7 @@ internal static class RtsBuildingCatalog
         float scaleX = Mathf.Max(0.1f, visual.transform.localScale.x);
         float scaleY = Mathf.Max(0.1f, visual.transform.localScale.y);
         float scaleZ = Mathf.Max(0.1f, visual.transform.localScale.z);
-        float plinthHeightWorld = slopeDrop + 0.6f;
+        float plinthHeightWorld = Mathf.Clamp(slopeDrop - 8.5f, 1f, 16f);
 
         GameObject plinth = GameObject.CreatePrimitive(PrimitiveType.Cube);
         plinth.name = "GCE_FoundationPlinth";
@@ -462,7 +474,7 @@ internal static class RtsBuildingCatalog
             Mathf.Max(2f, normBounds.size.z * 0.88f) / scaleZ);
         plinth.transform.localPosition = new Vector3(
             normBounds.center.x / scaleX,
-            -(plinthHeightWorld * 0.5f + 0.02f) / scaleY,
+            -(9.6f + (plinthHeightWorld * 0.5f)) / scaleY,
             normBounds.center.z / scaleZ);
 
         if (plinth.TryGetComponent<MeshRenderer>(out MeshRenderer mr))
