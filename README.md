@@ -12,7 +12,7 @@ RTS gameplay, AI commander, air-defence station, supply logistics, ABM, road & p
 Install `GroundControlRtsExpanded` directly inside NOMM (auto-updates via NOMNOM).
 
 ### Manual Release ZIP
-1. Download `GroundControlRtsExpanded-v0.1.3.zip` from [Releases](https://github.com/ericogamo/GroundControlRtsExpanded/releases/latest).
+1. Download `GroundControlRtsExpanded-v0.1.4.zip` from [Releases](https://github.com/ericogamo/GroundControlRtsExpanded/releases/latest).
 2. Extract directly into `Nuclear Option\BepInEx\plugins\GroundControlRtsExpanded\` (containing `GroundControlRtsExpanded.dll` and `Models/`).
 
 ### From Git Clone
