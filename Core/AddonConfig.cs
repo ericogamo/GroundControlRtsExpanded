@@ -652,18 +652,18 @@ internal static class AddonConfig
             "08 Singleplayer Cheats",
             "EnableSingleplayerCheats",
             true,
-            "Enable Singleplayer-only sandbox & testing cheats (strictly disabled in Multiplayer).");
+            "Enable Singleplayer sandbox & testing cheats (also used by HostTestCheatSteamId in a self-hosted Multiplayer test lobby).");
 
         CheatMenuKey = config.Bind(
             "08 Singleplayer Cheats",
             "CheatMenuKey",
             new KeyboardShortcut(KeyCode.F10, KeyCode.LeftShift),
-            "Open or close the Singleplayer Cheat menu.");
+            "Open or close the Singleplayer / Host Test Cheat menu.");
 
         HostTestCheatSteamId = config.Bind(
             "08 Singleplayer Cheats",
             "HostTestCheatSteamId",
             string.Empty,
-            "Optional Steam64 ID allowed to use the Host-only test cheat menu in a self-hosted Multiplayer test lobby (leave empty for Singleplayer-only).");
+            "Optional Steam64 ID allowed to use the Host-only test cheat menu in a self-hosted Multiplayer test lobby (leave empty for Singleplayer-only). Host cheats apply only to the host's faction.");
     }
 }

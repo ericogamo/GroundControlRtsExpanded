@@ -1,7 +1,9 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Reflection.Emit;
+using System.Runtime.CompilerServices;
 using HarmonyLib;
 using UnityEngine;
 
@@ -274,8 +276,33 @@ internal static class EconomyBeginStructureBuildGatePatch
 [HarmonyPatch]
 internal static class EconomyCommitBuildGatePatch
 {
+    private static readonly PropertyInfo? NetworkIsHandlingGuestProp =
+        GroundControlReflection.NetworkType != null
+            ? AccessTools.Property(GroundControlReflection.NetworkType, "IsHandlingGuest")
+            : null;
+
+    private static readonly MethodInfo? EcoStatusTextSetter =
+        GroundControlReflection.EconomyServiceType != null
+            ? AccessTools.Property(GroundControlReflection.EconomyServiceType, "StatusText")?.GetSetMethod(true)
+            : null;
+
     private static bool Prepare() => GroundControlReflection.EconomyCommitBuildMethod != null;
     private static MethodBase TargetMethod() => GroundControlReflection.EconomyCommitBuildMethod!;
+
+    private static bool IsHandlingGuest()
+        => NetworkIsHandlingGuestProp?.GetValue(null) is bool b && b;
+
+    private static void SetStatusText(object? ecoInstance, string reason)
+    {
+        if (ecoInstance != null && EcoStatusTextSetter != null)
+        {
+            EcoStatusTextSetter.Invoke(ecoInstance, new object?[] { reason ?? string.Empty });
+        }
+        else
+        {
+            GroundControlReflection.SetEconomyStatusText(reason);
+        }
+    }
 
     private static bool Prefix(object __instance, FactionHQ? hq, BuildingDefinition? structure, ref bool __result)
     {
@@ -286,9 +313,9 @@ internal static class EconomyCommitBuildGatePatch
 
         if (StructureBuildGateHelpers.TryGetBlockReason(structure, hq, out string reason))
         {
-            if (ReferenceEquals(hq, GroundControlReflection.GetLocalHq()))
+            SetStatusText(__instance, reason);
+            if (!IsHandlingGuest() && ReferenceEquals(hq, GroundControlReflection.GetLocalHq()))
             {
-                GroundControlReflection.SetEconomyStatusText(reason);
                 GroundControlReflection.NoticeFail(reason);
                 GroundControlReflection.InvokeEconomyCancelBuild(__instance);
             }
@@ -391,38 +418,234 @@ internal static class SupplyHeliRefreshOptionsAirdropPatch
     }
 }
 
+internal static class SupplyHeliCargoMountFilterHelper
+{
+    private static readonly ConditionalWeakTable<HardpointSet, List<WeaponMount>> UnfilteredBySet = new();
+    private static readonly FieldInfo? SupplyHeliAircraftOptionsField =
+        GroundControlReflection.SupplyHeliServiceType != null
+            ? AccessTools.Field(GroundControlReflection.SupplyHeliServiceType, "aircraftOptions")
+            : null;
+    private static readonly PropertyInfo? CargoSlotMountsProp =
+        GroundControlReflection.CargoSlotOptionType != null
+            ? AccessTools.Property(GroundControlReflection.CargoSlotOptionType, "Mounts")
+            : null;
+    private static readonly Type? SupplyHeliUiType =
+        AccessTools.TypeByName("GroundControlRts.CommanderSupplyHeliUi");
+    private static readonly FieldInfo? SupplyHeliUiServiceField =
+        SupplyHeliUiType != null ? AccessTools.Field(SupplyHeliUiType, "service") : null;
+
+    private static FactionHQ? lastSyncedHq;
+    private static bool lastIgnoreFactionLock;
+    private static int lastFilterPresent;
+
+    internal static void RegisterUnfiltered(HardpointSet? set, List<WeaponMount>? mounts)
+    {
+        if (set == null || mounts == null)
+        {
+            return;
+        }
+
+        if (!UnfilteredBySet.TryGetValue(set, out List<WeaponMount> copy))
+        {
+            copy = new List<WeaponMount>(mounts.Count);
+            UnfilteredBySet.Add(set, copy);
+        }
+        else
+        {
+            copy.Clear();
+        }
+
+        for (int i = 0; i < mounts.Count; i++)
+        {
+            if (mounts[i] != null)
+            {
+                copy.Add(mounts[i]);
+            }
+        }
+    }
+
+    internal static void SyncForUi(object? supplyUi)
+    {
+        if (supplyUi == null || SupplyHeliUiServiceField == null)
+        {
+            return;
+        }
+
+        object? service = SupplyHeliUiServiceField.GetValue(supplyUi);
+        SyncForService(service, GroundControlReflection.GetLocalHq(), force: false);
+    }
+
+    internal static void SyncForService(object? supplyService, FactionHQ? targetHq, bool force)
+    {
+        if (supplyService == null || SupplyHeliAircraftOptionsField == null)
+        {
+            return;
+        }
+
+        Func<WeaponMount, FactionHQ?, bool>? filter = MdsBridgeBootstrap.IsMdsAirdropMountAllowedForHq;
+        bool ignoreLock = SingleplayerCheatService.IsIgnoreFactionLockActive;
+        int filterFlag = filter != null ? 1 : 0;
+
+        if (!force
+            && ReferenceEquals(targetHq, lastSyncedHq)
+            && ignoreLock == lastIgnoreFactionLock
+            && filterFlag == lastFilterPresent)
+        {
+            return;
+        }
+
+        if (SupplyHeliAircraftOptionsField.GetValue(supplyService) is not IList options || options.Count == 0)
+        {
+            return;
+        }
+
+        lastSyncedHq = targetHq;
+        lastIgnoreFactionLock = ignoreLock;
+        lastFilterPresent = filterFlag;
+
+        for (int a = 0; a < options.Count; a++)
+        {
+            object? option = options[a];
+            if (option == null
+                || GroundControlReflection.CargoAircraftCargoSlotsProp?.GetValue(option) is not IList slots
+                || GroundControlReflection.CargoAircraftHardpointSetsProp?.GetValue(option) is not HardpointSet[] sets)
+            {
+                continue;
+            }
+
+            for (int s = 0; s < slots.Count; s++)
+            {
+                object? slot = slots[s];
+                if (slot == null
+                    || GroundControlReflection.CargoSlotHardpointIndexProp?.GetValue(slot) is not int hpIdx
+                    || hpIdx < 0
+                    || hpIdx >= sets.Length)
+                {
+                    continue;
+                }
+
+                HardpointSet? hpSet = sets[hpIdx];
+                if (hpSet == null
+                    || !UnfilteredBySet.TryGetValue(hpSet, out List<WeaponMount> master)
+                    || CargoSlotMountsProp?.GetValue(slot) is not List<WeaponMount> activeMounts)
+                {
+                    continue;
+                }
+
+                WeaponMount? prevSelected = GroundControlReflection.CargoSlotSelectedMountProp?.GetValue(slot) as WeaponMount;
+                activeMounts.Clear();
+                int newSelectedIndex = -1;
+
+                for (int m = 0; m < master.Count; m++)
+                {
+                    WeaponMount? mount = master[m];
+                    if (mount == null)
+                    {
+                        continue;
+                    }
+
+                    if (filter != null && targetHq != null && !filter(mount, targetHq))
+                    {
+                        continue;
+                    }
+
+                    if (ReferenceEquals(mount, prevSelected))
+                    {
+                        newSelectedIndex = activeMounts.Count;
+                    }
+
+                    activeMounts.Add(mount);
+                }
+
+                GroundControlReflection.CargoSlotSelectedIndexField?.SetValue(slot, newSelectedIndex);
+            }
+        }
+    }
+
+    internal static void InvalidateSyncState()
+    {
+        lastSyncedHq = null;
+        lastFilterPresent = -1;
+    }
+
+    internal static Type? UiType => SupplyHeliUiType;
+}
+
 [HarmonyPatch]
 internal static class SupplyHeliGetCargoMountsFilterPatch
 {
     private static bool Prepare() => GroundControlReflection.SupplyHeliGetCargoMountsMethod != null;
     private static MethodBase TargetMethod() => GroundControlReflection.SupplyHeliGetCargoMountsMethod!;
 
-    private static void Postfix(List<WeaponMount> __result)
+    private static void Postfix(HardpointSet? set, List<WeaponMount>? __result)
     {
-        if (!AddonConfig.ModEnabled.Value || __result == null || __result.Count == 0)
+        if (__result == null || __result.Count == 0)
         {
             return;
         }
 
-        Func<WeaponMount, FactionHQ?, bool>? filter = MdsBridgeBootstrap.IsMdsAirdropMountAllowedForHq;
-        if (filter == null)
-        {
-            return;
-        }
+        SupplyHeliCargoMountFilterHelper.RegisterUnfiltered(set, __result);
+        SupplyHeliCargoMountFilterHelper.InvalidateSyncState();
+    }
+}
 
-        FactionHQ? targetHq = SupplyHeliHostCargoRunGatePatch.ActiveGuestCargoHq ?? GroundControlReflection.GetLocalHq();
-        if (targetHq == null)
-        {
-            return;
-        }
+[HarmonyPatch]
+internal static class SupplyHeliUiDrawWindowFilterPatch
+{
+    private static readonly MethodInfo? DrawWindowMethod =
+        SupplyHeliCargoMountFilterHelper.UiType != null
+            ? AccessTools.Method(SupplyHeliCargoMountFilterHelper.UiType, "DrawWindow", new[] { typeof(int) })
+            : null;
 
-        for (int i = __result.Count - 1; i >= 0; i--)
+    private static bool Prepare() => DrawWindowMethod != null;
+    private static MethodBase TargetMethod() => DrawWindowMethod!;
+
+    private static void Prefix(object __instance)
+    {
+        if (AddonConfig.ModEnabled.Value)
         {
-            WeaponMount? mount = __result[i];
-            if (mount != null && !filter(mount, targetHq))
-            {
-                __result.RemoveAt(i);
-            }
+            SupplyHeliCargoMountFilterHelper.SyncForUi(__instance);
+        }
+    }
+}
+
+[HarmonyPatch]
+internal static class SupplyHeliUiShowForFilterPatch
+{
+    private static readonly MethodInfo? ShowForMethod =
+        SupplyHeliCargoMountFilterHelper.UiType != null
+            ? AccessTools.Method(SupplyHeliCargoMountFilterHelper.UiType, "ShowFor", new[] { typeof(AircraftDefinition) })
+            : null;
+
+    private static bool Prepare() => ShowForMethod != null;
+    private static MethodBase TargetMethod() => ShowForMethod!;
+
+    private static void Postfix(object __instance)
+    {
+        if (AddonConfig.ModEnabled.Value)
+        {
+            SupplyHeliCargoMountFilterHelper.InvalidateSyncState();
+            SupplyHeliCargoMountFilterHelper.SyncForUi(__instance);
+        }
+    }
+}
+
+[HarmonyPatch]
+internal static class SupplyHeliCycleSlotFilterPatch
+{
+    private static readonly MethodInfo? CycleCargoSlotMethod =
+        GroundControlReflection.SupplyHeliServiceType != null
+            ? AccessTools.Method(GroundControlReflection.SupplyHeliServiceType, "CycleCargoSlot", new[] { typeof(int) })
+            : null;
+
+    private static bool Prepare() => CycleCargoSlotMethod != null;
+    private static MethodBase TargetMethod() => CycleCargoSlotMethod!;
+
+    private static void Prefix(object __instance)
+    {
+        if (AddonConfig.ModEnabled.Value)
+        {
+            SupplyHeliCargoMountFilterHelper.SyncForService(__instance, GroundControlReflection.GetLocalHq(), force: false);
         }
     }
 }
@@ -527,23 +750,164 @@ internal static class SupplyHeliExcludeMdsFromAmmoCargoPatch
 internal static class SupplyHeliCargoGateHelpers
 {
     private static readonly List<WeaponMount> MountScratch = new();
+    private static readonly PropertyInfo? CargoAircraftDefinitionProp =
+        GroundControlReflection.CargoAircraftOptionType != null
+            ? AccessTools.Property(GroundControlReflection.CargoAircraftOptionType, "Definition")
+            : null;
+    private static readonly FieldInfo? QueuedCargoSpawnsField =
+        GroundControlReflection.SupplyHeliServiceType != null
+            ? AccessTools.Field(GroundControlReflection.SupplyHeliServiceType, "queuedCargoSpawns")
+            : null;
+    private static readonly PropertyInfo? QueuedSpawnHqProp =
+        GroundControlReflection.SupplyHeliQueuedSpawnType != null
+            ? AccessTools.Property(GroundControlReflection.SupplyHeliQueuedSpawnType, "Hq")
+            : null;
 
-    internal static void ClearScratch() => MountScratch.Clear();
+    internal static void ClearScratch()
+    {
+        MountScratch.Clear();
+        SupplyHeliCargoMountFilterHelper.InvalidateSyncState();
+    }
 
     internal static bool TryGetBlockedSelectedReason(object? supplyService, out string reason)
-        => TryGetBlockedReason(supplyService, GroundControlReflection.CollectSupplyHeliSelectedMounts, out reason);
+    {
+        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
+        object? selectedOpt = supplyService != null ? GroundControlReflection.SupplyHeliSelectedAircraftProp?.GetValue(supplyService) : null;
+        AircraftDefinition? aircraftDef = selectedOpt != null ? CargoAircraftDefinitionProp?.GetValue(selectedOpt) as AircraftDefinition : null;
+
+        if (TryGetAircraftCapOrTechBlockReason(supplyService, localHq, aircraftDef, includeQueuedCount: true, tellPlayer: false, out reason))
+        {
+            return true;
+        }
+
+        return TryGetBlockedLoadoutReason(supplyService, localHq, GroundControlReflection.CollectSupplyHeliSelectedMounts, out reason);
+    }
 
     internal static bool TryGetBlockedPendingReason(object? supplyService, out string reason)
-        => TryGetBlockedReason(supplyService, GroundControlReflection.CollectSupplyHeliPendingLoadoutMounts, out reason);
+    {
+        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
+        object? pending = supplyService != null ? GroundControlReflection.SupplyHeliPendingTargetSelectionField?.GetValue(supplyService) : null;
+        object? pendingOpt = pending != null ? GroundControlReflection.PendingTargetSelectionAircraftProp?.GetValue(pending) : null;
+        AircraftDefinition? aircraftDef = pendingOpt != null ? CargoAircraftDefinitionProp?.GetValue(pendingOpt) as AircraftDefinition : null;
 
-    private static bool TryGetBlockedReason(
+        if (TryGetAircraftCapOrTechBlockReason(supplyService, localHq, aircraftDef, includeQueuedCount: true, tellPlayer: false, out reason))
+        {
+            return true;
+        }
+
+        return TryGetBlockedLoadoutReason(supplyService, localHq, GroundControlReflection.CollectSupplyHeliPendingLoadoutMounts, out reason);
+    }
+
+    internal static bool TryGetAircraftCapOrTechBlockReason(
         object? supplyService,
+        FactionHQ? hq,
+        AircraftDefinition? aircraftDef,
+        bool includeQueuedCount,
+        bool tellPlayer,
+        out string reason)
+    {
+        reason = string.Empty;
+        if (!DynamicCapAndTechService.IsActive || hq == null || aircraftDef == null || SingleplayerCheatService.IsIgnoreCapsActiveFor(hq))
+        {
+            return false;
+        }
+
+        if (DynamicCapAndTechService.Instance.TryGetSpawnBlockReason(hq, aircraftDef, tellPlayer, out reason))
+        {
+            return true;
+        }
+
+        if (includeQueuedCount)
+        {
+            int queued = CountQueuedCargoSpawnsForHq(supplyService, hq);
+            if (queued > 0)
+            {
+                FactionCapSnapshot snap = DynamicCapAndTechService.Instance.GetFreshSnapshot(hq);
+                if (snap.AirUsed + queued >= snap.AirCap)
+                {
+                    reason = $"AIR CAP REACHED: {snap.AirUsed}+{queued}/{snap.AirCap} — Build Pilot Academy (Shift+C)";
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    internal static AircraftDefinition? FindAircraftDefinitionByJsonKey(string? jsonKey)
+    {
+        if (string.IsNullOrEmpty(jsonKey))
+        {
+            return null;
+        }
+
+        if (Encyclopedia.Lookup != null
+            && Encyclopedia.Lookup.TryGetValue(jsonKey!, out UnitDefinition found)
+            && found is AircraftDefinition adef)
+        {
+            return adef;
+        }
+
+        List<AircraftDefinition>? aircraft = Encyclopedia.i?.aircraft;
+        if (aircraft != null)
+        {
+            for (int i = 0; i < aircraft.Count; i++)
+            {
+                AircraftDefinition? a = aircraft[i];
+                if (a != null && string.Equals(a.jsonKey, jsonKey, StringComparison.Ordinal))
+                {
+                    return a;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    internal static AircraftDefinition? GetQueuedSpawnAircraftDefinition(object? queuedSpawn)
+    {
+        if (queuedSpawn == null)
+        {
+            return null;
+        }
+
+        PropertyInfo? aircraftProp = queuedSpawn.GetType().GetProperty("Aircraft", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        object? cargoOpt = aircraftProp?.GetValue(queuedSpawn);
+        return cargoOpt != null ? CargoAircraftDefinitionProp?.GetValue(cargoOpt) as AircraftDefinition : null;
+    }
+
+    private static int CountQueuedCargoSpawnsForHq(object? supplyService, FactionHQ hq)
+    {
+        if (supplyService == null || QueuedCargoSpawnsField == null || QueuedSpawnHqProp == null)
+        {
+            return 0;
+        }
+
+        if (QueuedCargoSpawnsField.GetValue(supplyService) is not IEnumerable queued)
+        {
+            return 0;
+        }
+
+        int count = 0;
+        foreach (object? item in queued)
+        {
+            if (item != null && ReferenceEquals(QueuedSpawnHqProp.GetValue(item), hq))
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private static bool TryGetBlockedLoadoutReason(
+        object? supplyService,
+        FactionHQ? targetHq,
         Action<object?, List<WeaponMount>> collector,
         out string reason)
     {
         reason = string.Empty;
-        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
-        if (localHq == null || MdsBridgeBootstrap.GetMdsAirdropLoadoutBlockReason == null)
+        if (targetHq == null || MdsBridgeBootstrap.GetMdsAirdropLoadoutBlockReason == null)
         {
             return false;
         }
@@ -554,7 +918,7 @@ internal static class SupplyHeliCargoGateHelpers
             return false;
         }
 
-        string? block = MdsBridgeBootstrap.GetMdsAirdropLoadoutBlockReason(MountScratch, localHq);
+        string? block = MdsBridgeBootstrap.GetMdsAirdropLoadoutBlockReason(MountScratch, targetHq);
         if (string.IsNullOrEmpty(block))
         {
             return false;
@@ -574,12 +938,34 @@ internal static class SupplyHeliHostCargoRunGatePatch
     private static bool Prepare() => GroundControlReflection.SupplyHeliHostCargoRunMethod != null;
     private static MethodBase TargetMethod() => GroundControlReflection.SupplyHeliHostCargoRunMethod!;
 
-    private static bool Prefix(FactionHQ? hq, string[]? args, out FactionHQ? __state)
+    private static bool Prefix(object __instance, FactionHQ? hq, string[]? args, out FactionHQ? __state)
     {
         __state = ActiveGuestCargoHq;
         ActiveGuestCargoHq = hq;
 
-        if (!AddonConfig.ModEnabled.Value || hq == null || args == null || args.Length <= 3 || MdsBridgeBootstrap.GetMdsAirdropLoadoutBlockReason == null)
+        if (!AddonConfig.ModEnabled.Value || hq == null || args == null)
+        {
+            return true;
+        }
+
+        if (args.Length > 1)
+        {
+            AircraftDefinition? aircraftDef = SupplyHeliCargoGateHelpers.FindAircraftDefinitionByJsonKey(args[1]);
+            if (SupplyHeliCargoGateHelpers.TryGetAircraftCapOrTechBlockReason(
+                    __instance,
+                    hq,
+                    aircraftDef,
+                    includeQueuedCount: true,
+                    tellPlayer: false,
+                    out string capReason))
+            {
+                GroundControlReflection.NoticeFail(capReason);
+                ActiveGuestCargoHq = __state;
+                return false;
+            }
+        }
+
+        if (args.Length <= 3 || MdsBridgeBootstrap.GetMdsAirdropLoadoutBlockReason == null)
         {
             return true;
         }
@@ -630,6 +1016,49 @@ internal static class SupplyHeliHostCargoRunGatePatch
     {
         ActiveGuestCargoHq = __state;
         return __exception;
+    }
+}
+
+[HarmonyPatch]
+internal static class SupplyHeliTrySpawnAtAirbaseCapGatePatch
+{
+    private static readonly MethodInfo? TrySpawnCargoRunAtAirbaseMethod =
+        GroundControlReflection.SupplyHeliServiceType != null && GroundControlReflection.SupplyHeliQueuedSpawnType != null
+            ? AccessTools.Method(
+                GroundControlReflection.SupplyHeliServiceType,
+                "TrySpawnCargoRunAtAirbase",
+                new[] { GroundControlReflection.SupplyHeliQueuedSpawnType, typeof(Airbase), typeof(FactionHQ) })
+            : null;
+
+    private static bool Prepare() => TrySpawnCargoRunAtAirbaseMethod != null;
+    private static MethodBase TargetMethod() => TrySpawnCargoRunAtAirbaseMethod!;
+
+    private static bool Prefix(object __instance, object? request, FactionHQ? hq)
+    {
+        if (!AddonConfig.ModEnabled.Value || hq == null || request == null)
+        {
+            return true;
+        }
+
+        AircraftDefinition? aircraftDef = SupplyHeliCargoGateHelpers.GetQueuedSpawnAircraftDefinition(request);
+        if (SupplyHeliCargoGateHelpers.TryGetAircraftCapOrTechBlockReason(
+                __instance,
+                hq,
+                aircraftDef,
+                includeQueuedCount: false,
+                tellPlayer: false,
+                out string reason))
+        {
+            GroundControlReflection.InvokeSupplyHeliSetStatus(__instance, reason);
+            if (ReferenceEquals(hq, GroundControlReflection.GetLocalHq()))
+            {
+                GroundControlReflection.NoticeFail(reason);
+            }
+
+            return false;
+        }
+
+        return true;
     }
 }
 
@@ -709,7 +1138,7 @@ internal static class MoveSetSelectionStanceMdsPatch
         for (int i = 0; i < selected.Count; i++)
         {
             Unit? u = selected[i];
-            if ((u is Building || u is Container || u is GroundVehicle) && !u.disabled && ReferenceEquals(u.NetworkHQ, localHq))
+            if (u != null && (u is Building || u is Container || u is GroundVehicle) && !u.disabled && ReferenceEquals(u.NetworkHQ, localHq))
             {
                 var status = MdsBridgeBootstrap.QueryMdsSiteUiStatus(u);
                 if (status.IsMdsSite)
@@ -823,9 +1252,13 @@ internal static class MoveCycleSelectionStanceMdsPatch
 
         Unit? focused = GroundControlReflection.GetFocusedSelection();
         bool currentHold = GroundControlReflection.IsUnitHoldingFire(focused);
-        if (!currentHold && focused != null && MdsBridgeBootstrap.QueryMdsSiteUiStatus != null)
+        if (focused != null && MdsBridgeBootstrap.QueryMdsSiteUiStatus != null)
         {
-            currentHold = MdsBridgeBootstrap.QueryMdsSiteUiStatus(focused).IsHoldFire;
+            var status = MdsBridgeBootstrap.QueryMdsSiteUiStatus(focused);
+            if (status.IsMdsSite)
+            {
+                currentHold = status.IsHoldFire;
+            }
         }
 
         GroundControlReflection.InvokeMoveSetSelectionStance(__instance, !currentHold);
@@ -1053,7 +1486,10 @@ internal static class EconomyGetDefencePriceMdsPatch
         float? mdsPrice = MdsBridgeBootstrap.GetMdsDefencePrice(unit);
         if (mdsPrice.HasValue && mdsPrice.Value > 0f)
         {
-            __result = mdsPrice.Value;
+            // Airdropped/slung Container MDS sites cannot be repaired by Engineers (Container is not IRepairable),
+            // so charge 50% upkeep compared to permanent repairable Building sites.
+            float effectivePrice = unit is Container ? mdsPrice.Value * 0.5f : mdsPrice.Value;
+            __result = Mathf.Max(0.05f, effectivePrice);
         }
     }
 }

@@ -38,6 +38,7 @@ internal sealed class AiStrategicDirectorService : IAddonResetSession
     private sealed class FactionDirectorState
     {
         internal float PeakGrossIncome;
+        internal int PeakGroundCombat;
         internal AiStrategicPhase? LastLoggedPhase;
         internal float LastTelemetryAt = -120f;
         internal PlayerThreatSnapshot ThreatSnapshot;
@@ -76,8 +77,8 @@ internal sealed class AiStrategicDirectorService : IAddonResetSession
         }
 
         FactionDirectorState state = GetOrCreateState(hq);
-        float enemyGross = ecoInstance != null ? GroundControlReflection.GetHqIncomePerMinute(ecoInstance, hq) : 0f;
-        float enemyNet = GroundControlReflection.GetEnemyNetIncomePerMinute(hq);
+        AiEconomyProfile profile = AiEconomySettings.GetActiveProfile();
+        AiEconomySettings.GetEffectiveAiIncome(ecoInstance, hq, profile, out float enemyGross, out float enemyNet);
         int goldMines = ecoInstance != null ? GroundControlReflection.CountGoldMines(ecoInstance, hq) : 0;
         int bestDepot = GroundControlReflection.GetBestDepotLevel(hq);
         int techTier = DynamicCapAndTechService.IsActive ? DynamicCapAndTechService.Instance.GetSnapshot(hq).TechTier : 1;
@@ -88,23 +89,51 @@ internal sealed class AiStrategicDirectorService : IAddonResetSession
         }
 
         int groundCombat = CountLiveGroundCombat(hq);
-        if ((state.PeakGrossIncome >= 250f && enemyGross < state.PeakGrossIncome * 0.45f)
-            || (bestDepot >= 1 && groundCombat < 4 && hq.factionFunds < 600f && (goldMines >= 1 || bestDepot >= 2)))
+        if (groundCombat > state.PeakGroundCombat)
+        {
+            state.PeakGroundCombat = groundCombat;
+        }
+
+        if ((state.PeakGrossIncome >= 300f && enemyGross < state.PeakGrossIncome * 0.45f)
+            || ((state.PeakGroundCombat >= 4 || state.PeakGrossIncome >= 300f)
+                && goldMines >= 1
+                && groundCombat < 4
+                && hq.factionFunds < 500f))
         {
             return AiStrategicPhase.EmergencyReconstruction;
         }
 
-        if ((goldMines == 0 && bestDepot < 2) || enemyGross < 150f)
+        if (goldMines == 0 || enemyGross < 300f)
         {
             return AiStrategicPhase.OpeningEconomy;
         }
 
-        if (bestDepot >= 3 && techTier >= 2 && enemyNet >= 400f)
+        if (goldMines >= 2 && bestDepot >= 3 && techTier >= 2 && enemyNet >= 500f)
         {
             return AiStrategicPhase.FullSpectrum;
         }
 
         return AiStrategicPhase.MidExpansion;
+    }
+
+    internal bool IsInEcoCatchUp(object? ecoInstance, FactionHQ? hq, out float playerGross)
+    {
+        playerGross = 0f;
+        if (hq == null || ecoInstance == null)
+        {
+            return false;
+        }
+
+        int goldMines = GroundControlReflection.CountGoldMines(ecoInstance, hq);
+        float enemyGross = AiEconomySettings.GetEffectiveAiGrossIncome(ecoInstance, hq, AiEconomySettings.GetActiveProfile());
+        if (AiEconomySettings.TryGetPlayerReferenceEconomy(ecoInstance, out playerGross, out _, out _)
+            && playerGross > 0f
+            && enemyGross < playerGross * 0.90f)
+        {
+            return true;
+        }
+
+        return goldMines == 0 || enemyGross < 450f;
     }
 
     internal PlayerThreatSnapshot ReadPlayerThreat(FactionHQ? aiHq)
@@ -183,7 +212,7 @@ internal sealed class AiStrategicDirectorService : IAddonResetSession
                         samRadars++;
                     }
                 }
-                else if (unit is Building && age <= 120f)
+                else if (unit is Building)
                 {
                     if (unit.HasRadarEmission()
                         || (unit.definition is BuildingDefinition bdef && bdef.buildingType == BuildingType.RDR))
@@ -217,14 +246,30 @@ internal sealed class AiStrategicDirectorService : IAddonResetSession
         int mdsComp = hq != null && MdsBridgeBootstrap.GetHostileMdsCompensation != null
             ? Mathf.Clamp(MdsBridgeBootstrap.GetHostileMdsCompensation(hq), 0, 6)
             : 0;
-        if (bestDepot < 2)
+        object? eco = GroundControlReflection.GetEcoInstance();
+        int goldMines = eco != null && hq != null ? GroundControlReflection.CountGoldMines(eco, hq) : 0;
+        float enemyGross = eco != null && hq != null
+            ? AiEconomySettings.GetEffectiveAiGrossIncome(eco, hq, AiEconomySettings.GetActiveProfile())
+            : 0f;
+        PlayerThreatSnapshot threat = ReadPlayerThreat(hq);
+
+        if (goldMines == 0 || enemyGross < 350f)
         {
-            return Mathf.Clamp(2 + safeBases / 2 + Mathf.Min(2, mdsComp), 2, 7);
+            return Mathf.Clamp(2 + Mathf.Min(2, threat.Aircraft), 2, 4);
         }
 
-        PlayerThreatSnapshot threat = ReadPlayerThreat(hq);
+        if (bestDepot < 2)
+        {
+            return Mathf.Clamp(2 + safeBases / 2 + Mathf.Min(2, mdsComp), 2, 6);
+        }
+
         if (bestDepot == 2)
         {
+            if (threat.Aircraft == 0)
+            {
+                return Mathf.Clamp(3 + safeBases + mdsComp, 3, 10);
+            }
+
             return Mathf.Clamp(3 + 2 * safeBases + Mathf.Min(4, threat.Aircraft / 2) + mdsComp, 5, 22);
         }
 
@@ -233,8 +278,37 @@ internal sealed class AiStrategicDirectorService : IAddonResetSession
 
     internal bool ShouldSuppressOpeningDepotSpam(object? ecoInstance, FactionHQ? hq)
         => hq != null
-            && GroundControlReflection.CountGoldMines(ecoInstance, hq) == 0
-            && GroundControlReflection.GetBestDepotLevel(hq) < 2;
+            && (GroundControlReflection.CountGoldMines(ecoInstance, hq) == 0
+                || AiEconomySettings.GetEffectiveAiGrossIncome(ecoInstance, hq, AiEconomySettings.GetActiveProfile()) < 450f);
+
+    internal bool CanReserveCommandHqLevel2(object? ecoInstance, FactionHQ hq)
+    {
+        AiStrategicPhase phase = EvaluatePhase(ecoInstance, hq);
+        if (phase == AiStrategicPhase.OpeningEconomy || phase == AiStrategicPhase.EmergencyReconstruction)
+        {
+            return false;
+        }
+
+        int goldMines = ecoInstance != null ? GroundControlReflection.CountGoldMines(ecoInstance, hq) : 0;
+        float enemyGross = ecoInstance != null
+            ? AiEconomySettings.GetEffectiveAiGrossIncome(ecoInstance, hq, AiEconomySettings.GetActiveProfile())
+            : 0f;
+        if (goldMines == 0 || enemyGross < 300f)
+        {
+            return false;
+        }
+
+        FactionCapSnapshot snap = DynamicCapAndTechService.Instance.GetSnapshot(hq);
+        if (snap.BarracksCount == 0 && hq.factionFunds < 300f)
+        {
+            return false;
+        }
+
+        object? enemyInstance = GroundControlReflection.GetEnemyInstance();
+        object? cmdState = GroundControlReflection.TryGetCommanderState(enemyInstance, hq);
+        float mineFund = GroundControlReflection.GetStateFloat(cmdState, GroundControlReflection.StateMineFundProp);
+        return mineFund < 250f;
+    }
 
     internal bool CanSpendOnCityBuilding(
         object? ecoInstance,
@@ -246,25 +320,22 @@ internal sealed class AiStrategicDirectorService : IAddonResetSession
     {
         AiStrategicPhase phase = EvaluatePhase(ecoInstance, hq);
         int goldMines = ecoInstance != null ? GroundControlReflection.CountGoldMines(ecoInstance, hq) : 0;
-        int bestDepot = GroundControlReflection.GetBestDepotLevel(hq);
-        float enemyGross = ecoInstance != null ? GroundControlReflection.GetHqIncomePerMinute(ecoInstance, hq) : 0f;
+        float enemyGross = ecoInstance != null
+            ? AiEconomySettings.GetEffectiveAiGrossIncome(ecoInstance, hq, AiEconomySettings.GetActiveProfile())
+            : 0f;
         FactionCapSnapshot snap = DynamicCapAndTechService.Instance.GetSnapshot(hq);
+        float buildReserve = GroundControlReflection.GetEnemyBuildReserve(hq, out bool resGoldMine, out bool resIncome);
 
-        if (phase == AiStrategicPhase.OpeningEconomy || (goldMines == 0 && bestDepot < 2))
+        if (phase == AiStrategicPhase.OpeningEconomy || goldMines == 0 || enemyGross < 300f)
         {
-            int totalMines = ecoInstance != null ? GroundControlReflection.CountMines(ecoInstance, hq) : 0;
-            if (kind == RtsBuildingKind.CommandHq
-                && !isUpgrade
-                && snap.CommandHqCount == 0
-                && ((enemyGross >= 75f && totalMines >= 2) || enemyGross >= 100f))
+            if (kind == RtsBuildingKind.Barracks && !isUpgrade && snap.BarracksCount == 0 && isUrgentCapRelief)
             {
-                return hq.factionFunds >= cost + 60f;
-            }
+                if (resGoldMine && hq.factionFunds >= 350f)
+                {
+                    return false;
+                }
 
-            if ((kind == RtsBuildingKind.Barracks && !isUpgrade && snap.BarracksCount == 0 && isUrgentCapRelief)
-                || (kind == RtsBuildingKind.PilotAcademy && !isUpgrade && snap.PilotAcademyCount == 0 && isUrgentCapRelief))
-            {
-                return hq.factionFunds >= cost + 60f;
+                return hq.factionFunds >= cost + 80f;
             }
 
             return false;
@@ -285,24 +356,16 @@ internal sealed class AiStrategicDirectorService : IAddonResetSession
             }
         }
 
-        float buildReserve = GroundControlReflection.GetEnemyBuildReserve(hq, out bool resGoldMine, out bool resIncome);
         object? enemyInstance = GroundControlReflection.GetEnemyInstance();
         object? cmdState = GroundControlReflection.TryGetCommanderState(enemyInstance, hq);
         float mineFund = GroundControlReflection.GetStateFloat(cmdState, GroundControlReflection.StateMineFundProp);
-        float protectedReserve = Mathf.Max(buildReserve, mineFund);
+        float protectedReserve = (kind == RtsBuildingKind.CommandHq && !resGoldMine && !resIncome)
+            ? mineFund
+            : Mathf.Max(buildReserve, mineFund);
 
-        bool isCoreCommandHq = kind == RtsBuildingKind.CommandHq
-            && ((!isUpgrade && snap.CommandHqCount == 0) || (isUpgrade && snap.CommandHqLevel == 1));
-        if (isCoreCommandHq && (!resGoldMine || enemyGross >= 150f))
+        if (resGoldMine || resIncome || protectedReserve >= 250f)
         {
-            if (hq.factionFunds < cost + protectedReserve * 0.15f)
-            {
-                return false;
-            }
-        }
-        else if (resGoldMine || resIncome || protectedReserve >= 250f)
-        {
-            float reserveShare = isUrgentCapRelief ? 0.15f : 0.90f;
+            float reserveShare = (isUrgentCapRelief && kind == RtsBuildingKind.Barracks) ? 0.50f : 1.0f;
             if (hq.factionFunds < cost + protectedReserve * reserveShare)
             {
                 return false;
@@ -331,9 +394,9 @@ internal sealed class AiStrategicDirectorService : IAddonResetSession
         state.LastLoggedPhase = phase;
         state.LastTelemetryAt = now;
 
-        float enemyGross = ecoInstance != null ? GroundControlReflection.GetHqIncomePerMinute(ecoInstance, hq) : 0f;
-        float enemyNet = GroundControlReflection.GetEnemyNetIncomePerMinute(hq);
-        float floor = AiEconomySettings.GetActiveProfile().NetIncomeTarget;
+        AiEconomyProfile profile = AiEconomySettings.GetActiveProfile();
+        AiEconomySettings.GetEffectiveAiIncome(ecoInstance, hq, profile, out float enemyGross, out float enemyNet);
+        float floor = profile.NetIncomeTarget;
         float playerGross = ecoInstance != null ? AiEconomySettings.GetPlayerReferenceIncomePerMinute(ecoInstance) : 0f;
         int goldMines = ecoInstance != null ? GroundControlReflection.CountGoldMines(ecoInstance, hq) : 0;
         int totalMines = ecoInstance != null ? GroundControlReflection.CountMines(ecoInstance, hq) : 0;
@@ -344,18 +407,25 @@ internal sealed class AiStrategicDirectorService : IAddonResetSession
         object? enemyInstance = GroundControlReflection.GetEnemyInstance();
         object? cmdState = GroundControlReflection.TryGetCommanderState(enemyInstance, hq);
         float airFund = GroundControlReflection.GetStateFloat(cmdState, GroundControlReflection.StateAirFundProp);
+        float samFund = GroundControlReflection.GetStateFloat(cmdState, GroundControlReflection.StateSamFundProp);
         float reserve = GroundControlReflection.GetEnemyBuildReserve(hq, out _, out _);
         PlayerThreatSnapshot threat = ReadPlayerThreat(hq);
+        string airCapText = string.Empty;
+        if (DynamicCapAndTechService.IsActive)
+        {
+            FactionCapSnapshot capSnap = DynamicCapAndTechService.Instance.GetSnapshot(hq);
+            airCapText = $" | Air={capSnap.AirUsed}/{capSnap.AirCap}";
+        }
 
         AddonLog.Info(
             $"[AI Director] {hq.faction?.name ?? "AI"} | Phase={phase} | Funds={hq.factionFunds:0} Cr | " +
             $"Income={enemyGross:0} gross / {enemyNet:0} net (Floor={floor:0}, Player={playerGross:0}) | " +
-            $"Mines={goldMines}G/{totalMines}T | Depot=L{bestDepot} | Dock=L{dockLvl} | Fac={fac} | " +
-            $"AirFund={airFund:0} | Reserve={reserve:0} | " +
+            $"Mines={goldMines}G/{totalMines}T | Depot=L{bestDepot} | Dock=L{dockLvl} | Fac={fac}{airCapText} | " +
+            $"AirFund={airFund:0} | SamFund={samFund:0} | Reserve={reserve:0} | " +
             $"Threat(Air={threat.Aircraft},Arm={threat.HeavyArmor},Ship={threat.Ships},Rad={threat.SamRadars})");
     }
 
-    private static int CountLiveGroundCombat(FactionHQ hq)
+    internal static int CountLiveGroundCombat(FactionHQ hq)
     {
         if (hq.factionUnits == null)
         {

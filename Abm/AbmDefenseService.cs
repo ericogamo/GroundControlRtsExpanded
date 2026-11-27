@@ -25,6 +25,8 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         internal bool PaidForCurrent { get; set; }
         internal float ProductionElapsed { get; set; }
         internal bool SeededInitialSilo { get; set; }
+        internal int FreeSeededStock { get; set; }
+        internal float ExcessGraceUntil { get; set; }
     }
 
     private sealed class TrackedBallisticThreat
@@ -46,6 +48,7 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         internal Missile TargetThreat { get; set; } = null!;
         internal FactionHQ DefenderHq { get; set; } = null!;
         internal float SpawnedAt { get; set; }
+        internal float NextTrackingUpdateAt { get; set; }
     }
 
     private const int WindowId = 148121;
@@ -62,6 +65,8 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
     private const float InterceptRadiusMeters = 95f;
     private const float MinDisarmAglMeters = 250f;
     private const float MaxInterceptorLifetimeSeconds = 120f;
+    private const float TrackingRefreshIntervalSeconds = 0.45f;
+    private const float SiloLossExcessGraceSeconds = 60f;
 
     private static readonly FieldInfo? MissileWarheadField = AccessTools.Field(typeof(Missile), "warhead");
     private static readonly FieldInfo? MissileBlastYieldField = AccessTools.Field(typeof(Missile), "blastYield");
@@ -75,6 +80,7 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
     private readonly HashSet<Missile> ownInterceptorSet = new();
     private readonly Dictionary<Unit, float> siloCooldownUntil = new();
     private readonly List<RtsBuildingRecord> abmBuildingsScratch = new();
+    private readonly List<RtsBuildingRecord> abmSensorScratch = new();
     private readonly List<RtsBuildingRecord> ownedUiBuffer = new();
     private readonly Dictionary<string, float> alertCooldowns = new(StringComparer.Ordinal);
 
@@ -163,6 +169,7 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         ownInterceptorSet.Clear();
         siloCooldownUntil.Clear();
         abmBuildingsScratch.Clear();
+        abmSensorScratch.Clear();
         ownedUiBuffer.Clear();
         alertCooldowns.Clear();
         clientInFlightByHq.Clear();
@@ -191,7 +198,12 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
             ToggleWindow();
         }
 
-        float now = Time.unscaledTime;
+        if (Time.timeScale <= 0f)
+        {
+            return;
+        }
+
+        float now = Time.time;
         PruneThreats(now);
         TickActiveInterceptors(now);
 
@@ -199,7 +211,7 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         {
             float elapsed = nextProductionAt > 0f ? Mathf.Min(1.0f, now - nextProductionAt + ProductionTickInterval) : ProductionTickInterval;
             nextProductionAt = now + ProductionTickInterval;
-            UpdateAllFactionStockpiles(elapsed);
+            UpdateAllFactionStockpiles(elapsed, now);
         }
 
         if (now >= nextLaunchScanAt)
@@ -231,6 +243,7 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
 
     internal bool TryReserveInterceptor(FactionHQ? hq, string missileId)
     {
+        _ = missileId;
         if (hq == null || !((NetworkBehaviour)hq).IsServer)
         {
             return false;
@@ -243,7 +256,50 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         }
 
         state.Stockpile--;
+        if (state.FreeSeededStock > 0)
+        {
+            state.FreeSeededStock = Math.Min(state.FreeSeededStock - 1, state.Stockpile);
+        }
+
         return true;
+    }
+
+    internal void RefundInterceptor(FactionHQ? hq)
+    {
+        if (hq == null || !((NetworkBehaviour)hq).IsServer)
+        {
+            return;
+        }
+
+        FactionAbmState state = GetOrCreateState(hq);
+        if (state.Stockpile < state.MaxCapacity)
+        {
+            state.Stockpile++;
+        }
+    }
+
+    internal int CountActiveInterceptorsForThreatId(PersistentID threatId)
+    {
+        if (threatId.NotValid)
+        {
+            return 0;
+        }
+
+        int count = 0;
+        for (int i = 0; i < activeInterceptors.Count; i++)
+        {
+            TrackedInterceptor tr = activeInterceptors[i];
+            if (tr.Interceptor != null
+                && !tr.Interceptor.disabled
+                && tr.TargetThreat != null
+                && !tr.TargetThreat.disabled
+                && tr.TargetThreat.persistentID == threatId)
+            {
+                count++;
+            }
+        }
+
+        return count;
     }
 
     internal void SetAutoProduce(FactionHQ? hq, bool autoProduce)
@@ -275,18 +331,30 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
     }
 
     internal string BuildServerThreatsPayload()
+        => BuildServerThreatsPayload(viewerHq: null);
+
+    internal string BuildServerThreatsPayload(FactionHQ? viewerHq)
     {
         if (trackedThreats.Count == 0)
         {
             return string.Empty;
         }
 
+        FactionAbmState? viewerState = viewerHq != null ? GetOrCreateState(viewerHq) : null;
         var sb = new StringBuilder();
         foreach (TrackedBallisticThreat t in trackedThreats.Values)
         {
             if (t.Missile == null || t.Missile.disabled || t.Intercepted || !t.Missile.persistentID.IsValid)
             {
                 continue;
+            }
+
+            if (viewerHq != null && viewerState != null)
+            {
+                if (ReferenceEquals(t.LauncherHq, viewerHq) || !HasEarlyWarningVisibility(viewerState, t.BlastYield))
+                {
+                    continue;
+                }
             }
 
             GlobalPosition pos = t.Missile.GlobalPosition();
@@ -356,6 +424,9 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         return localHq != null && (TryGetTopThreatForFaction(localHq, out _) || TryGetTopClientThreat(localHq, out _));
     }
 
+    private static bool HasEarlyWarningVisibility(FactionAbmState state, float blastYield)
+        => state.RadarCount > 0 || state.SiloCount > 0 || blastYield > 200f;
+
     private bool TryGetTopClientThreat(FactionHQ hq, out ClientReplicatedThreat? top)
     {
         top = null;
@@ -364,11 +435,12 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
             return false;
         }
 
+        FactionAbmState state = GetOrCreateState(hq);
         float bestYield = -1f;
         for (int i = 0; i < clientThreats.Count; i++)
         {
             ClientReplicatedThreat t = clientThreats[i];
-            if (ReferenceEquals(t.LauncherHq, hq))
+            if (ReferenceEquals(t.LauncherHq, hq) || !HasEarlyWarningVisibility(state, t.BlastYield))
             {
                 continue;
             }
@@ -407,7 +479,7 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
             return;
         }
 
-        float now = Time.unscaledTime;
+        float now = Time.time;
         if (!trackedThreats.TryGetValue(missile, out TrackedBallisticThreat? threat))
         {
             threat = new TrackedBallisticThreat
@@ -505,11 +577,11 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         windowRect = NativeThemeBridge.DrawWindow(WindowId, windowRect, id => DrawAbmWindow(localHq, state), "ABM DEFENSE & PLANT");
     }
 
-    private void UpdateAllFactionStockpiles(float dt)
+    private void UpdateAllFactionStockpiles(float dt, float simNow)
     {
         foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
         {
-            if (hq == null)
+            if (hq == null || !((NetworkBehaviour)hq).IsServer)
             {
                 continue;
             }
@@ -517,23 +589,53 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
             FactionAbmState state = GetOrCreateState(hq);
             RefreshBuildingStats(hq, state);
 
-            if (!((NetworkBehaviour)hq).IsServer)
-            {
-                continue;
-            }
-
             if (state.SiloCount > 0 && !state.SeededInitialSilo)
             {
                 state.SeededInitialSilo = true;
-                if (state.Stockpile < 2 && state.MaxCapacity > state.Stockpile)
+                int room = Math.Max(0, state.MaxCapacity - state.Stockpile);
+                int seed = state.Stockpile < 2 ? Math.Min(2, room) : 0;
+                if (seed > 0)
                 {
-                    state.Stockpile = Math.Min(state.MaxCapacity, state.Stockpile + 2);
+                    state.Stockpile += seed;
+                    state.FreeSeededStock += seed;
                 }
             }
 
-            if (state.Stockpile > state.MaxCapacity)
+            if (state.Stockpile <= state.MaxCapacity)
             {
-                state.Stockpile = state.MaxCapacity;
+                state.ExcessGraceUntil = 0f;
+                state.FreeSeededStock = Math.Min(state.FreeSeededStock, state.Stockpile);
+            }
+            else
+            {
+                if (state.ExcessGraceUntil <= 0f)
+                {
+                    state.ExcessGraceUntil = simNow + SiloLossExcessGraceSeconds;
+                }
+                else if (simNow >= state.ExcessGraceUntil)
+                {
+                    int excess = state.Stockpile - state.MaxCapacity;
+                    int freeTrimmed = Math.Min(excess, state.FreeSeededStock);
+                    state.FreeSeededStock -= freeTrimmed;
+                    int paidTrimmed = excess - freeTrimmed;
+                    state.Stockpile = state.MaxCapacity;
+                    state.ExcessGraceUntil = 0f;
+
+                    if (paidTrimmed > 0)
+                    {
+                        float refund = paidTrimmed * GcreNetworkSync.EffectiveAbmMissileCost;
+                        hq.AddFunds(refund);
+                        AddonLog.Info($"[ABM] {hq.faction?.factionName ?? "Faction"} refunded ${refund:0}m for {paidTrimmed} excess ABM interceptor(s) after silo loss.");
+                    }
+                }
+            }
+
+            if (state.PaidForCurrent && (state.PlantCount <= 0 || state.MaxCapacity <= 0))
+            {
+                float refund = GcreNetworkSync.EffectiveAbmMissileCost;
+                hq.AddFunds(refund);
+                state.PaidForCurrent = false;
+                state.ProductionElapsed = 0f;
             }
 
             if (state.PlantCount <= 0 || state.ProductionRate <= 0f || !state.AutoProduce || state.Stockpile >= state.MaxCapacity)
@@ -544,6 +646,11 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
             float cost = GcreNetworkSync.EffectiveAbmMissileCost;
             if (!state.PaidForCurrent)
             {
+                if (!CanAiAffordAbmProduction(hq, cost))
+                {
+                    continue;
+                }
+
                 if (!GroundControlReflection.TrySpend(hq, cost))
                 {
                     continue;
@@ -571,6 +678,31 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
                 SetFeedback($"ABM Interceptor ready ({state.Stockpile}/{state.MaxCapacity}).");
             }
         }
+    }
+
+    private static bool CanAiAffordAbmProduction(FactionHQ hq, float cost)
+    {
+        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
+        if (!GroundControlReflection.IsSafeAiFaction(hq, localHq) || GroundControlReflection.HasHumanPlayers(hq))
+        {
+            return true;
+        }
+
+        object? eco = GroundControlReflection.GetEcoInstance();
+        AiStrategicPhase phase = AiStrategicDirectorService.Instance.EvaluatePhase(eco, hq);
+        if ((phase == AiStrategicPhase.OpeningEconomy || phase == AiStrategicPhase.EmergencyReconstruction)
+            && hq.factionFunds < cost + 650f)
+        {
+            return false;
+        }
+
+        float buildReserve = GroundControlReflection.GetEnemyBuildReserve(hq, out bool resGoldMine, out bool resIncome);
+        if ((resGoldMine || resIncome || buildReserve > 0f) && hq.factionFunds < cost + buildReserve)
+        {
+            return false;
+        }
+
+        return true;
     }
 
     private void RefreshBuildingStats(FactionHQ hq, FactionAbmState state)
@@ -683,18 +815,24 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
                     continue;
                 }
 
+                if (targetMissile.persistentID.IsValid)
+                {
+                    defenderHq.RpcUpdateTrackingInfo(targetMissile.persistentID);
+                }
+
                 Vector3 launchPos = chosenSilo.Unit.transform.position + Vector3.up * 12f;
+                Vector3 launchDir = ComputeInterceptLaunchDirection(launchPos, targetMissile, interceptorDef);
                 Missile? launched = Spawner.i.SpawnMissile(
                     interceptorDef,
                     launchPos,
-                    Quaternion.LookRotation(Vector3.up),
-                    Vector3.up * 85f,
+                    Quaternion.LookRotation(launchDir),
+                    launchDir * 85f,
                     targetMissile,
                     chosenSilo.Unit);
 
                 if (launched == null)
                 {
-                    state.Stockpile++;
+                    RefundInterceptor(defenderHq);
                     continue;
                 }
 
@@ -705,6 +843,7 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
                     TargetThreat = targetMissile,
                     DefenderHq = defenderHq,
                     SpawnedAt = now,
+                    NextTrackingUpdateAt = now + TrackingRefreshIntervalSeconds,
                 });
 
                 siloCooldownUntil[chosenSilo.Unit] = now + SiloFireCooldownSeconds;
@@ -789,6 +928,19 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
 
             GlobalPosition intPos = tr.Interceptor.GlobalPosition();
             GlobalPosition threatPos = tr.TargetThreat.GlobalPosition();
+
+            if (tr.TargetThreat.persistentID.IsValid
+                && now >= tr.NextTrackingUpdateAt
+                && IsThreatInAbmSensorRange(tr.DefenderHq, threatPos))
+            {
+                tr.NextTrackingUpdateAt = now + TrackingRefreshIntervalSeconds;
+                tr.DefenderHq.RpcUpdateTrackingInfo(tr.TargetThreat.persistentID);
+                if (tr.Interceptor.targetID.NotValid)
+                {
+                    tr.Interceptor.SetTarget(tr.TargetThreat);
+                }
+            }
+
             float dist = FastMath.Distance(intPos, threatPos);
             if (dist > InterceptRadiusMeters)
             {
@@ -864,9 +1016,59 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         }
     }
 
+    private static Vector3 ComputeInterceptLaunchDirection(Vector3 launchPos, Missile targetMissile, MissileDefinition interceptorDef)
+    {
+        Vector3 threatLocal = targetMissile.transform.position;
+        Vector3 threatVel = targetMissile.rb != null ? targetMissile.rb.velocity : Vector3.zero;
+        float dist = Vector3.Distance(launchPos, threatLocal);
+        Missile? prefabMissile = interceptorDef.unitPrefab != null ? interceptorDef.unitPrefab.GetComponent<Missile>() : null;
+        WeaponInfo? info = prefabMissile != null ? prefabMissile.GetWeaponInfo() : null;
+        float maxSpeed = Mathf.Max(400f, info != null ? info.maxSpeed : 900f);
+        float tti = Mathf.Clamp(dist / maxSpeed, 0.5f, 20f);
+        Vector3 predictedPos = threatLocal + threatVel * (tti * 0.55f);
+        Vector3 toPredicted = predictedPos - launchPos;
+        if (toPredicted.sqrMagnitude < 1f)
+        {
+            return Vector3.up;
+        }
+
+        toPredicted.Normalize();
+        Vector3 blended = Vector3.Slerp(Vector3.up, toPredicted, 0.55f);
+        blended.y = Mathf.Max(0.45f, blended.y);
+        return blended.sqrMagnitude > 0.001f ? blended.normalized : Vector3.up;
+    }
+
+    private bool IsThreatInAbmSensorRange(FactionHQ defenderHq, GlobalPosition threatPos)
+    {
+        DynamicCapAndTechService.Instance.GetOwnedBuildingsOfKinds(defenderHq, abmOnly: true, abmSensorScratch);
+        for (int i = 0; i < abmSensorScratch.Count; i++)
+        {
+            RtsBuildingRecord rec = abmSensorScratch[i];
+            if (rec.Unit == null || rec.Unit.disabled)
+            {
+                continue;
+            }
+
+            int lvl = Mathf.Clamp(rec.Level, 1, 3);
+            float range = rec.Spec.Kind switch
+            {
+                RtsBuildingKind.AbmRadar => 45000f + (lvl - 1) * 17500f,
+                RtsBuildingKind.AbmSilo => 30000f + (lvl - 1) * 6000f,
+                _ => 0f,
+            };
+
+            if (range > 0f && FastMath.InRange(rec.Unit.GlobalPosition(), threatPos, range))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private int CountActiveInterceptorsForThreat(FactionHQ defenderHq, Missile threat)
     {
-        int count = 0;
+        int ownCount = 0;
         for (int i = 0; i < activeInterceptors.Count; i++)
         {
             TrackedInterceptor tr = activeInterceptors[i];
@@ -875,11 +1077,21 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
                 && ReferenceEquals(tr.DefenderHq, defenderHq)
                 && ReferenceEquals(tr.TargetThreat, threat))
             {
-                count++;
+                ownCount++;
             }
         }
 
-        return count;
+        int trackedAttacks = 0;
+        if (threat.persistentID.IsValid
+            && defenderHq.trackingDatabase != null
+            && defenderHq.trackingDatabase.TryGetValue(threat.persistentID, out TrackingInfo? info)
+            && info != null
+            && info.missileAttacks > 0)
+        {
+            trackedAttacks = info.missileAttacks;
+        }
+
+        return Math.Max(ownCount, trackedAttacks);
     }
 
     private int CountActiveInterceptorsForFaction(FactionHQ defenderHq)
@@ -902,10 +1114,15 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
     private bool TryGetTopThreatForFaction(FactionHQ hq, out TrackedBallisticThreat? top)
     {
         top = null;
+        FactionAbmState state = GetOrCreateState(hq);
         float bestYield = -1f;
         foreach (TrackedBallisticThreat threat in trackedThreats.Values)
         {
-            if (threat.Missile == null || threat.Missile.disabled || threat.Intercepted || ReferenceEquals(threat.LauncherHq, hq))
+            if (threat.Missile == null
+                || threat.Missile.disabled
+                || threat.Intercepted
+                || ReferenceEquals(threat.LauncherHq, hq)
+                || !HasEarlyWarningVisibility(state, threat.BlastYield))
             {
                 continue;
             }
@@ -956,6 +1173,9 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         return bestSq < float.MaxValue ? Mathf.Sqrt(bestSq) / 1000f : -1f;
     }
 
+    private static bool IsSafeAbmInterceptorPrefab(MissileDefinition def)
+        => def.unitPrefab != null && def.unitPrefab.GetComponentInChildren<SARHSeeker>(true) == null;
+
     private MissileDefinition? ResolveInterceptorDefinition()
     {
         Encyclopedia? enc = Encyclopedia.i;
@@ -972,13 +1192,13 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         cachedEncyclopedia = enc;
         cachedInterceptorDef = null;
 
-        string[] preferredKeys = { "SAM_Radar2", "SAM_Radar1", "missile_radar1" };
+        string[] preferredKeys = { "SAM_Radar2", "missile_radar1" };
         for (int p = 0; p < preferredKeys.Length; p++)
         {
             for (int i = 0; i < enc.missiles.Count; i++)
             {
                 MissileDefinition? m = enc.missiles[i];
-                if (m != null && m.unitPrefab != null && string.Equals(m.jsonKey, preferredKeys[p], StringComparison.OrdinalIgnoreCase))
+                if (m != null && IsSafeAbmInterceptorPrefab(m) && string.Equals(m.jsonKey, preferredKeys[p], StringComparison.OrdinalIgnoreCase))
                 {
                     cachedInterceptorDef = m;
                     return m;
@@ -989,7 +1209,7 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         for (int i = 0; i < enc.missiles.Count; i++)
         {
             MissileDefinition? m = enc.missiles[i];
-            if (m == null || m.unitPrefab == null)
+            if (m == null || !IsSafeAbmInterceptorPrefab(m))
             {
                 continue;
             }
@@ -1162,7 +1382,10 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
 
         DynamicCapAndTechService.Instance.GetOwnedBuildingsOfKinds(localHq, abmOnly: true, ownedUiBuffer);
         IReadOnlyList<RtsBuildingSpec> specs = RtsBuildingCatalog.AllSpecs;
-        float contentH = 360f + ownedUiBuffer.Count * 50f + Mathf.Max(1, trackedThreats.Count) * 22f;
+        int threatRowsForHeight = (GcreNetworkSync.IsPureClient && GcreNetworkSync.HostHasGcre)
+            ? clientThreats.Count
+            : trackedThreats.Count;
+        float contentH = 360f + ownedUiBuffer.Count * 50f + Mathf.Max(1, threatRowsForHeight) * 22f;
         Rect viewRect = new(0f, 0f, scrollOuter.width - 18f, Mathf.Max(scrollOuter.height - 6f, contentH));
         scrollPos = GUI.BeginScrollView(scrollOuter, scrollPos, viewRect);
 
@@ -1256,7 +1479,11 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
         int threatRows = 0;
         foreach (TrackedBallisticThreat t in trackedThreats.Values)
         {
-            if (t.Missile == null || t.Missile.disabled || t.Intercepted || ReferenceEquals(t.LauncherHq, localHq))
+            if (t.Missile == null
+                || t.Missile.disabled
+                || t.Intercepted
+                || ReferenceEquals(t.LauncherHq, localHq)
+                || !HasEarlyWarningVisibility(state, t.BlastYield))
             {
                 continue;
             }
@@ -1274,7 +1501,7 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
             for (int i = 0; i < clientThreats.Count; i++)
             {
                 ClientReplicatedThreat ct = clientThreats[i];
-                if (ReferenceEquals(ct.LauncherHq, localHq))
+                if (ReferenceEquals(ct.LauncherHq, localHq) || !HasEarlyWarningVisibility(state, ct.BlastYield))
                 {
                     continue;
                 }
@@ -1307,7 +1534,7 @@ internal sealed class AbmDefenseService : IAddonTick, IAddonGui, IAddonResetSess
 
     private void EmitLocalAlert(string text)
     {
-        float now = Time.unscaledTime;
+        float now = Time.time;
         if (alertCooldowns.TryGetValue(text, out float until) && now < until)
         {
             return;

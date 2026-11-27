@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Reflection.Emit;
 using HarmonyLib;
 using Mirage;
 using UnityEngine;
@@ -35,24 +36,40 @@ internal static class WantsRadarHunterPatch
 [HarmonyPatch]
 internal static class TryBuyRoleSeadPriorityPatch
 {
+    private struct TryBuyState
+    {
+        internal bool PrevSuppress;
+        internal bool PrevUrgentSead;
+    }
+
+    private static readonly Dictionary<AircraftDefinition, bool> AradCapabilityCache = new();
+
     internal static bool SuppressAntiShipForCurrentBuy { get; private set; }
+    internal static bool UrgentSeadForCurrentBuy { get; private set; }
 
     private static bool Prepare() => GroundControlReflection.TryBuyRoleMethod != null;
     private static MethodBase TargetMethod() => GroundControlReflection.TryBuyRoleMethod!;
 
-    private static void Prefix(FactionHQ? hq, object? state, ref bool bombing, ref bool escalate, out bool __state)
+    private static void Prefix(FactionHQ? hq, object? state, object? role, ref bool bombing, ref bool escalate, out TryBuyState __state)
     {
-        __state = SuppressAntiShipForCurrentBuy;
+        __state = new TryBuyState
+        {
+            PrevSuppress = SuppressAntiShipForCurrentBuy,
+            PrevUrgentSead = UrgentSeadForCurrentBuy,
+        };
         SuppressAntiShipForCurrentBuy = false;
+        UrgentSeadForCurrentBuy = false;
 
         if (!AddonConfig.EnableTacticalQualityAi.Value || hq == null)
         {
             return;
         }
 
+        bool isStrikeOrAnyRole = role == null || Convert.ToInt32(role) == 0;
         PlayerThreatSnapshot threat = AiStrategicDirectorService.Instance.ReadPlayerThreat(hq);
         bool hasAradCapableAir = HasAradCapableAircraft(hq);
         bool urgentSead = AddonConfig.SeadBeforeStrike.Value
+            && isStrikeOrAnyRole
             && hasAradCapableAir
             && threat.SamRadars >= 1
             && AiTacticalDoctrineService.Instance.HasDetectedEnemyRadar(hq)
@@ -65,20 +82,21 @@ internal static class TryBuyRoleSeadPriorityPatch
         }
 
         bool throttleAntiShip = false;
-        if (threat.Ships > 0 && threat.Ships < 3)
+        if (isStrikeOrAnyRole && threat.Ships > 0 && threat.Ships < 3)
         {
-            int sortie = AiTacticalDoctrineService.Instance.NextStrikeSortieIndex(hq);
+            int sortie = AiTacticalDoctrineService.Instance.PeekStrikeSortieIndex(hq);
             throttleAntiShip = (sortie % 3) != 0;
         }
 
+        UrgentSeadForCurrentBuy = urgentSead;
         SuppressAntiShipForCurrentBuy = urgentSead || throttleAntiShip;
 
         int bestDepot = GroundControlReflection.GetBestDepotLevel(hq);
-        int techTier = DynamicCapAndTechService.IsActive ? DynamicCapAndTechService.Instance.GetSnapshot(hq).TechTier : 2;
         object? eco = GroundControlReflection.GetEcoInstance();
+        int goldMines = eco != null ? GroundControlReflection.CountGoldMines(eco, hq) : 0;
         float enemyGross = GroundControlReflection.GetHqIncomePerMinute(eco, hq);
 
-        if (bestDepot >= 2 || techTier >= 2 || enemyGross >= 250f)
+        if (goldMines >= 1 && enemyGross >= 400f && bestDepot >= 2)
         {
             escalate = true;
             if (state != null)
@@ -93,13 +111,74 @@ internal static class TryBuyRoleSeadPriorityPatch
         }
     }
 
-    private static Exception? Finalizer(Exception? __exception, bool __state)
+    private static void Postfix(FactionHQ? hq, object? role, float __result)
     {
-        SuppressAntiShipForCurrentBuy = __state;
+        if (!AddonConfig.EnableTacticalQualityAi.Value || hq == null || __result <= 0f)
+        {
+            return;
+        }
+
+        if (role == null || Convert.ToInt32(role) == 0)
+        {
+            AiTacticalDoctrineService.Instance.NextStrikeSortieIndex(hq);
+        }
+    }
+
+    private static Exception? Finalizer(Exception? __exception, TryBuyState __state)
+    {
+        SuppressAntiShipForCurrentBuy = __state.PrevSuppress;
+        UrgentSeadForCurrentBuy = __state.PrevUrgentSead;
         return __exception;
     }
 
-    private static bool HasAradCapableAircraft(FactionHQ hq)
+    internal static bool IsAradCapableAirframe(AircraftDefinition? def)
+    {
+        if (def == null)
+        {
+            return false;
+        }
+
+        if (def.roleIdentity.antiRadar >= 0.40f)
+        {
+            return true;
+        }
+
+        if (AradCapabilityCache.TryGetValue(def, out bool cached))
+        {
+            return cached;
+        }
+
+        bool hasArad = false;
+        HardpointSet[]? hardpoints = ((UnitDefinition)def).unitPrefab != null
+            ? ((UnitDefinition)def).unitPrefab.GetComponent<Aircraft>()?.weaponManager?.hardpointSets
+            : null;
+        if (hardpoints != null)
+        {
+            for (int i = 0; i < hardpoints.Length && !hasArad; i++)
+            {
+                List<WeaponMount>? options = hardpoints[i].weaponOptions;
+                if (options == null)
+                {
+                    continue;
+                }
+
+                for (int j = 0; j < options.Count; j++)
+                {
+                    WeaponInfo? info = options[j]?.info;
+                    if (info != null && GroundControlReflection.AirIsAradWeapon(info))
+                    {
+                        hasArad = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        AradCapabilityCache[def] = hasArad;
+        return hasArad;
+    }
+
+    internal static bool HasAradCapableAircraft(FactionHQ hq)
     {
         foreach (Airbase ab in hq.GetAirbases())
         {
@@ -110,8 +189,7 @@ internal static class TryBuyRoleSeadPriorityPatch
 
             foreach (AircraftDefinition def in ab.GetAvailableAircraft())
             {
-                if (def != null
-                    && def.roleIdentity.antiRadar >= 0.40f
+                if (IsAradCapableAirframe(def)
                     && GroundControlReflection.EnemyCanLaunchFrom(ab, hq, def))
                 {
                     return true;
@@ -126,14 +204,70 @@ internal static class TryBuyRoleSeadPriorityPatch
 [HarmonyPatch]
 internal static class KeepAntiShipCandidatesSeadGuardPatch
 {
+    private static FieldInfo? cachedItem1Field;
+
     private static bool Prepare() => GroundControlReflection.EnemyKeepAntiShipCandidatesMethod != null;
     private static MethodBase TargetMethod() => GroundControlReflection.EnemyKeepAntiShipCandidatesMethod!;
 
-    private static bool Prefix(float reference, ref float __result)
+    private static bool Prefix(IList? airCandidates, bool escalate, float reference, ref float __result)
     {
         if (!TryBuyRoleSeadPriorityPatch.SuppressAntiShipForCurrentBuy)
         {
             return true;
+        }
+
+        if (TryBuyRoleSeadPriorityPatch.UrgentSeadForCurrentBuy
+            && airCandidates != null
+            && airCandidates.Count > 0)
+        {
+            if (cachedItem1Field == null && airCandidates[0] != null)
+            {
+                cachedItem1Field = airCandidates[0]!.GetType().GetField("Item1");
+            }
+
+            if (cachedItem1Field != null)
+            {
+                bool anyArad = false;
+                for (int i = 0; i < airCandidates.Count; i++)
+                {
+                    object? entry = airCandidates[i];
+                    if (entry != null
+                        && cachedItem1Field.GetValue(entry) is AircraftDefinition def
+                        && TryBuyRoleSeadPriorityPatch.IsAradCapableAirframe(def))
+                    {
+                        anyArad = true;
+                        break;
+                    }
+                }
+
+                if (anyArad)
+                {
+                    for (int i = airCandidates.Count - 1; i >= 0; i--)
+                    {
+                        object? entry = airCandidates[i];
+                        if (entry == null
+                            || cachedItem1Field.GetValue(entry) is not AircraftDefinition def
+                            || !TryBuyRoleSeadPriorityPatch.IsAradCapableAirframe(def))
+                        {
+                            airCandidates.RemoveAt(i);
+                        }
+                    }
+
+                    float updatedRef = escalate ? 0f : float.MaxValue;
+                    for (int i = 0; i < airCandidates.Count; i++)
+                    {
+                        object? entry = airCandidates[i];
+                        if (entry != null && cachedItem1Field.GetValue(entry) is AircraftDefinition def)
+                        {
+                            float price = GroundControlReflection.EcoPriceOf(def);
+                            updatedRef = escalate ? Mathf.Max(updatedRef, price) : Mathf.Min(updatedRef, price);
+                        }
+                    }
+
+                    __result = updatedRef;
+                    return false;
+                }
+            }
         }
 
         __result = reference;
@@ -172,26 +306,54 @@ internal static class BuyAirframePicketPatch
             return true;
         }
 
+        if (DynamicCapAndTechService.IsActive && DynamicCapAndTechService.Instance.IsAirFull(hq))
+        {
+            __result = 0f;
+            return false;
+        }
+
         int airborne = GroundControlReflection.EnemyCountAirborne(hq);
-        if (airborne >= 1
-            && budget > 0f
-            && budget < float.MaxValue * 0.5f
-            && !GroundControlReflection.EnemyHasAirStock(hq))
+        bool hasStock = GroundControlReflection.EnemyHasAirStock(hq);
+        if (!hasStock && budget > 0f && budget < float.MaxValue * 0.5f && !AiEconomySettings.GetActiveProfile().IsVanilla)
         {
             object? eco = GroundControlReflection.GetEcoInstance();
-            if (eco != null)
+            int goldMines = eco != null ? GroundControlReflection.CountGoldMines(eco, hq) : 0;
+            float enemyGross = eco != null ? GroundControlReflection.GetHqIncomePerMinute(eco, hq) : 0f;
+            float reserve = GroundControlReflection.GetEnemyBuildReserve(hq, out _, out bool resIncome);
+            PlayerThreatSnapshot threat = AiStrategicDirectorService.Instance.ReadPlayerThreat(hq);
+
+            // Opening economy: hold cash air purchases unless defending against air or capturing neutral bases.
+            if (goldMines == 0 || enemyGross < 350f)
             {
-                float enemyGross = GroundControlReflection.GetHqIncomePerMinute(eco, hq);
-                int goldMines = GroundControlReflection.CountGoldMines(eco, hq);
-                if (enemyGross < 100f && goldMines == 0)
+                bool emergencyAirDef = threat.Aircraft >= 2 && airborne == 0 && hq.factionFunds >= reserve + 120f;
+                bool earlyCapture = airborne == 0
+                    && enemyGross >= 150f
+                    && GroundControlReflection.HasNeutralCapturableAirbases()
+                    && hq.factionFunds >= reserve + 110f;
+
+                if (!emergencyAirDef && !earlyCapture)
                 {
-                    float reserve = GroundControlReflection.GetEnemyBuildReserve(hq, out _, out _);
-                    if (reserve > 0f && hq.factionFunds < reserve + 60f)
-                    {
-                        __result = 0f;
-                        return false;
-                    }
+                    __result = 0f;
+                    return false;
                 }
+            }
+
+            // Never raid active income-building reserves for cash jets.
+            if (resIncome && reserve > 0f && hq.factionFunds < reserve + 100f)
+            {
+                __result = 0f;
+                return false;
+            }
+
+            // Do not feed unescorted strike jets into heavy SAM walls without SEAD capability.
+            if (threat.SamRadars >= 2
+                && (goldMines < 2 || enemyGross < 550f)
+                && !TryBuyRoleSeadPriorityPatch.HasAradCapableAircraft(hq)
+                && airborne >= 2
+                && threat.Aircraft < 3)
+            {
+                __result = 0f;
+                return false;
             }
         }
 
@@ -335,20 +497,89 @@ internal static class TaskAirWingSeadHoldPatch
     private struct TaskAirWingState
     {
         internal FactionHQ? PrevAiHq;
+        internal FactionHQ? PrevHoldHq;
         internal bool HoldActive;
     }
 
+    private static FactionHQ? activeSeadHoldHq;
+    private static bool transpilerApplied;
+
     private static bool Prepare() => GroundControlReflection.TaskAirWingMethod != null;
     private static MethodBase TargetMethod() => GroundControlReflection.TaskAirWingMethod!;
+
+    private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+    {
+        List<CodeInstruction> codes = new(instructions);
+        MethodInfo? waveLeftWithGetter = GroundControlReflection.CommanderStateType != null
+            ? AccessTools.PropertyGetter(GroundControlReflection.CommanderStateType, "WaveLeftWith")
+            : null;
+        MethodInfo? filterMethod = AccessTools.Method(typeof(TaskAirWingSeadHoldPatch), nameof(FilterWaveOutFlag));
+
+        if (waveLeftWithGetter == null || filterMethod == null)
+        {
+            AddonLog.Warn("[Tactical AI] TaskAirWingSeadHoldPatch: WaveLeftWith getter not found; using fallback recall.");
+            return codes;
+        }
+
+        for (int i = 0; i < codes.Count; i++)
+        {
+            if (!codes[i].Calls(waveLeftWithGetter))
+            {
+                continue;
+            }
+
+            int branchScanEnd = Math.Min(codes.Count, i + 15);
+            for (int j = i + 1; j < branchScanEnd; j++)
+            {
+                if ((codes[j].opcode != OpCodes.Br_S && codes[j].opcode != OpCodes.Br)
+                    || codes[j].operand is not Label mergeLabel)
+                {
+                    continue;
+                }
+
+                int mergeScanEnd = Math.Min(codes.Count, j + 20);
+                for (int k = j + 1; k < mergeScanEnd; k++)
+                {
+                    if (!codes[k].labels.Contains(mergeLabel) || !IsStloc(codes[k].opcode))
+                    {
+                        continue;
+                    }
+
+                    CodeInstruction loadHq = new(OpCodes.Ldarg_1);
+                    loadHq.MoveLabelsFrom(codes[k]);
+                    codes.Insert(k, loadHq);
+                    codes.Insert(k + 1, new CodeInstruction(OpCodes.Call, filterMethod));
+                    transpilerApplied = true;
+                    return codes;
+                }
+            }
+        }
+
+        AddonLog.Warn("[Tactical AI] TaskAirWingSeadHoldPatch: flag8 merge point not found; using fallback recall.");
+        return codes;
+    }
+
+    private static bool IsStloc(OpCode op)
+        => op == OpCodes.Stloc_0
+            || op == OpCodes.Stloc_1
+            || op == OpCodes.Stloc_2
+            || op == OpCodes.Stloc_3
+            || op == OpCodes.Stloc_S
+            || op == OpCodes.Stloc;
+
+    private static bool FilterWaveOutFlag(bool flag8, FactionHQ? hq)
+        => flag8 && (hq == null || !ReferenceEquals(activeSeadHoldHq, hq));
 
     private static void Prefix(object __instance, FactionHQ hq, FactionHQ localHq, out TaskAirWingState __state)
     {
         __state = new TaskAirWingState
         {
             PrevAiHq = ReviewContextGuardPatch.ActiveAiHq,
+            PrevHoldHq = activeSeadHoldHq,
             HoldActive = false,
         };
         ReviewContextGuardPatch.ActiveAiHq = hq;
+        activeSeadHoldHq = null;
 
         if (!AddonConfig.EnableTacticalQualityAi.Value || !AddonConfig.SeadBeforeStrike.Value || hq == null)
         {
@@ -373,12 +604,17 @@ internal static class TaskAirWingSeadHoldPatch
         if (AiTacticalDoctrineService.Instance.ShouldHoldBombersForSead(hq, localHq, waveOut, out bool releaseSavedGoal))
         {
             __state.HoldActive = true;
-            int curGoal = GroundControlReflection.StateWaveGoalProp.GetValue(state) is int g ? g : 0;
-            if (curGoal < 99)
+            activeSeadHoldHq = hq;
+            GroundControlReflection.StateWaveWaitSinceProp.SetValue(state, Time.time);
+
+            if (!transpilerApplied)
             {
-                AiTacticalDoctrineService.Instance.NoteSavedWaveGoal(hq, curGoal);
-                GroundControlReflection.StateWaveWaitSinceProp.SetValue(state, Time.time);
-                GroundControlReflection.StateWaveGoalProp.SetValue(state, 99);
+                int curGoal = GroundControlReflection.StateWaveGoalProp.GetValue(state) is int g ? g : 0;
+                if (curGoal < 99)
+                {
+                    AiTacticalDoctrineService.Instance.NoteSavedWaveGoal(hq, curGoal);
+                    GroundControlReflection.StateWaveGoalProp.SetValue(state, 99);
+                }
             }
         }
         else if (releaseSavedGoal)
@@ -401,45 +637,49 @@ internal static class TaskAirWingSeadHoldPatch
 
         if (__state.HoldActive)
         {
-            if (GroundControlReflection.EnemyStatesField?.GetValue(__instance) is IDictionary states
-                && states.Contains(hq)
-                && states[hq] is object stateObj)
+            if (!transpilerApplied)
             {
-                GroundControlReflection.StateWaveOutProp?.SetValue(stateObj, false);
-            }
-
-            GlobalPosition stagingPos = FindNearestOwnAirbasePos(hq, AiBattlefieldIntelService.Instance.GetPrimaryObjectivePos(hq, localHq));
-
-            foreach (PersistentID pid in hq.factionUnits)
-            {
-                if (!pid.TryGetUnit(out Unit u) || u is not Aircraft ac || ac.disabled || ac.Player != null)
+                if (GroundControlReflection.EnemyStatesField?.GetValue(__instance) is IDictionary states
+                    && states.Contains(hq)
+                    && states[hq] is object stateObj)
                 {
-                    continue;
+                    GroundControlReflection.StateWaveOutProp?.SetValue(stateObj, false);
                 }
 
-                if (!GroundControlReflection.AirHasPlanePilot(ac)
-                    || IsCargoConfigured(ac)
-                    || GroundControlReflection.EnemyIsRadarPicket(ac.definition, hq)
-                    || GroundControlReflection.IsRadarHunter(ac, hq)
-                    || GroundControlReflection.AirIsMissionReturning(ac)
-                    || GroundControlReflection.AirGetMissionLandingBase(ac) != null
-                    || GroundControlReflection.AirGetMissionModeInt(ac) == GroundControlReflection.AirCommandModeAradValue
-                    || !GroundControlReflection.AirHasCombatAmmo(ac))
-                {
-                    continue;
-                }
+                GlobalPosition stagingPos = FindNearestOwnAirbasePos(hq, AiBattlefieldIntelService.Instance.GetPrimaryObjectivePos(hq, localHq));
 
-                // AirRole: 0=Strike, 1=Fighter, 2=Transport
-                if (GroundControlReflection.EnemyGetAirRoleInt(ac) == 1)
+                foreach (PersistentID pid in hq.factionUnits)
                 {
-                    continue;
-                }
+                    if (!pid.TryGetUnit(out Unit u) || u is not Aircraft ac || ac.disabled || ac.Player != null)
+                    {
+                        continue;
+                    }
 
-                int mode = GroundControlReflection.AirCarriesStrategicStore(ac) ? 4 : 1;
-                GroundControlReflection.AirClearAiRoute(ac);
-                GroundControlReflection.AirClearAiForcedTarget(ac);
-                GroundControlReflection.AirSetAiCommitted(ac, false);
-                GroundControlReflection.AirRetargetAiMission(ac, mode, stagingPos, 15000f);
+                    if (!GroundControlReflection.AirHasPlanePilot(ac)
+                        || IsCargoConfigured(ac)
+                        || GroundControlReflection.EnemyIsRadarPicket(ac.definition, hq)
+                        || GroundControlReflection.IsRadarHunter(ac, hq)
+                        || GroundControlReflection.AirIsMissionReturning(ac)
+                        || GroundControlReflection.AirGetMissionLandingBase(ac) != null
+                        || GroundControlReflection.AirGetMissionModeInt(ac) == GroundControlReflection.AirCommandModeAradValue
+                        || !GroundControlReflection.AirHasCombatAmmo(ac))
+                    {
+                        continue;
+                    }
+
+                    // AirRole: 0=Strike, 1=Fighter, 2=Transport
+                    if (GroundControlReflection.EnemyGetAirRoleInt(ac) == 1)
+                    {
+                        continue;
+                    }
+
+                    int currentMode = GroundControlReflection.AirGetMissionModeInt(ac);
+                    int mode = currentMode == 5 /* Hybrid */ ? 5 : (GroundControlReflection.AirCarriesStrategicStore(ac) ? 4 : 1);
+                    GroundControlReflection.AirClearAiRoute(ac);
+                    GroundControlReflection.AirClearAiForcedTarget(ac);
+                    GroundControlReflection.AirSetAiCommitted(ac, false);
+                    GroundControlReflection.AirRetargetAiMission(ac, mode, stagingPos, 15000f);
+                }
             }
 
             return;
@@ -450,7 +690,18 @@ internal static class TaskAirWingSeadHoldPatch
             && AddonConfig.EnableAiCombinedArmsSync.Value
             && AiBattlefieldIntelService.Instance.TryGetRearQrfAlert(hq, out GlobalPosition alertPos, out Unit? attacker))
         {
+            if (attacker == null && !AiOperationalManeuverService.HasTrackedHostileNear(hq, alertPos, 3000f))
+            {
+                return;
+            }
+
             bool isAirAttack = attacker is Aircraft;
+            if (isAirAttack && AiOperationalManeuverService.HasFriendlyAirDefenceNear(hq, alertPos, 2500f))
+            {
+                AiBattlefieldIntelService.Instance.ClearRearQrfAlert(hq);
+                return;
+            }
+
             int fighterIndex = 0;
             foreach (PersistentID pid in hq.factionUnits)
             {
@@ -520,6 +771,7 @@ internal static class TaskAirWingSeadHoldPatch
     private static Exception? Finalizer(Exception? __exception, TaskAirWingState __state)
     {
         ReviewContextGuardPatch.ActiveAiHq = __state.PrevAiHq;
+        activeSeadHoldHq = __state.PrevHoldHq;
         return __exception;
     }
 
@@ -868,14 +1120,15 @@ internal static class PickPriorityTargetCogPatch
                 continue;
             }
 
+            bool isMdsSite = MdsBridgeBootstrap.IsMdsSelectableUnit?.Invoke(unit) == true;
             bool isLocatedArty = AiBattlefieldIntelService.Instance.IsLocatedHostileArtillery(hq, unit);
             bool isRadarUnit = unit.HasRadarEmission();
-            if (!(unit is Building) && !isLocatedArty && !isRadarUnit)
+            if (!(unit is Building) && !isMdsSite && !isLocatedArty && !isRadarUnit)
             {
                 continue;
             }
 
-            if (!(unit is Building) && !isLocatedArty && levelNow - info.lastSpottedTime > 90f)
+            if (!(unit is Building) && !isMdsSite && !isLocatedArty && levelNow - info.lastSpottedTime > 90f)
             {
                 continue;
             }
@@ -941,18 +1194,14 @@ internal static class PickSalvoTargetCogPatch
 
         foreach (KeyValuePair<PersistentID, TrackingInfo> kv in hq.trackingDatabase)
         {
-            if (SalvoScratch.Count >= 200)
-            {
-                break;
-            }
-
             TrackingInfo info = kv.Value;
             if (info == null || !info.TryGetUnit(out Unit unit) || unit == null || unit.disabled || unit.definition == null)
             {
                 continue;
             }
 
-            if (!(unit is Building) && !(unit is GroundVehicle))
+            bool isMdsSite = MdsBridgeBootstrap.IsMdsSelectableUnit?.Invoke(unit) == true;
+            if (!(unit is Building) && !(unit is GroundVehicle) && !isMdsSite)
             {
                 continue;
             }
@@ -963,6 +1212,7 @@ internal static class PickSalvoTargetCogPatch
             }
 
             if (!(unit is Building)
+                && !isMdsSite
                 && levelNow - info.lastSpottedTime > 90f
                 && !AiBattlefieldIntelService.Instance.IsLocatedHostileArtillery(hq, unit))
             {
@@ -988,6 +1238,12 @@ internal static class PickSalvoTargetCogPatch
         {
             __result = null;
             return false;
+        }
+
+        if (SalvoScratch.Count > 200)
+        {
+            SalvoScratch.Sort((a, b) => b.BaseScore.CompareTo(a.BaseScore));
+            SalvoScratch.RemoveRange(200, SalvoScratch.Count - 200);
         }
 
         Unit? bestUnpenalized = null;
@@ -1249,7 +1505,7 @@ internal static class PickJammerTargetsDeconflictPatch
         {
             (Unit r, GlobalPosition rPos, float distToObj) = RadarScratch[i];
             float distToAc = FastMath.Distance(acPos, rPos);
-            if (distToAc >= maxRange || !r.LineOfSight(acWorld, 1000f))
+            if (distToAc >= maxRange || !HasTrackedLineOfSight(r, rPos, acWorld, distToAc))
             {
                 continue;
             }
@@ -1269,6 +1525,22 @@ internal static class PickJammerTargetsDeconflictPatch
         }
 
         return bestFree ?? bestFallback;
+    }
+
+    private static bool HasTrackedLineOfSight(Unit radar, GlobalPosition trackedPos, Vector3 acWorld, float distToAc)
+    {
+        if (distToAc > radar.GetVisibility() * 1000f)
+        {
+            return false;
+        }
+
+        Vector3 rWorld = trackedPos.ToLocalPosition();
+        if (Physics.Linecast(acWorld, rWorld, out RaycastHit hit, PhysicsLayers.StaticsMask))
+        {
+            return FastMath.InRange(hit.point, rWorld, radar.maxRadius * 2f);
+        }
+
+        return true;
     }
 }
 
@@ -1411,20 +1683,18 @@ internal static class ReleaseNavalWaveTacticalPatch
             return true;
         }
 
-        // Pull back heavily damaged capital ships (< 35% condition)
+        // Pull back heavily damaged ships (< 35% condition)
+        float now = Time.time;
         if (hq.factionUnits != null)
         {
-            float now = Time.time;
             foreach (PersistentID pid in hq.factionUnits)
             {
-                if (!pid.TryGetUnit(out Unit u) || u is not Ship s || s.disabled || s.definition is not ShipDefinition sdef)
+                if (!pid.TryGetUnit(out Unit u) || u is not Ship s || s.disabled)
                 {
                     continue;
                 }
 
-                bool isCapital = sdef.shipType <= ShipType.DDG || sdef.value >= 300f;
-                if (isCapital
-                    && GroundControlReflection.GetUnitCondition(u) < 0.35f
+                if (GroundControlReflection.GetUnitCondition(u) < 0.35f
                     && !FastMath.InRange(u.GlobalPosition(), rallyLanePoint, 2500f)
                     && AiTacticalDoctrineService.Instance.ShouldIssueNavalRetreat(u, now))
                 {
@@ -1448,8 +1718,45 @@ internal static class ReleaseNavalWaveTacticalPatch
         float waitingSince = GroundControlReflection.GetStateFloat(state, GroundControlReflection.StateNavalWaitingSinceProp);
         if (waitingSince <= 0f)
         {
-            waitingSince = Time.time;
+            waitingSince = now;
             GroundControlReflection.SetStateFloat(state, GroundControlReflection.StateNavalWaitingSinceProp, waitingSince);
+        }
+
+        bool timedOut = now - waitingSince > 300f;
+        int readyCount = 0;
+        StaleShipsScratch.Clear();
+        try
+        {
+            foreach (Ship ship in rallying)
+            {
+                if (FastMath.InRange(((Unit)ship).GlobalPosition(), rallyLanePoint, 2500f))
+                {
+                    readyCount++;
+                }
+                else if (timedOut)
+                {
+                    StaleShipsScratch.Add(ship);
+                }
+                else if (AiTacticalDoctrineService.Instance.ShouldIssueNavalRetreat((Unit)ship, now))
+                {
+                    GroundControlReflection.TrySetAiDestination((Unit)ship, rallyLanePoint);
+                }
+            }
+
+            for (int i = 0; i < StaleShipsScratch.Count; i++)
+            {
+                rallying.Remove(StaleShipsScratch[i]);
+            }
+        }
+        finally
+        {
+            StaleShipsScratch.Clear();
+        }
+
+        if (rallying.Count == 0)
+        {
+            GroundControlReflection.SetStateFloat(state, GroundControlReflection.StateNavalWaitingSinceProp, 0f);
+            return false;
         }
 
         if (!TryPickNavalTargetSeaLane(hq, localHq, out GlobalPosition targetLanePoint))
@@ -1457,18 +1764,13 @@ internal static class ReleaseNavalWaveTacticalPatch
             return true;
         }
 
-        int readyCount = 0;
-        foreach (Ship ship in rallying)
-        {
-            if (FastMath.InRange(((Unit)ship).GlobalPosition(), rallyLanePoint, 2500f))
-            {
-                readyCount++;
-            }
-        }
-
-        bool timedOut = Time.time - waitingSince > 300f;
         if (readyCount < 3 && (!timedOut || readyCount < 2))
         {
+            if (timedOut)
+            {
+                GroundControlReflection.SetStateFloat(state, GroundControlReflection.StateNavalWaitingSinceProp, now);
+            }
+
             return false;
         }
 
@@ -1497,7 +1799,7 @@ internal static class ReleaseNavalWaveTacticalPatch
         GroundControlReflection.SetStateFloat(
             state,
             GroundControlReflection.StateNavalWaitingSinceProp,
-            rallying.Count > 0 ? Time.time : 0f);
+            rallying.Count > 0 ? now : 0f);
         return false;
     }
 
@@ -1631,7 +1933,7 @@ internal static class GetLaneFormUpFlankPatch
             return;
         }
 
-        Airbase? targetBase = FindNearestAirbaseNear(hold, 1200f);
+        Airbase? targetBase = FindNearestAirbaseNear(hold, 1500f);
         if (!AiTacticalDoctrineService.Instance.TryGetFlankAngleOffsetDegrees(unit.NetworkHQ, targetBase, out float angleDeg))
         {
             return;
@@ -1661,10 +1963,10 @@ internal static class GetLaneFormUpFlankPatch
         }
     }
 
-    private static Airbase? FindNearestAirbaseNear(GlobalPosition pos, float maxRadiusMeters)
+    private static Airbase? FindNearestAirbaseNear(GlobalPosition pos, float minRadiusMeters)
     {
         Airbase? best = null;
-        float bestSq = maxRadiusMeters * maxRadiusMeters;
+        float bestSq = float.MaxValue;
         foreach (Airbase ab in FactionRegistry.airbaseLookup.Values)
         {
             if (ab == null || ab.disabled || ab.center == null)
@@ -1672,8 +1974,11 @@ internal static class GetLaneFormUpFlankPatch
                 continue;
             }
 
+            float effRadius = ab.SavedAirbase != null
+                ? Mathf.Clamp(ab.SavedAirbase.CaptureRange * 0.75f, minRadiusMeters, 3000f)
+                : minRadiusMeters;
             float dSq = FastMath.SquareDistance(pos, ab.center.GlobalPosition());
-            if (dSq < bestSq)
+            if (dSq <= effRadius * effRadius && dSq < bestSq)
             {
                 bestSq = dSq;
                 best = ab;
@@ -1767,12 +2072,14 @@ internal static class ReviewMainEffortAdaptationPatch
                 {
                     GroundControlReflection.CaptureReleaseDrive(drive);
                     GroundControlReflection.CaptureClearDriveTarget(drive);
+                    GroundControlReflection.DriveOwnerProp?.SetValue(drive, hq);
                 }
             }
             else if (HasAlternativeDriveTarget(hq, staging, stalledTarget))
             {
                 GroundControlReflection.CaptureReleaseDrive(drive);
                 GroundControlReflection.CaptureClearDriveTarget(drive);
+                GroundControlReflection.DriveOwnerProp?.SetValue(drive, hq);
             }
         }
 
@@ -1816,6 +2123,9 @@ internal static class ReviewMainEffortAdaptationPatch
 [HarmonyPatch]
 internal static class ChooseEnemyTargetAdaptationPatch
 {
+    private static readonly PropertyInfo? DisableCaptureProp =
+        AccessTools.Property(GroundControlReflection.SettingsType, "DisableCapture");
+
     private static bool Prepare() => GroundControlReflection.ChooseEnemyTarget4Method != null;
     private static MethodBase TargetMethod() => GroundControlReflection.ChooseEnemyTarget4Method!;
 
@@ -1826,7 +2136,7 @@ internal static class ChooseEnemyTargetAdaptationPatch
             return;
         }
 
-        if (hq == null || staging == null || __result == null || __result.CurrentHQ == null)
+        if (hq == null || staging == null || staging.center == null || __result == null)
         {
             return;
         }
@@ -1836,6 +2146,7 @@ internal static class ChooseEnemyTargetAdaptationPatch
             return;
         }
 
+        bool disableCapture = DisableCaptureProp?.GetValue(null) is bool dc && dc;
         GlobalPosition stagingPos = staging.center.GlobalPosition();
         Airbase? alternative = null;
         float bestDist = float.MaxValue;
@@ -1844,7 +2155,9 @@ internal static class ChooseEnemyTargetAdaptationPatch
         {
             if (candidate == null
                 || candidate == __result
-                || candidate.CurrentHQ == null
+                || candidate.disabled
+                || candidate.center == null
+                || (disableCapture && candidate.CurrentHQ == null)
                 || !GroundControlReflection.IsLandBase(candidate)
                 || !GroundControlReflection.IsTakeable(candidate, hq)
                 || AiTacticalDoctrineService.Instance.IsTargetStalled(hq, candidate))

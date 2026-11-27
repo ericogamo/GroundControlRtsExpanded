@@ -106,6 +106,7 @@ internal static class ModelRegistry
 
     private static void DestroyCompiledMap(Dictionary<string, CompiledModel> map)
     {
+        var destroyedMaterials = new HashSet<Material>();
         foreach (CompiledModel compiled in map.Values)
         {
             for (int i = 0; i < compiled.Parts.Count; i++)
@@ -115,9 +116,10 @@ internal static class ModelRegistry
                     UnityEngine.Object.Destroy(compiled.Parts[i].Mesh);
                 }
 
-                if (compiled.Parts[i].Material != null)
+                Material? partMat = compiled.Parts[i].Material;
+                if (partMat != null && destroyedMaterials.Add(partMat))
                 {
-                    UnityEngine.Object.Destroy(compiled.Parts[i].Material);
+                    UnityEngine.Object.Destroy(partMat);
                 }
             }
 
@@ -610,6 +612,8 @@ internal static class ModelRegistry
             : null;
 
         var compiled = new CompiledModel();
+        var compiledMaterials = new Dictionary<ParsedMaterialData, Material>();
+        var compiledTextures = new Dictionary<byte[], Texture2D>();
         var normBounds = new Bounds();
         bool hasNorm = false;
 
@@ -678,13 +682,14 @@ internal static class ModelRegistry
                 mesh.colors32 = sub.Colors;
             }
 
-            if (sub.Normals.Length == vertCount)
+            if (sub.Normals.Length == vertCount && Mathf.Abs(det) > 1e-6f)
             {
                 Matrix4x4 normalMatrix = local.inverse.transpose;
                 var norms = new Vector3[vertCount];
                 for (int v = 0; v < vertCount; v++)
                 {
-                    norms[v] = (rot * normalMatrix.MultiplyVector(sub.Normals[v])).normalized;
+                    Vector3 n = rot * normalMatrix.MultiplyVector(sub.Normals[v]);
+                    norms[v] = n.sqrMagnitude > 1e-12f ? n.normalized : Vector3.up;
                 }
 
                 mesh.normals = norms;
@@ -696,35 +701,43 @@ internal static class ModelRegistry
 
             mesh.RecalculateBounds();
 
-            Texture2D? tex = null;
-            if (sub.Material.BaseColorTextureBytes != null && sub.Material.BaseColorTextureBytes.Length > 0)
+            if (!compiledMaterials.TryGetValue(sub.Material, out Material? mat))
             {
-                tex = new Texture2D(2, 2, TextureFormat.RGBA32, mipChain: true)
+                Texture2D? tex = null;
+                if (sub.Material.BaseColorTextureBytes != null && sub.Material.BaseColorTextureBytes.Length > 0)
                 {
-                    name = $"{sub.Name}_tex",
-                    wrapMode = TextureWrapMode.Repeat,
-                    anisoLevel = 4,
-                    hideFlags = HideFlags.DontUnloadUnusedAsset,
-                };
-                if (!tex.LoadImage(sub.Material.BaseColorTextureBytes, markNonReadable: true))
-                {
-                    UnityEngine.Object.Destroy(tex);
-                    tex = null;
+                    if (!compiledTextures.TryGetValue(sub.Material.BaseColorTextureBytes, out tex))
+                    {
+                        tex = new Texture2D(2, 2, TextureFormat.RGBA32, mipChain: true)
+                        {
+                            name = $"{sub.Name}_tex",
+                            wrapMode = TextureWrapMode.Repeat,
+                            anisoLevel = 4,
+                            hideFlags = HideFlags.DontUnloadUnusedAsset,
+                        };
+                        if (!tex.LoadImage(sub.Material.BaseColorTextureBytes, markNonReadable: true))
+                        {
+                            UnityEngine.Object.Destroy(tex);
+                            tex = null;
+                        }
+                        else
+                        {
+                            compiled.Textures.Add(tex);
+                            compiledTextures[sub.Material.BaseColorTextureBytes] = tex;
+                        }
+                    }
                 }
-                else
-                {
-                    compiled.Textures.Add(tex);
-                }
-            }
 
-            float smoothness = cfg.SmoothnessOverride ?? sub.Material.Smoothness;
-            Material mat = UrpMaterialFactory.CreateMaterial(
-                $"{parsed.SlotId}_{sub.Material.Name}",
-                sub.Material.BaseColor,
-                tex,
-                sub.Material.Metallic,
-                smoothness,
-                tintOverride);
+                float smoothness = cfg.SmoothnessOverride ?? sub.Material.Smoothness;
+                mat = UrpMaterialFactory.CreateMaterial(
+                    $"{parsed.SlotId}_{sub.Material.Name}",
+                    sub.Material.BaseColor,
+                    tex,
+                    sub.Material.Metallic,
+                    smoothness,
+                    tintOverride);
+                compiledMaterials[sub.Material] = mat;
+            }
 
             compiled.Parts.Add(new CompiledSubMesh
             {

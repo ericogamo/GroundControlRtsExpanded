@@ -3,6 +3,13 @@ using UnityEngine;
 
 namespace GroundControlRtsExpanded;
 
+internal enum AiIncomePriorityKind
+{
+    None = 0,
+    UpgradeIncome = 1,
+    BuildMine = 2,
+}
+
 internal readonly struct AiEconomyProfile
 {
     internal AiEconomyProfile(
@@ -171,6 +178,43 @@ internal static class AiEconomySettings
     internal static float GetPlayerReferenceIncomePerMinute(object ecoInstance)
         => TryGetPlayerReferenceEconomy(ecoInstance, out float playerGross, out _, out _) ? playerGross : 0f;
 
+    internal static float GetEffectiveAiGrossIncome(object? ecoInstance, FactionHQ? hq, in AiEconomyProfile profile)
+    {
+        GetEffectiveAiIncome(ecoInstance, hq, profile, out float effectiveGross, out _);
+        return effectiveGross;
+    }
+
+    internal static void GetEffectiveAiIncome(
+        object? ecoInstance,
+        FactionHQ? hq,
+        in AiEconomyProfile profile,
+        out float effectiveGross,
+        out float effectiveNet)
+    {
+        if (ecoInstance == null || hq == null)
+        {
+            effectiveGross = 0f;
+            effectiveNet = 0f;
+            return;
+        }
+
+        float rawGross = GroundControlReflection.GetHqIncomePerMinute(ecoInstance, hq);
+        float rawNet = GroundControlReflection.GetEnemyNetIncomePerMinute(hq);
+        float upkeep = Mathf.Max(0f, rawGross - rawNet);
+
+        float baseIncome = GroundControlReflection.GetBaseIncomePerMinute();
+        float capturedBaseIncome = BaseCaptureIncomeService.GetCapturedBaseIncomePerMinute(hq);
+        float stipendIncome = GroundControlReflection.GetAiStipendPerMinute(hq, GroundControlReflection.GetLocalHq());
+        float rawBldgIncome = Mathf.Max(0f, rawGross - baseIncome - stipendIncome - capturedBaseIncome);
+
+        float mineMult = profile.IsVanilla
+            ? (GroundControlReflection.GetEnemyDifficulty() == 1 ? GroundControlReflection.GetEnemyMineIncomeMultiplier() : 1f)
+            : Mathf.Max(0f, profile.MineIncomeMultiplier);
+
+        effectiveGross = baseIncome + capturedBaseIncome + stipendIncome + rawBldgIncome * mineMult;
+        effectiveNet = effectiveGross - upkeep;
+    }
+
     internal static int GetEffectiveMaxGoldMines(object? ecoInstance, FactionHQ hq, in AiEconomyProfile profile)
     {
         if (ecoInstance == null
@@ -180,15 +224,15 @@ internal static class AiEconomySettings
             return profile.MaxGoldMines;
         }
 
-        float enemyGross = GroundControlReflection.GetHqIncomePerMinute(ecoInstance, hq);
-        float enemyNet = GroundControlReflection.GetEnemyNetIncomePerMinute(hq);
+        GetEffectiveAiIncome(ecoInstance, hq, profile, out float enemyGross, out float enemyNet);
         float enemyUpkeep = Mathf.Max(0f, enemyGross - enemyNet);
         float targetGross = TryGetPlayerReferenceEconomy(ecoInstance, out float playerGross, out int playerGoldMines, out _)
             ? playerGross * profile.FairPlayIncomeCapMultiplier
             : 0f;
 
         float neededGross = Mathf.Max(profile.NetIncomeTarget + enemyUpkeep, targetGross);
-        int minesForTarget = Mathf.CeilToInt(neededGross / 300f) + 1;
+        float perGoldMineRate = 300f * Mathf.Max(0.25f, profile.MineIncomeMultiplier);
+        int minesForTarget = Mathf.CeilToInt(neededGross / perGoldMineRate) + 1;
         int effectiveMax = Mathf.Max(profile.MaxGoldMines, Mathf.Max(playerGoldMines + 1, minesForTarget));
         return Mathf.Clamp(effectiveMax, profile.MaxGoldMines, 24);
     }
@@ -250,8 +294,10 @@ internal static class AiEconomySettings
             return false;
         }
 
+        GetEffectiveAiIncome(ecoInstance, hq, profile, out float enemyGross, out float enemyNet);
+
         // Guaranteed net floor after upkeep so defense upkeep never stalls AI economy below NetIncomeTarget.
-        if (GroundControlReflection.GetEnemyNetIncomePerMinute(hq) < profile.NetIncomeTarget)
+        if (enemyNet < profile.NetIncomeTarget)
         {
             return false;
         }
@@ -262,7 +308,6 @@ internal static class AiEconomySettings
             return true;
         }
 
-        float enemyGross = GroundControlReflection.GetHqIncomePerMinute(ecoInstance, hq);
         float targetGross = playerGross * profile.FairPlayIncomeCapMultiplier;
         float remainingGap = targetGross - enemyGross;
         float minGapRequired = pendingGain > 0f ? Mathf.Max(5f, pendingGain * 0.5f) : 5f;
@@ -271,7 +316,8 @@ internal static class AiEconomySettings
 
     internal static bool IsIncomeUpgradeBlocked(object ecoInstance, FactionHQ hq, in AiEconomyProfile profile)
     {
-        float gain = GetNextIncomeUpgradeGain(ecoInstance, hq);
+        float mult = profile.IsVanilla ? 1f : Mathf.Max(0f, profile.MineIncomeMultiplier);
+        float gain = GetNextIncomeUpgradeGain(ecoInstance, hq) * mult;
         return IsExceedingFairPlayIncomeCap(ecoInstance, hq, profile, gain);
     }
 
@@ -285,7 +331,8 @@ internal static class AiEconomySettings
             return true;
         }
 
-        float gain = GetNextMineBuildGain(ecoInstance, hq);
+        float mult = profile.IsVanilla ? 1f : Mathf.Max(0f, profile.MineIncomeMultiplier);
+        float gain = GetNextMineBuildGain(ecoInstance, hq) * mult;
         return IsExceedingFairPlayIncomeCap(ecoInstance, hq, profile, gain);
     }
 
@@ -296,7 +343,8 @@ internal static class AiEconomySettings
             return false;
         }
 
-        if (GroundControlReflection.GetEnemyNetIncomePerMinute(hq) < profile.NetIncomeTarget)
+        GetEffectiveAiIncome(ecoInstance, hq, profile, out float enemyGross, out float enemyNet);
+        if (enemyNet < profile.NetIncomeTarget)
         {
             return true;
         }
@@ -306,12 +354,85 @@ internal static class AiEconomySettings
             && TryGetPlayerReferenceEconomy(ecoInstance, out float playerGross, out _, out _)
             && playerGross > 0f)
         {
-            float enemyGross = GroundControlReflection.GetHqIncomePerMinute(ecoInstance, hq);
             float targetGross = playerGross * profile.FairPlayIncomeCapMultiplier;
-            float nextGain = GetNextMineBuildGain(ecoInstance, hq);
+            float mult = profile.IsVanilla ? 1f : Mathf.Max(0f, profile.MineIncomeMultiplier);
+            float nextGain = GetNextMineBuildGain(ecoInstance, hq) * mult;
             return (targetGross - enemyGross) >= Mathf.Max(5f, nextGain * 0.5f);
         }
 
         return false;
+    }
+
+    internal static AiIncomePriorityKind EvaluatePriorityIncomeAction(
+        object? ecoInstance,
+        FactionHQ? hq,
+        in AiEconomyProfile profile,
+        out float cost,
+        out bool isGoldMine)
+    {
+        cost = 0f;
+        isGoldMine = false;
+        if (profile.IsVanilla || ecoInstance == null || hq == null)
+        {
+            return AiIncomePriorityKind.None;
+        }
+
+        // Never starve the very first depot needed to field builders/capture vehicles.
+        if (GroundControlReflection.CountBuildings(hq, BuildingType.DEP) < 1)
+        {
+            return AiIncomePriorityKind.None;
+        }
+
+        int totalMines = GroundControlReflection.CountMines(ecoInstance, hq);
+        // Allow 1 cheap Radar Station (50 Cr) early without delaying a Gold Mine.
+        if (GroundControlReflection.CountBuildings(hq, BuildingType.RDR) == 0
+            && totalMines >= 1
+            && hq.factionFunds < 380f)
+        {
+            return AiIncomePriorityKind.None;
+        }
+
+        // Priority 1: Upgrade existing income buildings (4.0-5.2 min payback, best ROI in game).
+        if (GroundControlReflection.FindEnemyIncomeUpgrade(ecoInstance, hq, out float upgCost) != null
+            && upgCost > 0f
+            && !IsIncomeUpgradeBlocked(ecoInstance, hq, profile))
+        {
+            cost = upgCost;
+            isGoldMine = upgCost >= 350f;
+            return AiIncomePriorityKind.UpgradeIncome;
+        }
+
+        // Priority 2: Build Gas Terminals / Gold Mines before extra Depots, Bunkers, and Docks.
+        int goldMines = GroundControlReflection.CountGoldMines(ecoInstance, hq);
+        GetEffectiveAiIncome(ecoInstance, hq, profile, out float enemyGross, out float enemyNet);
+        int bestDepot = GroundControlReflection.GetBestDepotLevel(hq);
+
+        bool behindPlayer = TryGetPlayerReferenceEconomy(ecoInstance, out float playerGross, out _, out _)
+            && playerGross > 0f
+            && enemyGross < playerGross * 0.90f;
+
+        // Unlock first Depot L2 right after Gold Mine #1 is established/upgraded.
+        bool allowFirstDepotL2 = bestDepot < 2
+            && goldMines >= 1
+            && enemyGross >= 400f
+            && GroundControlReflection.HasBaseWithoutUpgradedDepot(ecoInstance, hq);
+
+        if (!allowFirstDepotL2
+            && (goldMines == 0 || enemyGross < 450f || (enemyNet < profile.NetIncomeTarget && goldMines < 2) || behindPlayer)
+            && !IsMineBuildBlocked(ecoInstance, hq, profile)
+            && GroundControlReflection.HasAnyBlueprintRoom(hq))
+        {
+            int pendingIncome = GroundControlReflection.CountPendingIncomeBlueprints(ecoInstance, hq);
+            if (pendingIncome == 0 || (totalMines < 2 && pendingIncome < 2))
+            {
+                object? nextKind = GroundControlReflection.ChooseEnemyIncomeKind(ecoInstance, hq);
+                isGoldMine = GroundControlReflection.IsMineBuildKind(nextKind);
+                float nextCost = GroundControlReflection.GetEnemyIncomeReserve(ecoInstance, hq, nextKind);
+                cost = Mathf.Max(isGoldMine ? 1f : 40f, nextCost);
+                return AiIncomePriorityKind.BuildMine;
+            }
+        }
+
+        return AiIncomePriorityKind.None;
     }
 }

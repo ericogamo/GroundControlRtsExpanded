@@ -155,3 +155,27 @@ internal static class CommanderLogSpamPatch
         return KeyBuilder.ToString();
     }
 }
+
+[HarmonyPatch]
+internal static class SceneComponentCacheInvalidationPatches
+{
+    private static IEnumerable<MethodBase> TargetMethods()
+    {
+        MethodBase? reg = AccessTools.Method(typeof(UnitRegistry), nameof(UnitRegistry.RegisterUnit), new[] { typeof(Unit), typeof(PersistentID) });
+        if (reg != null) yield return reg;
+
+        MethodBase? disable = AccessTools.Method(typeof(UnitRegistry), "Registry_OnUnitDisable", new[] { typeof(Unit) });
+        if (disable != null) yield return disable;
+
+        MethodBase? clear = AccessTools.Method(typeof(UnitRegistry), nameof(UnitRegistry.Clear));
+        if (clear != null) yield return clear;
+
+        MethodBase? init = AccessTools.Method(typeof(Unit), nameof(Unit.InitializeUnit));
+        if (init != null) yield return init;
+    }
+
+    private static void Postfix()
+    {
+        SceneComponentCache.BumpGeneration();
+    }
+}

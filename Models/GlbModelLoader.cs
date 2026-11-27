@@ -386,7 +386,8 @@ internal static class GlbModelLoader
                 continue;
             }
 
-            int? outputAccIdx = samplers[samplerIdx.Value]?["output"]?.Value<int?>();
+            JObject? samplerObj = samplers[samplerIdx.Value] as JObject;
+            int? outputAccIdx = samplerObj?["output"]?.Value<int?>();
             if (!outputAccIdx.HasValue)
             {
                 continue;
@@ -399,6 +400,11 @@ internal static class GlbModelLoader
                 continue;
             }
 
+            string? interpolation = samplerObj?["interpolation"]?.Value<string>();
+            int sampleIndex = string.Equals(interpolation, "CUBICSPLINE", StringComparison.OrdinalIgnoreCase) && count >= 3
+                ? count - 2
+                : count - 1;
+
             if (!result.TryGetValue(nodeIdx.Value, out NodeTransformOverride? ov))
             {
                 ov = new NodeTransformOverride();
@@ -408,7 +414,7 @@ internal static class GlbModelLoader
             if (string.Equals(path, "translation", StringComparison.OrdinalIgnoreCase))
             {
                 int elemStride = stride > 0 ? stride : 12;
-                int pos = baseOffset + ((count - 1) * elemStride);
+                int pos = baseOffset + (sampleIndex * elemStride);
                 if (pos + 12 <= binChunk.Length)
                 {
                     float x = BitConverter.ToSingle(binChunk, pos);
@@ -420,7 +426,7 @@ internal static class GlbModelLoader
             else if (string.Equals(path, "rotation", StringComparison.OrdinalIgnoreCase))
             {
                 int elemStride = stride > 0 ? stride : 16;
-                int pos = baseOffset + ((count - 1) * elemStride);
+                int pos = baseOffset + (sampleIndex * elemStride);
                 if (pos + 16 <= binChunk.Length)
                 {
                     float x = BitConverter.ToSingle(binChunk, pos);
@@ -435,7 +441,7 @@ internal static class GlbModelLoader
             else if (string.Equals(path, "scale", StringComparison.OrdinalIgnoreCase))
             {
                 int elemStride = stride > 0 ? stride : 12;
-                int pos = baseOffset + ((count - 1) * elemStride);
+                int pos = baseOffset + (sampleIndex * elemStride);
                 if (pos + 12 <= binChunk.Length)
                 {
                     float x = BitConverter.ToSingle(binChunk, pos);
@@ -454,7 +460,11 @@ internal static class GlbModelLoader
         NodeTransformOverride? ov = null;
         bool hasAnimOverride = animOverrides != null && animOverrides.TryGetValue(nodeIndex, out ov) && ov.HasAny;
 
-        if (!hasAnimOverride && node["matrix"] is JArray m && m.Count == 16)
+        Vector3 t = Vector3.zero;
+        Quaternion r = Quaternion.identity;
+        Vector3 s = Vector3.one;
+
+        if (node["matrix"] is JArray m && m.Count == 16)
         {
             var mat = new Matrix4x4();
             for (int col = 0; col < 4; col++)
@@ -467,45 +477,100 @@ internal static class GlbModelLoader
 
             // Convert right-handed matrix into Unity left-handed X-negated basis: F * M * F where F = diag(-1, 1, 1, 1)
             Matrix4x4 flip = Matrix4x4.Scale(new Vector3(-1f, 1f, 1f));
-            return flip * mat * flip;
+            Matrix4x4 unityMat = flip * mat * flip;
+            if (!hasAnimOverride)
+            {
+                return unityMat;
+            }
+
+            DecomposeMatrix(unityMat, out t, out r, out s);
+        }
+        else
+        {
+            if (node["translation"] is JArray ta && ta.Count >= 3)
+            {
+                t = new Vector3(-ta[0].Value<float>(), ta[1].Value<float>(), ta[2].Value<float>());
+            }
+
+            if (node["rotation"] is JArray ra && ra.Count >= 4)
+            {
+                // Right-handed (x, y, z, w) -> left-handed X-mirrored (x, -y, -z, w)
+                r = new Quaternion(
+                    ra[0].Value<float>(),
+                    -ra[1].Value<float>(),
+                    -ra[2].Value<float>(),
+                    ra[3].Value<float>());
+            }
+
+            if (node["scale"] is JArray sa && sa.Count >= 3)
+            {
+                s = new Vector3(sa[0].Value<float>(), sa[1].Value<float>(), sa[2].Value<float>());
+            }
         }
 
-        Vector3 t = Vector3.zero;
         if (ov?.Translation != null)
         {
             t = ov.Translation.Value;
         }
-        else if (node["translation"] is JArray ta && ta.Count >= 3)
-        {
-            t = new Vector3(-ta[0].Value<float>(), ta[1].Value<float>(), ta[2].Value<float>());
-        }
 
-        Quaternion r = Quaternion.identity;
         if (ov?.Rotation != null)
         {
             r = ov.Rotation.Value;
         }
-        else if (node["rotation"] is JArray ra && ra.Count >= 4)
-        {
-            // Right-handed (x, y, z, w) -> left-handed X-mirrored (x, -y, -z, w)
-            r = new Quaternion(
-                ra[0].Value<float>(),
-                -ra[1].Value<float>(),
-                -ra[2].Value<float>(),
-                ra[3].Value<float>());
-        }
 
-        Vector3 s = Vector3.one;
         if (ov?.Scale != null)
         {
             s = ov.Scale.Value;
         }
-        else if (node["scale"] is JArray sa && sa.Count >= 3)
-        {
-            s = new Vector3(sa[0].Value<float>(), sa[1].Value<float>(), sa[2].Value<float>());
-        }
 
         return Matrix4x4.TRS(t, r, s);
+    }
+
+    private static void DecomposeMatrix(
+        Matrix4x4 mat,
+        out Vector3 translation,
+        out Quaternion rotation,
+        out Vector3 scale)
+    {
+        translation = new Vector3(mat.m03, mat.m13, mat.m23);
+
+        var col0 = new Vector3(mat.m00, mat.m10, mat.m20);
+        var col1 = new Vector3(mat.m01, mat.m11, mat.m21);
+        var col2 = new Vector3(mat.m02, mat.m12, mat.m22);
+
+        float sx = col0.magnitude;
+        float sy = col1.magnitude;
+        float sz = col2.magnitude;
+
+        if (Vector3.Dot(Vector3.Cross(col0, col1), col2) < 0f)
+        {
+            sx = -sx;
+            col0 = -col0;
+        }
+
+        scale = new Vector3(sx, sy, sz);
+
+        if (sz > 1e-6f && sy > 1e-6f)
+        {
+            Vector3 fwd = col2 / sz;
+            Vector3 up = col1 / sy;
+            rotation = Vector3.Cross(up, fwd).sqrMagnitude > 1e-6f
+                ? Quaternion.LookRotation(fwd, up)
+                : Quaternion.identity;
+        }
+        else if (Mathf.Abs(sx) > 1e-6f && sy > 1e-6f)
+        {
+            Vector3 right = col0 / Mathf.Abs(sx);
+            Vector3 up = col1 / sy;
+            Vector3 fwd = Vector3.Cross(right, up);
+            rotation = fwd.sqrMagnitude > 1e-6f
+                ? Quaternion.LookRotation(fwd.normalized, up)
+                : Quaternion.identity;
+        }
+        else
+        {
+            rotation = Quaternion.identity;
+        }
     }
 
     private static void ExtractMeshPrimitives(

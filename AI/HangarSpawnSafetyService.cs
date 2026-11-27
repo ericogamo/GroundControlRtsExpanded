@@ -1,6 +1,8 @@
+using System;
 using System.Collections.Generic;
 using System.Reflection;
 using HarmonyLib;
+using Mirage;
 using NuclearOption.Networking;
 using UnityEngine;
 
@@ -34,7 +36,8 @@ internal sealed class HangarSpawnSafetyService : IAddonResetSession
     private static readonly FieldInfo? SelectionNoHangarsPanelField = AccessTools.Field(typeof(AircraftSelectionMenu), "noHangarsPanel");
 
     private readonly Dictionary<Hangar, BayReservation> reservations = new();
-    private readonly Collider[] overlapBuffer = new Collider[48];
+    private readonly Dictionary<INetworkPlayer, float> lastRemoteNoticeByPlayer = new();
+    private readonly Collider[] overlapBuffer = new Collider[128];
     private float lastNoticeTime = -100f;
 
     internal static HangarSpawnSafetyService Instance { get; } = new();
@@ -42,6 +45,7 @@ internal sealed class HangarSpawnSafetyService : IAddonResetSession
     public void ResetSession()
     {
         reservations.Clear();
+        lastRemoteNoticeByPlayer.Clear();
         lastNoticeTime = -100f;
     }
 
@@ -257,7 +261,7 @@ internal sealed class HangarSpawnSafetyService : IAddonResetSession
             }
         }
 
-        // Check 3: Physical overlap probe (catches disabled aircraft wrecks and ground vehicles in the bay).
+        // Check 3: Physical overlap probe (catches disabled aircraft wrecks, ground vehicles, and detached vehicle wreckage in the bay).
         float probeRadius = Mathf.Clamp(incomingSpan * 0.5f + 10f, 16f, 34f);
         int hitCount = Physics.OverlapSphereNonAlloc(
             spawnPos,
@@ -266,74 +270,121 @@ internal sealed class HangarSpawnSafetyService : IAddonResetSession
             PhysicsLayers.DefaultMask,
             QueryTriggerInteraction.Ignore);
 
-        for (int i = 0; i < hitCount; i++)
+        Collider[] hits = overlapBuffer;
+        int count = hitCount;
+        if (hitCount >= overlapBuffer.Length)
         {
-            Collider? col = overlapBuffer[i];
-            overlapBuffer[i] = null!;
-            if (col == null || col.gameObject.layer == PhysicsLayers.IgnoreCollisions)
-            {
-                continue;
-            }
+            hits = Physics.OverlapSphere(
+                spawnPos,
+                probeRadius,
+                PhysicsLayers.DefaultMask,
+                QueryTriggerInteraction.Ignore);
+            count = hits.Length;
+        }
 
-            Unit? unit = ResolveUnitFromCollider(col);
-            if (unit == null || ReferenceEquals(unit, hangar.attachedUnit))
+        try
+        {
+            for (int i = 0; i < count; i++)
             {
-                continue;
-            }
+                Collider? col = hits[i];
+                if (col == null || col.gameObject.layer == PhysicsLayers.IgnoreCollisions)
+                {
+                    continue;
+                }
 
-            if (unit is Building || unit is Ship || unit is Scenery)
-            {
-                continue;
-            }
+                Unit? unit = ResolveUnitFromCollider(col);
+                if (unit == null)
+                {
+                    Wreckage? wreck = col.GetComponentInParent<Wreckage>();
+                    if (wreck != null)
+                    {
+                        Vector3 closestWreck = GetSafeClosestPoint(col, spawnPos);
+                        if (IsInsideBayFootprint(
+                            closestWreck - spawnPos,
+                            spawnTf,
+                            incomingWidth * 0.5f + 2f,
+                            incomingLength * 0.5f + 2f,
+                            incomingLength * 0.5f + 4f,
+                            10f))
+                        {
+                            reason = "vehicle wreckage is blocking this bay";
+                            return true;
+                        }
+                    }
 
-            if (unit is Aircraft previewAc && !previewAc.networked)
-            {
-                continue;
-            }
+                    continue;
+                }
 
-            bool isAircraft = unit is Aircraft;
-            bool isVehicle = unit is GroundVehicle;
-            if (!isAircraft && !isVehicle)
-            {
-                continue;
-            }
+                if (ReferenceEquals(unit, hangar.attachedUnit))
+                {
+                    continue;
+                }
 
-            Vector3 closest = GetSafeClosestPoint(col, spawnPos);
-            Vector3 localDelta = closest - spawnPos;
+                if (unit is Building || unit is Ship || unit is Scenery)
+                {
+                    continue;
+                }
 
-            if (isAircraft)
-            {
-                if (IsInsideBayFootprint(
+                if (unit is Aircraft previewAc && !previewAc.networked)
+                {
+                    continue;
+                }
+
+                bool isAircraft = unit is Aircraft;
+                bool isVehicle = unit is GroundVehicle;
+                if (!isAircraft && !isVehicle)
+                {
+                    continue;
+                }
+
+                Vector3 closest = GetSafeClosestPoint(col, spawnPos);
+                Vector3 localDelta = closest - spawnPos;
+
+                if (isAircraft)
+                {
+                    if (IsInsideBayFootprint(
+                        localDelta,
+                        spawnTf,
+                        incomingWidth * 0.5f + 4f,
+                        incomingLength * 0.5f + 4f,
+                        incomingLength * 0.5f + 10f,
+                        14f))
+                    {
+                        reason = unit.disabled
+                            ? "aircraft wreckage is blocking this bay"
+                            : "an aircraft is obstructing this bay";
+                        return true;
+                    }
+                }
+                else if (IsInsideBayFootprint(
                     localDelta,
                     spawnTf,
-                    incomingWidth * 0.5f + 4f,
+                    incomingWidth * 0.5f + 2f,
+                    incomingLength * 0.5f + 2f,
                     incomingLength * 0.5f + 4f,
-                    incomingLength * 0.5f + 10f,
-                    14f))
+                    10f))
                 {
-                    reason = unit.disabled
-                        ? "aircraft wreckage is blocking this bay"
-                        : "an aircraft is obstructing this bay";
+                    reason = "a ground vehicle is inside this bay";
                     return true;
                 }
             }
-            else if (IsInsideBayFootprint(
-                localDelta,
-                spawnTf,
-                incomingWidth * 0.5f + 2f,
-                incomingLength * 0.5f + 2f,
-                incomingLength * 0.5f + 4f,
-                10f))
+        }
+        finally
+        {
+            if (hitCount > 0)
             {
-                reason = "a ground vehicle is inside this bay";
-                return true;
+                Array.Clear(overlapBuffer, 0, Math.Min(hitCount, overlapBuffer.Length));
             }
         }
 
         return false;
     }
 
-    internal bool HasAnySafetyBlockedCompatibleHangar(Airbase? airbase, AircraftDefinition? definition, out string reason)
+    internal bool HasAnySafetyBlockedCompatibleHangar(
+        Airbase? airbase,
+        AircraftDefinition? definition,
+        out string reason,
+        Player? requestingPlayer = null)
     {
         reason = string.Empty;
         if (airbase == null || definition == null || airbase.disabled || airbase.hangars == null)
@@ -349,7 +400,7 @@ internal sealed class HangarSpawnSafetyService : IAddonResetSession
                 continue;
             }
 
-            if (IsHangarBlocked(hangar, null, definition, out reason))
+            if (IsHangarBlocked(hangar, requestingPlayer, definition, out reason))
             {
                 return true;
             }
@@ -406,6 +457,30 @@ internal sealed class HangarSpawnSafetyService : IAddonResetSession
         lastNoticeTime = now;
         string details = string.IsNullOrWhiteSpace(reason) ? "bay occupied by AI spawn" : reason;
         GroundControlReflection.NoticeFail($"Hangar bay locked for safety ({details}) — wait a moment or pick another airbase.");
+    }
+
+    internal void NotifyRemotePlayerBlocked(Player? player, string reason)
+    {
+        if (player == null || player.IsLocalPlayer)
+        {
+            return;
+        }
+
+        INetworkPlayer? netPlayer = player.Owner;
+        if (netPlayer == null)
+        {
+            return;
+        }
+
+        float now = Time.unscaledTime;
+        if (lastRemoteNoticeByPlayer.TryGetValue(netPlayer, out float lastAt) && now - lastAt < NoticeCooldownSeconds)
+        {
+            return;
+        }
+
+        lastRemoteNoticeByPlayer[netPlayer] = now;
+        string details = string.IsNullOrWhiteSpace(reason) ? "bay occupied by AI spawn" : reason;
+        GcreNetworkSync.SendPlayerNotice(netPlayer, $"Hangar bay locked for safety ({details}) — wait a moment or pick another airbase.");
     }
 
     private BayReservation GetOrCreateReservation(Hangar hangar)

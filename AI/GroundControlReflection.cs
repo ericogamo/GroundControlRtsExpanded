@@ -125,12 +125,15 @@ internal static class GroundControlReflection
     internal static readonly FieldInfo? EcoNextLedgerAtField = AccessTools.Field(EconomyServiceType, "nextLedgerAt");
     internal static readonly MethodInfo? EcoRefreshCatalogMethod = AccessTools.Method(EconomyServiceType, "RefreshCatalog", Type.EmptyTypes);
     internal static readonly FieldInfo? EcoCatalogListField = AccessTools.Field(EconomyServiceType, "catalog");
+    internal static readonly MethodInfo? EcoIsEnemyMineOpenMethod = AccessTools.Method(EconomyServiceType, "IsEnemyMineOpen", new[] { typeof(FactionHQ) });
+    internal static readonly MethodInfo? EcoIsIncomeKindMethod = FindMethodByNameAndParamCount(EconomyServiceType, "IsIncomeKind", 1);
     internal static readonly MethodInfo? AirbaseCaptureFactionMethod = AccessTools.Method(typeof(Airbase), "CaptureFaction", new[] { typeof(FactionHQ) });
     internal static readonly PropertyInfo? NetworkIsGuestProp = AccessTools.Property(NetworkType, "IsGuest");
 
     // CommanderEnemyCommanderService members
     internal static readonly PropertyInfo? EnemyInstanceProp = AccessTools.Property(EnemyCommanderType, "Instance");
     internal static readonly MethodInfo? IsAiFactionMethod = AccessTools.Method(EnemyCommanderType, "IsAiFaction", new[] { typeof(FactionHQ), typeof(FactionHQ) });
+    internal static readonly PropertyInfo? EnemyEffectiveModeProp = AccessTools.Property(EnemyCommanderType, "EffectiveMode");
     internal static readonly MethodInfo? EnemyHasHumanPlayersMethod = AccessTools.Method(EnemyCommanderType, "HasHumanPlayers", new[] { typeof(FactionHQ) });
     internal static readonly PropertyInfo? EnemyBothSidesProp = AccessTools.Property(EnemyCommanderType, "BothSides");
     internal static readonly PropertyInfo? SettingsHumanTeamsProp = AccessTools.Property(SettingsType, "EnemyCommanderHumanTeams");
@@ -240,6 +243,12 @@ internal static class GroundControlReflection
     internal static readonly PropertyInfo? StateNavalFundProp = AccessTools.Property(CommanderStateType, "NavalFund");
     internal static readonly PropertyInfo? StateWarFundAtProp = AccessTools.Property(CommanderStateType, "WarFundAt");
     internal static readonly PropertyInfo? StateBrokeProp = AccessTools.Property(CommanderStateType, "Broke");
+    internal static readonly PropertyInfo? StatePendingAirBuysProp = AccessTools.Property(CommanderStateType, "PendingAirBuys");
+    internal static readonly MethodInfo? EnemyGetSavedBuildReserveMethod = CommanderStateType != null ? AccessTools.Method(EnemyCommanderType, "GetSavedBuildReserve", new[] { typeof(FactionHQ), CommanderStateType, typeof(bool) }) : null;
+    internal static readonly MethodInfo? EnemyTakeWarFundMethod = CommanderStateType != null ? AccessTools.Method(EnemyCommanderType, "TakeWarFund", new[] { typeof(FactionHQ), CommanderStateType }) : null;
+    internal static readonly MethodInfo? EnemyTryBuySiteRadarMethod = CommanderStateType != null ? AccessTools.Method(EnemyCommanderType, "TryBuySiteRadar", new[] { typeof(FactionHQ), CommanderStateType }) : null;
+    internal static readonly MethodInfo? EnemyTryBuyFireControlMethod = CommanderStateType != null ? AccessTools.Method(EnemyCommanderType, "TryBuyFireControl", new[] { typeof(FactionHQ), CommanderStateType, typeof(float) }) : null;
+    internal static readonly MethodInfo? EnemyReviewRadarSamWhileBrokeMethod = CommanderStateType != null ? AccessTools.Method(EnemyCommanderType, "ReviewRadarSamWhileBroke", new[] { typeof(FactionHQ), CommanderStateType }) : null;
 
     // Additional CommanderEnemyCommanderService tactical AI members
     internal static readonly MethodInfo? EnemyBuyAirframeMethod = FindMethodByNameAndParamCount(EnemyCommanderType, "BuyAirframe", 5);
@@ -776,6 +785,8 @@ internal static class GroundControlReflection
             ("CommanderEconomyService.HasBaseWithoutUpgradedDepot", EcoHasBaseWithoutUpgradedDepotMethod),
             ("CommanderEconomyService.CountBuildings", EcoCountBuildingsMethod),
             ("CommanderEconomyService.GetEnemyIncomeReserve(2)", EcoGetEnemyIncomeReserveMethod),
+            ("CommanderEconomyService.IsEnemyMineOpen", EcoIsEnemyMineOpenMethod),
+            ("CommanderEconomyService.IsIncomeKind(1)", EcoIsIncomeKindMethod),
             ("CommanderUnitCap.FactoriesPerBase", UnitCapFactoriesPerBaseMethod),
             ("CommanderNavalPurchaseService", NavalPurchaseServiceType),
             ("CommanderNavalPurchaseService.GetRequiredDockLevel", NavalGetRequiredDockLevelMethod),
@@ -791,7 +802,14 @@ internal static class GroundControlReflection
             ("CommanderState.AirSaveCap", StateAirSaveCapProp),
             ("CommanderState.SamFund", StateSamFundProp),
             ("CommanderState.MineFund", StateMineFundProp),
+            ("CommanderState.PendingAirBuys", StatePendingAirBuysProp),
+            ("CommanderEnemyCommanderService.GetSavedBuildReserve", EnemyGetSavedBuildReserveMethod),
+            ("CommanderEnemyCommanderService.TakeWarFund", EnemyTakeWarFundMethod),
+            ("CommanderEnemyCommanderService.TryBuySiteRadar", EnemyTryBuySiteRadarMethod),
+            ("CommanderEnemyCommanderService.TryBuyFireControl", EnemyTryBuyFireControlMethod),
+            ("CommanderEnemyCommanderService.ReviewRadarSamWhileBroke", EnemyReviewRadarSamWhileBrokeMethod),
             ("CommanderEnemyCommanderService.IsAiFaction", IsAiFactionMethod),
+            ("CommanderEnemyCommanderService.EffectiveMode", EnemyEffectiveModeProp),
             ("CommanderEnemyCommanderService.IsChallenging", IsChallengingMethod),
             ("CommanderEnemyCommanderService.IsChampionsMission", IsChampionsMissionProp),
             ("CommanderEnemyCommanderService.IsDuelMission", IsDuelMissionProp),
@@ -1391,22 +1409,35 @@ internal static class GroundControlReflection
     internal static bool IsBothSidesMode()
         => EnemyBothSidesProp?.GetValue(null) is bool b && b;
 
+    internal static int GetEnemyEffectiveMode()
+        => EnemyEffectiveModeProp?.GetValue(null) is int mode ? mode : 0;
+
     internal static bool IsHumanTeamAiEnabled()
         => SettingsHumanTeamsProp?.GetValue(null) is bool b && b;
 
     internal static bool IsSafeAiFaction(FactionHQ? hq, FactionHQ? localHq)
     {
-        if (hq == null || !IsAiFaction(hq, localHq))
+        if (hq == null || hq.faction == null || !((Mirage.NetworkBehaviour)hq).IsServer)
         {
             return false;
         }
 
-        if (HasHumanPlayers(hq) && !IsHumanTeamAiEnabled() && !IsBothSidesMode())
+        if (IsAiFaction(hq, localHq))
         {
-            return false;
+            if (HasHumanPlayers(hq) && !IsHumanTeamAiEnabled() && !IsBothSidesMode())
+            {
+                return false;
+            }
+
+            return true;
         }
 
-        return true;
+        // In BothSides (AI vs AI) mode, CommanderNetwork.RotateLocalSide() rotates ActingHq (localHq)
+        // across all HQs every 30s, causing CommanderEnemyCommanderService.IsAiFaction(hq, localHq)
+        // to return false while hq == localHq. Keep pure AI factions classified as AI.
+        return IsBothSidesMode()
+            && GetEnemyEffectiveMode() != 0
+            && !HasHumanPlayers(hq);
     }
 
     internal static FactionHQ? FindPrimaryHostileHq(FactionHQ? ownHq)
@@ -1511,6 +1542,78 @@ internal static class GroundControlReflection
 
     internal static bool IsMineBuildKind(object? kind)
         => kind != null && BuildKindMineValue != null && Equals(kind, BuildKindMineValue);
+
+    internal static bool IsIncomeBuildKind(object? kind)
+    {
+        if (kind == null)
+        {
+            return false;
+        }
+
+        if (EcoIsIncomeKindMethod != null && EcoIsIncomeKindMethod.Invoke(null, new[] { kind }) is bool isIncome)
+        {
+            return isIncome;
+        }
+
+        return IsMineBuildKind(kind);
+    }
+
+    internal static int CountPendingIncomeBlueprints(object? ecoInstance, FactionHQ? hq)
+    {
+        if (ecoInstance == null || hq == null || EcoConstructionSitesField?.GetValue(ecoInstance) is not IList sites)
+        {
+            return 0;
+        }
+
+        int count = 0;
+        for (int i = 0; i < sites.Count; i++)
+        {
+            object? site = sites[i];
+            if (site == null
+                || SiteHqProp?.GetValue(site) is not FactionHQ siteHq
+                || !ReferenceEquals(siteHq, hq))
+            {
+                continue;
+            }
+
+            if (IsIncomeBuildKind(SiteKindProp?.GetValue(site)))
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    internal static bool TryUpgradeEnemyIncome(object? ecoInstance, FactionHQ? hq, float reserveMultiple)
+        => ecoInstance != null && hq != null && TryUpgradeEnemyIncomeMethod?.Invoke(ecoInstance, new object?[] { hq, reserveMultiple }) is bool ok && ok;
+
+    internal static bool TryBuildEnemyMine(object? ecoInstance, FactionHQ? hq)
+        => ecoInstance != null && hq != null && TryBuildEnemyMineMethod?.Invoke(ecoInstance, new object?[] { hq }) is bool ok && ok;
+
+    internal static bool HasNeutralCapturableAirbases()
+    {
+        if (FactionRegistry.airbaseLookup == null)
+        {
+            return false;
+        }
+
+        foreach (Airbase ab in FactionRegistry.airbaseLookup.Values)
+        {
+            if (ab != null
+                && !ab.disabled
+                && ab.center != null
+                && ab.CurrentHQ == null
+                && ab.SavedAirbase != null
+                && ab.SavedAirbase.Capturable
+                && IsLandBase(ab))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     internal static float GetEnemyIncomeReserve(object? ecoInstance, FactionHQ? hq, object? kind)
     {
@@ -1676,6 +1779,14 @@ internal static class GroundControlReflection
         => state != null && prop?.GetValue(state) is float v ? v : 0f;
 
     internal static void SetStateFloat(object? state, PropertyInfo? prop, float value)
+    {
+        if (state != null && prop != null)
+        {
+            prop.SetValue(state, value);
+        }
+    }
+
+    internal static void SetStateInt(object? state, PropertyInfo? prop, int value)
     {
         if (state != null && prop != null)
         {
@@ -2908,7 +3019,6 @@ internal static class GroundControlReflection
         }
 
         DriveTargetProp?.SetValue(drive, null);
-        DriveOwnerProp?.SetValue(drive, null);
         DriveAnnouncedProp?.SetValue(drive, 0);
         DriveMarchSinceProp?.SetValue(drive, 0f);
     }

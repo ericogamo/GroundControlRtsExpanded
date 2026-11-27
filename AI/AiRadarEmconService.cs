@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using HarmonyLib;
 using Mirage;
 using NuclearOption.Networking;
@@ -21,6 +22,8 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
     private const string ModularSiteBehaviorTypeName = "MDSFramework.Sensors.ModularSiteBehavior";
 
     private static readonly Type? ModularSiteBehaviorType = AccessTools.TypeByName(ModularSiteBehaviorTypeName);
+    private static readonly MethodInfo? CommanderIsUnitRadarOfflineMethod =
+        AccessTools.Method(GroundControlReflection.CommanderRadarServiceType, "IsUnitRadarOffline", new[] { typeof(Unit) });
 
     private sealed class RadarUnitEntry
     {
@@ -54,6 +57,27 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
 
     private AiRadarEmconService()
     {
+    }
+
+    internal void CollectInactiveEmconUnitIds(List<PersistentID> output)
+    {
+        if (output == null)
+        {
+            return;
+        }
+
+        output.Clear();
+        for (int i = 0; i < entryList.Count; i++)
+        {
+            RadarUnitEntry entry = entryList[i];
+            if (entry.Unit != null
+                && !entry.Unit.disabled
+                && !entry.CurrentlyActive
+                && entry.Unit.persistentID.IsValid)
+            {
+                output.Add(entry.Unit.persistentID);
+            }
+        }
     }
 
     public void ResetSession()
@@ -102,12 +126,12 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
         PruneDeadEntries();
         PruneStaleArmSweeps(now);
 
-        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
         GroundControlReflection.NetworkRunAsHostTeam(() =>
         {
+            FactionHQ? localHq = GroundControlReflection.GetLocalHq();
             foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
             {
-                if (hq != null && ((NetworkBehaviour)hq).IsServer && GroundControlReflection.IsSafeAiFaction(hq, localHq))
+                if (IsEmconAiFaction(hq, localHq))
                 {
                     RefreshFactionRadarEntries(hq);
                     ProcessFactionEmcon(hq, now);
@@ -128,9 +152,10 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
         }
 
         float now = Time.time;
-        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
+        float levelNow = Time.timeSinceLevelLoad;
+        GlobalPosition missilePos = missile.GlobalPosition();
 
-        // Direct lock check on every TrackCurrentTarget call (fast O(1))
+        // Direct lock check on every TrackCurrentTarget call (fast O(1)), gated by sensor fairness
         if (targetedRadar != null && targetedRadar.activated)
         {
             Unit? directOwner = targetedRadar.GetAttachedUnit();
@@ -140,13 +165,29 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
                 && !(directOwner is Ship)
                 && directOwner.NetworkHQ != null
                 && !ReferenceEquals(directOwner.NetworkHQ, missile.NetworkHQ)
-                && GroundControlReflection.IsSafeAiFaction(directOwner.NetworkHQ, localHq)
-                && !IsMdsSite(directOwner))
+                && !GroundControlReflection.HasHumanPlayers(directOwner.NetworkHQ)
+                && !IsMdsSite(directOwner)
+                && !IsCommanderRadarOffline(directOwner)
+                && FastMath.InRange(missilePos, directOwner.GlobalPosition(), ArmThreatRadiusMeters)
+                && directOwner.NetworkHQ.trackingDatabase != null
+                && directOwner.NetworkHQ.trackingDatabase.TryGetValue(missile.persistentID, out TrackingInfo? directTrack)
+                && directTrack != null
+                && levelNow - directTrack.lastSpottedTime <= 15f)
             {
-                RadarUnitEntry? directEntry = GetOrRegisterEntry(directOwner);
-                if (directEntry != null)
+                bool isSafeAi = false;
+                GroundControlReflection.NetworkRunAsHostTeam(() =>
                 {
-                    TriggerBlinkAndHandoff(directEntry, missile, now);
+                    FactionHQ? localHq = GroundControlReflection.GetLocalHq();
+                    isSafeAi = IsEmconAiFaction(directOwner.NetworkHQ, localHq);
+                });
+
+                if (isSafeAi)
+                {
+                    RadarUnitEntry? directEntry = GetOrRegisterEntry(directOwner);
+                    if (directEntry != null)
+                    {
+                        TriggerBlinkAndHandoff(directEntry, missile, now);
+                    }
                 }
             }
         }
@@ -160,11 +201,9 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
 
         nextArmSweepByMissileId[missileId] = now + ArmSweepIntervalSeconds;
 
-        GlobalPosition missilePos = missile.GlobalPosition();
         Vector3 velDir = missile.rb != null && missile.rb.velocity.sqrMagnitude > 1f
             ? missile.rb.velocity.normalized
             : missile.transform.forward;
-        float levelNow = Time.timeSinceLevelLoad;
 
         for (int i = 0; i < entryList.Count; i++)
         {
@@ -173,7 +212,9 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
                 || entry.Unit.disabled
                 || entry.Hq == null
                 || ReferenceEquals(entry.Hq, missile.NetworkHQ)
-                || entry.Unit is Ship)
+                || GroundControlReflection.HasHumanPlayers(entry.Hq)
+                || entry.Unit is Ship
+                || IsCommanderRadarOffline(entry.Unit))
             {
                 continue;
             }
@@ -212,85 +253,86 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
 
     private void TickServerAradDetection(float now)
     {
-        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
         float levelNow = Time.timeSinceLevelLoad;
 
-        foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
+        GroundControlReflection.NetworkRunAsHostTeam(() =>
         {
-            if (hq == null
-                || !((NetworkBehaviour)hq).IsServer
-                || !GroundControlReflection.IsSafeAiFaction(hq, localHq)
-                || hq.trackingDatabase == null)
+            FactionHQ? localHq = GroundControlReflection.GetLocalHq();
+            foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
             {
-                continue;
+                if (!IsEmconAiFaction(hq, localHq) || hq.trackingDatabase == null)
+                {
+                    continue;
+                }
+
+                foreach (KeyValuePair<PersistentID, TrackingInfo> kv in hq.trackingDatabase)
+                {
+                    TrackingInfo? info = kv.Value;
+                    if (info == null
+                        || levelNow - info.lastSpottedTime > 8f
+                        || !info.TryGetUnit(out Unit unit)
+                        || unit is not Missile missile
+                        || missile.disabled
+                        || ReferenceEquals(missile.NetworkHQ, hq))
+                    {
+                        continue;
+                    }
+
+                    if (!IsAradMissile(missile))
+                    {
+                        continue;
+                    }
+
+                    int missileId = missile.GetInstanceID();
+                    if (nextArmSweepByMissileId.TryGetValue(missileId, out float nextSweepAt) && now < nextSweepAt)
+                    {
+                        continue;
+                    }
+
+                    nextArmSweepByMissileId[missileId] = now + ArmSweepIntervalSeconds;
+
+                    GlobalPosition missilePos = info.GetPosition();
+                    Vector3 velDir = missile.rb != null && missile.rb.velocity.sqrMagnitude > 1f
+                        ? missile.rb.velocity.normalized
+                        : missile.transform.forward;
+
+                    for (int i = 0; i < entryList.Count; i++)
+                    {
+                        RadarUnitEntry entry = entryList[i];
+                        if (entry.Unit == null
+                            || entry.Unit.disabled
+                            || !ReferenceEquals(entry.Hq, hq)
+                            || entry.Unit is Ship
+                            || IsCommanderRadarOffline(entry.Unit))
+                        {
+                            continue;
+                        }
+
+                        if (!entry.CurrentlyActive || now < entry.BlinkCooldownUntil || now < entry.BlinkOffUntil)
+                        {
+                            continue;
+                        }
+
+                        GlobalPosition radarPos = entry.Unit.GlobalPosition();
+                        if (!FastMath.InRange(missilePos, radarPos, ArmThreatRadiusMeters))
+                        {
+                            continue;
+                        }
+
+                        Vector3 toRadar = radarPos - missilePos;
+                        if (toRadar.sqrMagnitude < 1f)
+                        {
+                            continue;
+                        }
+
+                        if (Vector3.Dot(velDir, toRadar.normalized) > ArmThreatConeDotThreshold)
+                        {
+                            TriggerBlinkAndHandoff(entry, missile, now);
+                        }
+                    }
+                }
             }
-
-            foreach (KeyValuePair<PersistentID, TrackingInfo> kv in hq.trackingDatabase)
-            {
-                TrackingInfo? info = kv.Value;
-                if (info == null
-                    || levelNow - info.lastSpottedTime > 8f
-                    || !info.TryGetUnit(out Unit unit)
-                    || unit is not Missile missile
-                    || missile.disabled
-                    || ReferenceEquals(missile.NetworkHQ, hq))
-                {
-                    continue;
-                }
-
-                if (!IsAradMissile(missile))
-                {
-                    continue;
-                }
-
-                int missileId = missile.GetInstanceID();
-                if (nextArmSweepByMissileId.TryGetValue(missileId, out float nextSweepAt) && now < nextSweepAt)
-                {
-                    continue;
-                }
-
-                nextArmSweepByMissileId[missileId] = now + ArmSweepIntervalSeconds;
-
-                GlobalPosition missilePos = info.GetPosition();
-                Vector3 velDir = missile.rb != null && missile.rb.velocity.sqrMagnitude > 1f
-                    ? missile.rb.velocity.normalized
-                    : missile.transform.forward;
-
-                for (int i = 0; i < entryList.Count; i++)
-                {
-                    RadarUnitEntry entry = entryList[i];
-                    if (entry.Unit == null
-                        || entry.Unit.disabled
-                        || !ReferenceEquals(entry.Hq, hq)
-                        || entry.Unit is Ship)
-                    {
-                        continue;
-                    }
-
-                    if (!entry.CurrentlyActive || now < entry.BlinkCooldownUntil || now < entry.BlinkOffUntil)
-                    {
-                        continue;
-                    }
-
-                    GlobalPosition radarPos = entry.Unit.GlobalPosition();
-                    if (!FastMath.InRange(missilePos, radarPos, ArmThreatRadiusMeters))
-                    {
-                        continue;
-                    }
-
-                    Vector3 toRadar = radarPos - missilePos;
-                    if (toRadar.sqrMagnitude < 1f)
-                    {
-                        continue;
-                    }
-
-                    if (Vector3.Dot(velDir, toRadar.normalized) > ArmThreatConeDotThreshold)
-                    {
-                        TriggerBlinkAndHandoff(entry, missile, now);
-                    }
-                }
-            }
-        }
+        });
     }
 
     private bool IsAradMissile(Missile missile)
@@ -351,8 +393,10 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
             if (candidate == entry
                 || candidate.Unit == null
                 || candidate.Unit.disabled
+                || candidate.Unit is Ship
                 || !ReferenceEquals(candidate.Hq, entry.Hq)
-                || now < candidate.BlinkOffUntil)
+                || now < candidate.BlinkOffUntil
+                || IsCommanderRadarOffline(candidate.Unit))
             {
                 continue;
             }
@@ -396,7 +440,7 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
 
         foreach (PersistentID pid in hq.factionUnits)
         {
-            if (!pid.TryGetUnit(out Unit unit) || unit == null || unit.disabled || unit is Aircraft)
+            if (!pid.TryGetUnit(out Unit unit) || unit == null || unit.disabled || unit is Aircraft || unit is Ship)
             {
                 continue;
             }
@@ -417,7 +461,7 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
             return existing;
         }
 
-        if (unit == null || unit.disabled || unit.NetworkHQ == null || unit is Aircraft || IsMdsSite(unit))
+        if (unit == null || unit.disabled || unit.NetworkHQ == null || unit is Aircraft || unit is Ship || IsMdsSite(unit))
         {
             return null;
         }
@@ -467,11 +511,11 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
         ewCoverageScratch.Clear();
         ewRangeScratch.Clear();
 
-        // Pass 1: Keep non-SAM EW radars online (unless blinking from ARAD) and collect active EW/AWACS coverage
+        // Pass 1: Keep non-SAM EW radars online (unless blinking from ARAD or manually turned off) and collect active EW/AWACS coverage
         for (int i = 0; i < entryList.Count; i++)
         {
             RadarUnitEntry entry = entryList[i];
-            if (entry.Unit == null || entry.Unit.disabled || !ReferenceEquals(entry.Hq, hq))
+            if (entry.Unit == null || entry.Unit.disabled || entry.Unit is Ship || !ReferenceEquals(entry.Hq, hq))
             {
                 continue;
             }
@@ -481,13 +525,17 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
                 continue;
             }
 
-            if (AddonConfig.EnableAiRadarEmcon.Value && now < entry.BlinkOffUntil)
+            if (!IsCommanderRadarOffline(entry.Unit))
             {
-                SetUnitRadarsActive(entry, active: false, clearLocks: true);
-                continue;
+                if (AddonConfig.EnableAiRadarEmcon.Value && now < entry.BlinkOffUntil)
+                {
+                    SetUnitRadarsActive(entry, active: false, clearLocks: true);
+                    continue;
+                }
+
+                SetUnitRadarsActive(entry, active: true, clearLocks: false);
             }
 
-            SetUnitRadarsActive(entry, active: true, clearLocks: false);
             if (HasOperationalNonJammedActiveRadar(entry.Radars))
             {
                 ewCoverageScratch.Add(entry.Unit.GlobalPosition());
@@ -526,7 +574,12 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
         for (int i = 0; i < entryList.Count; i++)
         {
             RadarUnitEntry entry = entryList[i];
-            if (entry.Unit == null || entry.Unit.disabled || !ReferenceEquals(entry.Hq, hq) || !entry.IsSamRadar)
+            if (entry.Unit == null
+                || entry.Unit.disabled
+                || entry.Unit is Ship
+                || !ReferenceEquals(entry.Hq, hq)
+                || !entry.IsSamRadar
+                || IsCommanderRadarOffline(entry.Unit))
             {
                 continue;
             }
@@ -748,6 +801,11 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
 
     private static void SetUnitRadarsActive(RadarUnitEntry entry, bool active, bool clearLocks = false)
     {
+        if (active && IsCommanderRadarOffline(entry.Unit))
+        {
+            return;
+        }
+
         bool anyChanged = false;
         bool anyOperational = false;
 
@@ -865,6 +923,15 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
         return false;
     }
 
+    private static bool IsCommanderRadarOffline(Unit? unit)
+        => unit != null && CommanderIsUnitRadarOfflineMethod?.Invoke(null, new object?[] { unit }) is bool b && b;
+
+    private static bool IsEmconAiFaction(FactionHQ? hq, FactionHQ? localHq)
+        => hq != null
+            && ((NetworkBehaviour)hq).IsServer
+            && !GroundControlReflection.HasHumanPlayers(hq)
+            && GroundControlReflection.IsSafeAiFaction(hq, localHq);
+
     private static bool IsServerAuthorityActive()
     {
         NetworkManagerNuclearOption? net = NetworkManagerNuclearOption.i;
@@ -877,7 +944,11 @@ internal sealed class AiRadarEmconService : IAddonTick, IAddonResetSession
         for (int i = entryList.Count - 1; i >= 0; i--)
         {
             RadarUnitEntry e = entryList[i];
-            if (e.Unit == null || e.Unit.disabled || e.Hq == null)
+            if (e.Unit == null
+                || e.Unit.disabled
+                || e.Unit is Ship
+                || e.Hq == null
+                || GroundControlReflection.HasHumanPlayers(e.Hq))
             {
                 if (e.Unit != null)
                 {

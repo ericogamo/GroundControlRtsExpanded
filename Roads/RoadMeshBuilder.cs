@@ -219,6 +219,32 @@ internal static class RoadMeshBuilder
         }
     }
 
+    internal static void DestroyRoadObject(GameObject? root)
+    {
+        if (root == null)
+        {
+            return;
+        }
+
+        MeshFilter[] filters = root.GetComponentsInChildren<MeshFilter>(includeInactive: true);
+        for (int i = 0; i < filters.Length; i++)
+        {
+            Mesh? mesh = filters[i].sharedMesh;
+            if (mesh != null)
+            {
+                filters[i].sharedMesh = null;
+                if (filters[i].TryGetComponent<MeshCollider>(out MeshCollider mc) && ReferenceEquals(mc.sharedMesh, mesh))
+                {
+                    mc.sharedMesh = null;
+                }
+
+                Object.Destroy(mesh);
+            }
+        }
+
+        Object.Destroy(root);
+    }
+
     internal static void ClearMaterials()
     {
         DestroyMat(ref asphaltMat);

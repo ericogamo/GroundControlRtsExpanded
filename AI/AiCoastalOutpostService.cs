@@ -323,6 +323,7 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
 
             GlobalPosition towerPos = unit.GlobalPosition();
             if (state.HasPlan
+                && !IsNearBlockedSite(state, state.PlannedDockSite)
                 && FastMath.Distance(towerPos, state.PlannedDockSite) <= TowerSearchRadiusMeters
                 && GroundControlReflection.BuildPreviewIsSiteAllowed(preview, dockDef, state.PlannedDockSite, hq, out _, navalDock: true))
             {
@@ -330,7 +331,7 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
                 return true;
             }
 
-            if (TryFindFineShoreNearTower(preview, dockDef, hq, towerPos, out GlobalPosition foundDock))
+            if (TryFindFineShoreNearTower(preview, state, dockDef, hq, towerPos, out GlobalPosition foundDock))
             {
                 state.HasPlan = true;
                 state.PlannedTowerSite = towerPos;
@@ -416,17 +417,17 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
                 }
 
                 GroundControlReflection.EcoCollectIdleBuilders(hq, idleBuilderScratch);
-                if (resting != null)
+                for (int r = idleBuilderScratch.Count - 1; r >= 0; r--)
                 {
-                    for (int r = idleBuilderScratch.Count - 1; r >= 0; r--)
+                    Unit idle = idleBuilderScratch[r];
+                    if ((resting != null && resting.TryGetValue(idle, out float restUntil) && now < restUntil)
+                        || (failedLiftBuildersUntil.TryGetValue(idle, out float liftRetryAt) && now < liftRetryAt))
                     {
-                        if (resting.TryGetValue(idleBuilderScratch[r], out float restUntil) && now < restUntil)
-                        {
-                            idleBuilderScratch.RemoveAt(r);
-                        }
+                        idleBuilderScratch.RemoveAt(r);
                     }
                 }
 
+                bool canAirlift = CanFactionAirliftBuilder(hq);
                 Unit? bestDriveable = null;
                 float bestDriveSq = float.MaxValue;
                 Unit? bestAny = null;
@@ -435,14 +436,16 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
                 for (int j = 0; j < idleBuilderScratch.Count; j++)
                 {
                     Unit candidate = idleBuilderScratch[j];
-                    if (candidate == null || candidate.disabled)
+                    if (candidate == null
+                        || candidate.disabled
+                        || (failedLiftBuildersUntil.TryGetValue(candidate, out float liftRetryAt) && now < liftRetryAt))
                     {
                         continue;
                     }
 
                     GlobalPosition cPos = candidate.GlobalPosition();
                     float distSq = FastMath.SquareDistance(cPos, sitePos);
-                    if (distSq < bestAnySq)
+                    if (canAirlift && distSq < bestAnySq)
                     {
                         bestAnySq = distSq;
                         bestAny = candidate;
@@ -492,6 +495,11 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
                 }
 
                 if (!hq.TryGetNearestDepot(sitePos.ToLocalPosition(), float.MaxValue, out VehicleDepot depot) || depot == null)
+                {
+                    continue;
+                }
+
+                if (!GroundControlReflection.CanDriveBetween(((Unit)depot).GlobalPosition(), sitePos) && !canAirlift)
                 {
                     continue;
                 }
@@ -629,7 +637,8 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
         }
 
         BuildingDefinition? def = GroundControlReflection.SiteDefinitionProp?.GetValue(site) as BuildingDefinition;
-        if (def == null || !GroundControlReflection.BuildPreviewIsControlTower(def))
+        if (def == null
+            || (!GroundControlReflection.BuildPreviewIsControlTower(def) && !GroundControlReflection.IsSiteKindNavalDock(site)))
         {
             return false;
         }
@@ -639,7 +648,10 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
             return false;
         }
 
-        return FastMath.Distance(builder.GlobalPosition(), sitePos) > RemoteBuilderAirThresholdMeters;
+        GlobalPosition builderPos = builder.GlobalPosition();
+        return FastMath.Distance(builderPos, sitePos) > 250f
+            && !GroundControlReflection.CanDriveBetween(builderPos, sitePos)
+            && CanFactionAirliftBuilder(hq);
     }
 
     private static BuildingDefinition? ResolveControlTowerDefinition()
@@ -854,10 +866,11 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
             && !HasBuiltControlTowerNear(hq, state.ActiveBlueprintSite, 250f))
         {
             state.HasActiveTrackedBlueprint = false;
-            if (Time.time - state.ActiveBlueprintQueuedAt > StaleBlueprintBlockSeconds)
+            RecordBlockedSite(state, state.ActiveBlueprintSite);
+            state.HasPlan = false;
+            if (Time.time - state.ActiveBlueprintQueuedAt <= StaleBlueprintBlockSeconds)
             {
-                RecordBlockedSite(state, state.ActiveBlueprintSite);
-                state.HasPlan = false;
+                state.NextPlanScanAt = Mathf.Max(state.NextPlanScanAt, Time.time + 60f);
             }
         }
 
@@ -1137,7 +1150,8 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
             {
                 GlobalPosition dockProbe = GroundControlReflection.SnapToTerrain(
                     OffsetPosition(seaOrigin, inwardDir, landD + ShoreBackoffsMeters[b]));
-                if (!GroundControlReflection.BuildPreviewIsShoreline(dockProbe))
+                if (IsNearBlockedSite(state, dockProbe)
+                    || !GroundControlReflection.BuildPreviewIsShoreline(dockProbe))
                 {
                     continue;
                 }
@@ -1208,6 +1222,7 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
 
     private static bool TryFindFineShoreNearTower(
         object preview,
+        CoastalOutpostState state,
         BuildingDefinition dockDef,
         FactionHQ hq,
         GlobalPosition towerPos,
@@ -1261,7 +1276,8 @@ internal sealed class AiCoastalOutpostService : IAddonResetSession
                     }
 
                     GlobalPosition probe = GroundControlReflection.SnapToTerrain(OffsetPosition(towerPos, dir, dist));
-                    if (GroundControlReflection.BuildPreviewIsShoreline(probe)
+                    if (!IsNearBlockedSite(state, probe)
+                        && GroundControlReflection.BuildPreviewIsShoreline(probe)
                         && GroundControlReflection.BuildPreviewIsSiteAllowed(preview, dockDef, probe, hq, out _, navalDock: true))
                     {
                         bestDist = dist;

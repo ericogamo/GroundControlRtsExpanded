@@ -111,10 +111,31 @@ internal sealed class SingleplayerCheatService : IAddonTick, IAddonGui, IAddonRe
         return localHq != null && ReferenceEquals(hq, localHq);
     }
 
+    internal static bool IsIgnoreFactionLockActiveFor(FactionHQ? hq)
+    {
+        if (hq == null)
+        {
+            return false;
+        }
+
+        if (GcreNetworkSync.IsPureClient && GcreNetworkSync.HostHasGcre)
+        {
+            return !string.IsNullOrEmpty(GcreNetworkSync.RemoteCheatIgnoreFactionLockHqName) &&
+                   hq.faction != null &&
+                   string.Equals(hq.faction.factionName, GcreNetworkSync.RemoteCheatIgnoreFactionLockHqName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (!IsAllowed || !Instance.ignoreFactionLock)
+        {
+            return false;
+        }
+
+        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
+        return localHq != null && ReferenceEquals(hq, localHq);
+    }
+
     internal static bool IsIgnoreFactionLockActive =>
-        (GcreNetworkSync.IsPureClient && GcreNetworkSync.HostHasGcre)
-            ? GcreNetworkSync.RemoteCheatIgnoreFactionLock
-            : (IsAllowed && Instance.ignoreFactionLock);
+        IsIgnoreFactionLockActiveFor(GroundControlReflection.GetLocalHq());
     internal static bool IsInstantBuildActive => IsAllowed && Instance.instantBuild;
     internal static bool IsRevealMapActive => IsAllowed && Instance.revealMap;
 
@@ -257,7 +278,7 @@ internal sealed class SingleplayerCheatService : IAddonTick, IAddonGui, IAddonRe
         {
             y += NativeThemeBridge.DrawHelpOverlay(
                 new Rect(12f, y, innerW, 84f),
-                "Singleplayer-only sandbox & testing cheats. Strictly disabled in Multiplayer. " +
+                "Singleplayer sandbox & testing cheats (or Host-only test mode in Multiplayer when HostTestCheatSteamId is set). " +
                 "Hotkeys: Shift+F10 toggles this window.") + 10f;
         }
 
@@ -322,7 +343,7 @@ internal sealed class SingleplayerCheatService : IAddonTick, IAddonGui, IAddonRe
         if (nextFaction != ignoreFactionLock)
         {
             ignoreFactionLock = nextFaction;
-            SetFeedback(ignoreFactionLock ? "Faction lock bypassed (SP only)." : "Faction lock restored.");
+            SetFeedback(ignoreFactionLock ? "Faction lock bypassed (local faction)." : "Faction lock restored.");
         }
 
         y += 34f;
@@ -416,6 +437,7 @@ internal sealed class SingleplayerCheatService : IAddonTick, IAddonGui, IAddonRe
             }
 
             bool touched = false;
+            bool partBroadcasted = false;
             List<UnitPart> parts = unit.GetAllParts();
             for (int p = 0; p < parts.Count; p++)
             {
@@ -424,6 +446,11 @@ internal sealed class SingleplayerCheatService : IAddonTick, IAddonGui, IAddonRe
                 {
                     part.Repair();
                     touched = true;
+                    if (unit.persistentID.IsValid)
+                    {
+                        GcreNetworkSync.BroadcastPartHeal(unit.persistentID, p);
+                        partBroadcasted = true;
+                    }
                 }
             }
 
@@ -436,9 +463,9 @@ internal sealed class SingleplayerCheatService : IAddonTick, IAddonGui, IAddonRe
             if (touched)
             {
                 repairedCount++;
-                if (unit.persistentID.IsValid)
+                if (!partBroadcasted && unit.persistentID.IsValid)
                 {
-                    GcreNetworkSync.BroadcastPartHeal(unit.persistentID.Id);
+                    GcreNetworkSync.BroadcastPartHeal(unit.persistentID);
                 }
             }
         }

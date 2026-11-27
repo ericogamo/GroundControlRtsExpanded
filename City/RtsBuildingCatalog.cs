@@ -252,7 +252,7 @@ internal static class RtsBuildingCatalog
 
         if (!ReferenceEquals(cachedEncyclopedia, enc))
         {
-            ClonedDefs.Clear();
+            ClearClonedDefinitions();
             cachedEncyclopedia = enc;
         }
 
@@ -497,14 +497,44 @@ internal static class RtsBuildingCatalog
 
     internal static void ResetSession()
     {
-        ClonedDefs.Clear();
+        ClearClonedDefinitions();
         cachedEncyclopedia = null;
+    }
+
+    private static void ClearClonedDefinitions()
+    {
+        foreach (KeyValuePair<RtsBuildingKind, BuildingDefinition> kv in ClonedDefs)
+        {
+            BuildingDefinition? def = kv.Value;
+            if (def == null)
+            {
+                continue;
+            }
+
+            if (Encyclopedia.Lookup != null
+                && !string.IsNullOrEmpty(def.jsonKey)
+                && Encyclopedia.Lookup.TryGetValue(def.jsonKey, out UnitDefinition existing)
+                && ReferenceEquals(existing, def))
+            {
+                Encyclopedia.Lookup.Remove(def.jsonKey);
+            }
+
+            UnityEngine.Object.Destroy(def);
+        }
+
+        ClonedDefs.Clear();
     }
 
     internal static BuildingDefinition? PickPlainBuildingDefinition()
         => Encyclopedia.i != null ? PickPlainBuilding(Encyclopedia.i) : null;
 
     private static readonly FieldInfo? UnitPartDamageEffectsField = AccessTools.Field(typeof(UnitPart), "damageEffects");
+    private static readonly FieldInfo? BuildingRepairTimeField = AccessTools.Field(typeof(Building), "repairTime");
+
+    internal static bool IsRepairableBuilding(Unit? unit)
+        => unit is Building bldg
+           && BuildingRepairTimeField?.GetValue(bldg) is float repairTime
+           && repairTime < 999999f;
 
     private static readonly string[] HazardousBuildingKeywords =
     {
@@ -530,6 +560,7 @@ internal static class RtsBuildingCatalog
         BuildingDefinition? best = null;
         BuildingDefinition? fallback = null;
         BuildingDefinition? lastResortFallback = null;
+        BuildingDefinition? repairableFallback = null;
 
         for (int i = 0; i < enc.buildings.Count; i++)
         {
@@ -554,7 +585,8 @@ internal static class RtsBuildingCatalog
             }
 
             GameObject prefab = b.unitPrefab;
-            if (prefab.GetComponent<Building>() == null)
+            Building? bldgComp = prefab.GetComponent<Building>();
+            if (bldgComp == null)
             {
                 continue;
             }
@@ -562,6 +594,12 @@ internal static class RtsBuildingCatalog
             if (prefab.GetComponentInChildren<Radar>(true) != null
                 || prefab.GetComponentInChildren<Airbase>(true) != null)
             {
+                continue;
+            }
+
+            if (IsRepairableBuilding(bldgComp))
+            {
+                repairableFallback ??= b;
                 continue;
             }
 
@@ -591,7 +629,7 @@ internal static class RtsBuildingCatalog
             }
         }
 
-        return best ?? fallback ?? lastResortFallback;
+        return best ?? fallback ?? lastResortFallback ?? repairableFallback;
     }
 
     private static bool IsHazardousOrExplosiveBuilding(BuildingDefinition b, GameObject prefab)
@@ -670,15 +708,21 @@ internal static class RtsBuildingUnitDisabledVisualPatch
         RtsBuildingRecord? rec = __instance.persistentID.IsValid
             ? DynamicCapAndTechService.Instance.FindRecordByPersistentId(__instance.persistentID.Id)
             : null;
-        if (rec == null && __instance.definition is BuildingDefinition bd && RtsBuildingCatalog.TryGetSpec(bd, out RtsBuildingSpec specByDef))
+        if (rec != null)
+        {
+            RtsBuildingCatalog.SetCustomVisualVisible(__instance, rec.Spec, rec.Level, visible: !newState);
+            return;
+        }
+
+        if (__instance.definition is BuildingDefinition bd && RtsBuildingCatalog.TryGetSpec(bd, out RtsBuildingSpec specByDef))
         {
             RtsBuildingCatalog.SetCustomVisualVisible(__instance, specByDef, level: 1, visible: !newState);
             return;
         }
 
-        if (rec != null)
+        if (RtsBuildingCatalog.TryMatchByUniqueName(__instance.UniqueName, out RtsBuildingSpec specByName))
         {
-            RtsBuildingCatalog.SetCustomVisualVisible(__instance, rec.Spec, rec.Level, visible: !newState);
+            RtsBuildingCatalog.SetCustomVisualVisible(__instance, specByName, level: 1, visible: !newState);
         }
     }
 }

@@ -1,3 +1,4 @@
+using System;
 using HarmonyLib;
 using NuclearOption.Networking;
 using NuclearOption.SavedMission;
@@ -42,6 +43,22 @@ internal static class HangarTrySpawnSafetyPatch
         {
             string who = player != null ? $"player '{player.name}'" : "AI";
             AddonLog.Debug($"[HangarSafety] Blocked {who} spawn of {definition?.unitName ?? "?"} at hangar '{__instance.name}': {reason}");
+            if (AirbaseTrySpawnSafetyNoticePatch.IsInAirbaseTrySpawn)
+            {
+                AirbaseTrySpawnSafetyNoticePatch.RecordBlockedReason(reason);
+            }
+            else if (player != null)
+            {
+                if (player.IsLocalPlayer)
+                {
+                    HangarSpawnSafetyService.Instance.NotifyLocalPlayerBlocked(reason);
+                }
+                else
+                {
+                    HangarSpawnSafetyService.Instance.NotifyRemotePlayerBlocked(player, reason);
+                }
+            }
+
             __result = default;
             return false;
         }
@@ -109,13 +126,35 @@ internal static class HangarOnDestroySafetyPatch
     new[] { typeof(Player), typeof(AircraftDefinition), typeof(LiveryKey), typeof(Loadout), typeof(float) })]
 internal static class AirbaseTrySpawnSafetyNoticePatch
 {
+    [ThreadStatic]
+    private static bool inAirbaseTrySpawn;
+
+    [ThreadStatic]
+    private static string? lastAirbaseBlockedReason;
+
+    internal static bool IsInAirbaseTrySpawn => inAirbaseTrySpawn;
+
+    internal static void RecordBlockedReason(string reason)
+    {
+        if (string.IsNullOrEmpty(lastAirbaseBlockedReason) && !string.IsNullOrEmpty(reason))
+        {
+            lastAirbaseBlockedReason = reason;
+        }
+    }
+
+    private static void Prefix()
+    {
+        inAirbaseTrySpawn = true;
+        lastAirbaseBlockedReason = null;
+    }
+
     private static void Postfix(
         Airbase __instance,
         Player? player,
         AircraftDefinition definition,
         Airbase.TrySpawnResult __result)
     {
-        if (__result.Allowed || player == null || !player.IsLocalPlayer)
+        if (__result.Allowed || player == null)
         {
             return;
         }
@@ -125,10 +164,37 @@ internal static class AirbaseTrySpawnSafetyNoticePatch
             return;
         }
 
-        if (HangarSpawnSafetyService.Instance.HasAnySafetyBlockedCompatibleHangar(__instance, definition, out string reason))
+        bool hasReason = HangarSpawnSafetyService.Instance.HasAnySafetyBlockedCompatibleHangar(
+            __instance,
+            definition,
+            out string reason,
+            player);
+        if (!hasReason && !string.IsNullOrEmpty(lastAirbaseBlockedReason))
+        {
+            reason = lastAirbaseBlockedReason!;
+            hasReason = true;
+        }
+
+        if (!hasReason)
+        {
+            return;
+        }
+
+        if (player.IsLocalPlayer)
         {
             HangarSpawnSafetyService.Instance.NotifyLocalPlayerBlocked(reason);
         }
+        else if (__instance.IsServer)
+        {
+            HangarSpawnSafetyService.Instance.NotifyRemotePlayerBlocked(player, reason);
+        }
+    }
+
+    private static Exception? Finalizer(Exception? __exception)
+    {
+        inAirbaseTrySpawn = false;
+        lastAirbaseBlockedReason = null;
+        return __exception;
     }
 }
 

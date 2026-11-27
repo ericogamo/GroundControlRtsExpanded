@@ -32,7 +32,6 @@ internal sealed class AiTacticalDoctrineService : IAddonResetSession
     private readonly Dictionary<(FactionHQ Hq, Airbase Staging, int Slot), PushTracker> pushTrackers = new();
     private readonly Dictionary<(FactionHQ Hq, Airbase Target), float> targetStalledUntil = new();
     private readonly Dictionary<(FactionHQ Hq, Airbase Target), int> targetFlankIndex = new();
-    private readonly Dictionary<FactionHQ, Airbase> lastStalledTargetByHq = new();
     private readonly Dictionary<FactionHQ, int> strikeSortieCounters = new();
     private readonly Dictionary<(FactionHQ Hq, Unit Target), float> recentForcedTargets = new();
     private readonly Dictionary<Unit, float> navalRetreatOrderAt = new();
@@ -56,7 +55,6 @@ internal sealed class AiTacticalDoctrineService : IAddonResetSession
         pushTrackers.Clear();
         targetStalledUntil.Clear();
         targetFlankIndex.Clear();
-        lastStalledTargetByHq.Clear();
         strikeSortieCounters.Clear();
         recentForcedTargets.Clear();
         navalRetreatOrderAt.Clear();
@@ -211,6 +209,9 @@ internal sealed class AiTacticalDoctrineService : IAddonResetSession
         return true;
     }
 
+    internal int PeekStrikeSortieIndex(FactionHQ hq)
+        => (strikeSortieCounters.TryGetValue(hq, out int cur) ? cur : 0) + 1;
+
     internal int NextStrikeSortieIndex(FactionHQ hq)
     {
         int next = (strikeSortieCounters.TryGetValue(hq, out int cur) ? cur : 0) + 1;
@@ -364,7 +365,6 @@ internal sealed class AiTacticalDoctrineService : IAddonResetSession
                 if (!targetStalledUntil.TryGetValue(targetKey, out float stalledUntil) || now >= stalledUntil)
                 {
                     targetStalledUntil[targetKey] = now + StallCooldownSeconds;
-                    lastStalledTargetByHq[hq] = target;
 
                     int nextIdx = targetFlankIndex.TryGetValue(targetKey, out int cur)
                         ? (cur + 1) % FlankAnglesDegrees.Length
@@ -394,17 +394,14 @@ internal sealed class AiTacticalDoctrineService : IAddonResetSession
 
     internal bool TryGetFlankAngleOffsetDegrees(FactionHQ hq, Airbase? target, out float angleDegrees)
     {
-        if (hq != null)
+        if (hq != null
+            && target != null
+            && targetStalledUntil.TryGetValue((hq, target), out float stalledUntil)
+            && Time.time < stalledUntil
+            && targetFlankIndex.TryGetValue((hq, target), out int idx))
         {
-            Airbase? resolvedTarget = target ?? (lastStalledTargetByHq.TryGetValue(hq, out Airbase lastTarget) ? lastTarget : null);
-            if (resolvedTarget != null
-                && targetStalledUntil.TryGetValue((hq, resolvedTarget), out float stalledUntil)
-                && Time.time < stalledUntil
-                && targetFlankIndex.TryGetValue((hq, resolvedTarget), out int idx))
-            {
-                angleDegrees = FlankAnglesDegrees[idx % FlankAnglesDegrees.Length];
-                return true;
-            }
+            angleDegrees = FlankAnglesDegrees[idx % FlankAnglesDegrees.Length];
+            return true;
         }
 
         angleDegrees = 0f;
@@ -453,6 +450,25 @@ internal sealed class AiTacticalDoctrineService : IAddonResetSession
             for (int i = 0; i < staleStallKeys.Count; i++)
             {
                 targetStalledUntil.Remove(staleStallKeys[i]);
+            }
+
+            staleStallKeys.Clear();
+        }
+
+        if (targetFlankIndex.Count > 0)
+        {
+            staleStallKeys.Clear();
+            foreach (KeyValuePair<(FactionHQ Hq, Airbase Target), int> kv in targetFlankIndex)
+            {
+                if (kv.Key.Hq == null || kv.Key.Target == null || kv.Key.Target.disabled)
+                {
+                    staleStallKeys.Add(kv.Key);
+                }
+            }
+
+            for (int i = 0; i < staleStallKeys.Count; i++)
+            {
+                targetFlankIndex.Remove(staleStallKeys[i]);
             }
 
             staleStallKeys.Clear();

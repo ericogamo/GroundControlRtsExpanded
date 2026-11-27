@@ -115,6 +115,40 @@ internal static class CommanderAirPickForcedStationAntiShipPatch
 }
 
 [HarmonyPatch]
+internal static class CommanderAirSwarmReleaseAntiShipPatch
+{
+    private static readonly MethodInfo? TargetSwarmReleaseMethod = AccessTools.Method(
+        GroundControlReflection.AirCommandServiceType,
+        "SwarmRelease",
+        new[] { typeof(Aircraft), typeof(WeaponStation), typeof(List<Unit>) });
+
+    private static bool Prepare() => TargetSwarmReleaseMethod != null;
+    private static MethodBase TargetMethod() => TargetSwarmReleaseMethod!;
+
+    private static bool Prefix(Aircraft? aircraft, WeaponStation? station, List<Unit>? targets)
+    {
+        if (aircraft == null ||
+            station?.WeaponInfo == null ||
+            targets == null ||
+            MdsBridgeBootstrap.IsMdsAntiShipWeaponInfo?.Invoke(station.WeaponInfo) != true)
+        {
+            return true;
+        }
+
+        for (int i = targets.Count - 1; i >= 0; i--)
+        {
+            Unit? u = targets[i];
+            if (u == null || u.disabled || u is not Ship)
+            {
+                targets.RemoveAt(i);
+            }
+        }
+
+        return targets.Count > 0;
+    }
+}
+
+[HarmonyPatch]
 internal static class CommanderAirAddSwarmSpreadAntiShipPatch
 {
     private static bool Prepare() => GroundControlReflection.AirAddSwarmSpreadMethod != null;

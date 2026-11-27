@@ -383,7 +383,7 @@ internal static class AiAirDefenceHelper
         return reserve;
     }
 
-    internal static bool IsRadarSamWanted(
+    internal static VehicleDefinition? ChooseRadarSamCandidate(
         object enemyInstance,
         FactionHQ hq,
         object state,
@@ -392,7 +392,7 @@ internal static class AiAirDefenceHelper
         int sites = GetEffectiveSiteCount(state, out List<GlobalPosition>? defencePosts);
         if (sites <= 0 || defencePosts == null)
         {
-            return false;
+            return null;
         }
 
         StationCounts counts = CountStations(state, sites, catalog);
@@ -401,8 +401,36 @@ internal static class AiAirDefenceHelper
 
         int openSamStations = CountOpenSamStations(hq, defencePosts, counts, strato, bolt);
         int reserveSams = CountReserveSamUnits(hq, strato, bolt);
-        return openSamStations > reserveSams;
+        if (openSamStations <= reserveSams)
+        {
+            return null;
+        }
+
+        bool wantsSamSite = GroundControlReflection.StateWantsSamSiteProp?.GetValue(state) is bool w && w;
+        bool canFieldStrato = wantsSamSite && strato != null && CanAnyOpenSamStationField(hq, defencePosts, counts, strato);
+        bool canFieldBolt = bolt != null && CanAnyOpenSamStationField(hq, defencePosts, counts, bolt);
+
+        if (!canFieldStrato)
+        {
+            return canFieldBolt ? bolt : null;
+        }
+
+        if (!canFieldBolt || bolt == null)
+        {
+            return strato;
+        }
+
+        int boltOwned = GroundControlReflection.EnemyCountOwned(hq, bolt);
+        int stratoOwned = GroundControlReflection.EnemyCountSamLaunchers(enemyInstance, hq);
+        return boltOwned <= stratoOwned ? bolt : strato;
     }
+
+    internal static bool IsRadarSamWanted(
+        object enemyInstance,
+        FactionHQ hq,
+        object state,
+        IReadOnlyList<VehicleDefinition>? catalog)
+        => ChooseRadarSamCandidate(enemyInstance, hq, state, catalog) != null;
 
     internal static bool HasUnmetStationPackage(
         object enemyInstance,
@@ -620,46 +648,8 @@ internal static class ChooseRadarSamPatch
             return false;
         }
 
-        int sites = AiAirDefenceHelper.GetEffectiveSiteCount(state, out List<GlobalPosition>? defencePosts);
-        if (sites <= 0 || defencePosts == null)
-        {
-            __result = null;
-            return false;
-        }
-
         List<VehicleDefinition>? catalog = AiAirDefenceHelper.GetCatalog(__instance);
-        AiAirDefenceHelper.StationCounts counts = AiAirDefenceHelper.CountStations(state, sites, catalog);
-
-        VehicleDefinition? strato = GroundControlReflection.EnemyChooseSamLauncherUnit(__instance, float.MaxValue);
-        VehicleDefinition? bolt = AiAirDefenceHelper.FindCatalogMatch(catalog, AiAirDefenceHelper.IsMobileRadarSam);
-
-        int openSamStations = AiAirDefenceHelper.CountOpenSamStations(hq, defencePosts, counts, strato, bolt);
-        int reserveSams = AiAirDefenceHelper.CountReserveSamUnits(hq, strato, bolt);
-        if (openSamStations <= reserveSams)
-        {
-            __result = null;
-            return false;
-        }
-
-        bool wantsSamSite = GroundControlReflection.StateWantsSamSiteProp?.GetValue(state) is bool w && w;
-        bool canFieldStrato = wantsSamSite && strato != null && AiAirDefenceHelper.CanAnyOpenSamStationField(hq, defencePosts, counts, strato);
-        bool canFieldBolt = bolt != null && AiAirDefenceHelper.CanAnyOpenSamStationField(hq, defencePosts, counts, bolt);
-
-        if (!canFieldStrato)
-        {
-            __result = canFieldBolt ? bolt : null;
-            return false;
-        }
-
-        if (!canFieldBolt || bolt == null)
-        {
-            __result = strato;
-            return false;
-        }
-
-        int boltOwned = GroundControlReflection.EnemyCountOwned(hq, bolt);
-        int stratoOwned = GroundControlReflection.EnemyCountSamLaunchers(__instance, hq);
-        __result = boltOwned <= stratoOwned ? bolt : strato;
+        __result = AiAirDefenceHelper.ChooseRadarSamCandidate(__instance, hq, state, catalog);
         return false;
     }
 }
@@ -957,6 +947,50 @@ internal static class ChooseSamDepotPatch
 internal static class RecruitAirDefenceTriadPatch
 {
     private static readonly List<Unit> UnitScratch = new();
+    private static readonly Dictionary<Unit, Unit> ActiveMineGuards = new();
+
+    internal static bool IsActiveMineGuard(Unit? unit)
+    {
+        if (unit == null)
+        {
+            return false;
+        }
+
+        PruneMineGuards();
+        return ActiveMineGuards.ContainsKey(unit);
+    }
+
+    private static void PruneMineGuards()
+    {
+        if (ActiveMineGuards.Count == 0)
+        {
+            return;
+        }
+
+        UnitScratch.Clear();
+        foreach (KeyValuePair<Unit, Unit> kv in ActiveMineGuards)
+        {
+            Unit guard = kv.Key;
+            Unit mine = kv.Value;
+            if (!ReferenceEquals(guard, null)
+                && (guard == null
+                    || guard.disabled
+                    || mine == null
+                    || mine.disabled
+                    || guard.NetworkHQ == null
+                    || !ReferenceEquals(guard.NetworkHQ, mine.NetworkHQ)))
+            {
+                UnitScratch.Add(guard!);
+            }
+        }
+
+        for (int i = 0; i < UnitScratch.Count; i++)
+        {
+            ActiveMineGuards.Remove(UnitScratch[i]);
+        }
+
+        UnitScratch.Clear();
+    }
 
     private static bool Prepare() => GroundControlReflection.EnemyRecruitAirDefenceMethod != null;
     private static MethodBase TargetMethod() => GroundControlReflection.EnemyRecruitAirDefenceMethod!;
@@ -1038,6 +1072,8 @@ internal static class RecruitAirDefenceTriadPatch
         int[] cramCounts,
         List<VehicleDefinition>? catalog)
     {
+        PruneMineGuards();
+
         if (hq.factionUnits == null)
         {
             return;
@@ -1049,6 +1085,7 @@ internal static class RecruitAirDefenceTriadPatch
             return;
         }
 
+        Unit? exposedMineUnit = null;
         GlobalPosition? exposedMinePos = null;
         foreach (PersistentID pid in hq.factionUnits)
         {
@@ -1077,12 +1114,25 @@ internal static class RecruitAirDefenceTriadPatch
             if (!covered)
             {
                 bool hasDefenderNearMine = false;
-                foreach (Unit d in defenders.Keys)
+                foreach (KeyValuePair<Unit, Unit> mg in ActiveMineGuards)
                 {
-                    if (d != null && !d.disabled && FastMath.InRange(d.GlobalPosition(), mPos, 900f))
+                    if (ReferenceEquals(mg.Value, unit)
+                        || (mg.Key != null && !mg.Key.disabled && FastMath.InRange(mg.Key.GlobalPosition(), mPos, 900f)))
                     {
                         hasDefenderNearMine = true;
                         break;
+                    }
+                }
+
+                if (!hasDefenderNearMine)
+                {
+                    foreach (Unit d in defenders.Keys)
+                    {
+                        if (d != null && !d.disabled && FastMath.InRange(d.GlobalPosition(), mPos, 900f))
+                        {
+                            hasDefenderNearMine = true;
+                            break;
+                        }
                     }
                 }
 
@@ -1107,18 +1157,20 @@ internal static class RecruitAirDefenceTriadPatch
 
                 if (!hasDefenderNearMine)
                 {
+                    exposedMineUnit = unit;
                     exposedMinePos = mPos;
                     break;
                 }
             }
         }
 
-        if (!exposedMinePos.HasValue)
+        if (exposedMineUnit == null || !exposedMinePos.HasValue)
         {
             return;
         }
 
         Unit? surplusCram = null;
+        int surplusPost = -1;
         float bestDistSq = float.MaxValue;
         foreach (KeyValuePair<Unit, int> kv in defenders)
         {
@@ -1129,7 +1181,7 @@ internal static class RecruitAirDefenceTriadPatch
                 continue;
             }
 
-            if (!AiAirDefenceHelper.IsStationCramUnit(u, catalog) || cramCounts[post] < 2)
+            if (!AiAirDefenceHelper.IsStationCramUnit(u, catalog) || cramCounts[post] <= AiAirDefenceHelper.TargetCramsPerStation)
             {
                 continue;
             }
@@ -1144,13 +1196,20 @@ internal static class RecruitAirDefenceTriadPatch
             {
                 bestDistSq = dSq;
                 surplusCram = u;
+                surplusPost = post;
             }
         }
 
         if (surplusCram != null)
         {
+            if (surplusPost >= 0 && surplusPost < cramCounts.Length && cramCounts[surplusPost] > 0)
+            {
+                cramCounts[surplusPost]--;
+            }
+
             defenders.Remove(surplusCram);
             slots?.Remove(surplusCram);
+            ActiveMineGuards[surplusCram] = exposedMineUnit;
             GroundControlReflection.EnemyHoldAt(surplusCram, exposedMinePos.Value);
         }
     }
@@ -1553,9 +1612,60 @@ internal static class TryBuySamLauncherPhaseGuardPatch
 
     private static bool Prefix(object __instance, FactionHQ? hq, object? state, ref float __result)
     {
-        if (!AddonConfig.ModEnabled.Value || !AddonConfig.EnableTacticalQualityAi.Value || hq == null)
+        if (!AddonConfig.ModEnabled.Value
+            || !AddonConfig.EnableTacticalQualityAi.Value
+            || hq == null
+            || AiEconomySettings.GetActiveProfile().IsVanilla)
         {
             return true;
+        }
+
+        object? eco = GroundControlReflection.GetEcoInstance();
+        int goldMines = eco != null ? GroundControlReflection.CountGoldMines(eco, hq) : 0;
+        float enemyGross = eco != null ? GroundControlReflection.GetHqIncomePerMinute(eco, hq) : 0f;
+        float reserve = GroundControlReflection.GetEnemyBuildReserve(hq, out _, out bool resIncome);
+        PlayerThreatSnapshot threat = AiStrategicDirectorService.Instance.ReadPlayerThreat(hq);
+
+        if (goldMines == 0 || enemyGross < 350f)
+        {
+            GroundControlReflection.SetStateFloat(state, GroundControlReflection.StateSamFundProp, 0f);
+            if (!(threat.Aircraft >= 2 && hq.factionFunds >= reserve + 300f))
+            {
+                __result = 0f;
+                return false;
+            }
+        }
+
+        int activeSamStations = 0;
+        int deployedStationUnits = 0;
+        if (state != null && AiAirDefenceHelper.TryGetStateAndCatalog(__instance, hq, out _, out List<VehicleDefinition>? catalog))
+        {
+            int sites = AiAirDefenceHelper.GetEffectiveSiteCount(state, out _);
+            if (sites > 0)
+            {
+                AiAirDefenceHelper.StationCounts counts = AiAirDefenceHelper.CountStations(state, sites, catalog);
+                activeSamStations = AiAirDefenceHelper.CountActiveSamStations(counts);
+                for (int i = 0; i < counts.Sites; i++)
+                {
+                    deployedStationUnits += counts.Sams[i] + counts.Hels[i] + counts.Crams[i];
+                }
+            }
+        }
+
+        if (resIncome && reserve > 0f && hq.factionFunds < reserve + 100f)
+        {
+            if (!(threat.Aircraft >= 2 && activeSamStations == 0))
+            {
+                __result = 0f;
+                return false;
+            }
+        }
+
+        if (threat.Aircraft == 0 && enemyGross < 550f && deployedStationUnits >= 2)
+        {
+            GroundControlReflection.SetStateFloat(state, GroundControlReflection.StateSamFundProp, 0f);
+            __result = 0f;
+            return false;
         }
 
         if (GroundControlReflection.GetBestDepotLevel(hq) < 2)
@@ -1571,6 +1681,133 @@ internal static class TryBuySamLauncherPhaseGuardPatch
         }
 
         return true;
+    }
+}
+
+[HarmonyPatch]
+internal static class ReviewRadarSamWhileBrokeGuardPatch
+{
+    private static bool Prepare() => GroundControlReflection.EnemyReviewRadarSamWhileBrokeMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EnemyReviewRadarSamWhileBrokeMethod!;
+
+    private static bool Prefix(FactionHQ? hq, object? state)
+    {
+        if (!AddonConfig.ModEnabled.Value
+            || !AddonConfig.EnableTacticalQualityAi.Value
+            || hq == null
+            || AiEconomySettings.GetActiveProfile().IsVanilla)
+        {
+            return true;
+        }
+
+        object? eco = GroundControlReflection.GetEcoInstance();
+        int goldMines = eco != null ? GroundControlReflection.CountGoldMines(eco, hq) : 0;
+        float enemyGross = eco != null ? GroundControlReflection.GetHqIncomePerMinute(eco, hq) : 0f;
+        float reserve = GroundControlReflection.GetEnemyBuildReserve(hq, out _, out bool resIncome);
+        PlayerThreatSnapshot threat = AiStrategicDirectorService.Instance.ReadPlayerThreat(hq);
+        bool defending = GroundControlReflection.GetStateBool(state, GroundControlReflection.StateDefendingProp);
+
+        if (goldMines == 0
+            || enemyGross < 400f
+            || (resIncome && reserve > 0f && hq.factionFunds < reserve)
+            || (threat.Aircraft == 0 && !defending))
+        {
+            return false;
+        }
+
+        return true;
+    }
+}
+
+[HarmonyPatch]
+internal static class TryBuySiteRadarGuardPatch
+{
+    private static bool Prepare() => GroundControlReflection.EnemyTryBuySiteRadarMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EnemyTryBuySiteRadarMethod!;
+
+    private static bool Prefix(FactionHQ? hq, ref float __result)
+    {
+        if (!AddonConfig.ModEnabled.Value
+            || !AddonConfig.EnableTacticalQualityAi.Value
+            || hq == null
+            || AiEconomySettings.GetActiveProfile().IsVanilla)
+        {
+            return true;
+        }
+
+        object? eco = GroundControlReflection.GetEcoInstance();
+        int goldMines = eco != null ? GroundControlReflection.CountGoldMines(eco, hq) : 0;
+        float enemyGross = eco != null ? GroundControlReflection.GetHqIncomePerMinute(eco, hq) : 0f;
+        float reserve = GroundControlReflection.GetEnemyBuildReserve(hq, out _, out bool resIncome);
+        PlayerThreatSnapshot threat = AiStrategicDirectorService.Instance.ReadPlayerThreat(hq);
+
+        if (threat.Aircraft >= 2 && hq.factionFunds >= reserve + 120f)
+        {
+            return true;
+        }
+
+        if (goldMines == 0 || enemyGross < 350f || (resIncome && reserve > 0f && hq.factionFunds < reserve + 100f))
+        {
+            __result = 0f;
+            return false;
+        }
+
+        return true;
+    }
+}
+
+[HarmonyPatch]
+internal static class TryBuyFireControlGuardPatch
+{
+    private static bool Prepare() => GroundControlReflection.EnemyTryBuyFireControlMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EnemyTryBuyFireControlMethod!;
+
+    private static bool Prefix(FactionHQ? hq, ref float __result)
+    {
+        if (!AddonConfig.ModEnabled.Value
+            || !AddonConfig.EnableTacticalQualityAi.Value
+            || hq == null
+            || AiEconomySettings.GetActiveProfile().IsVanilla)
+        {
+            return true;
+        }
+
+        object? eco = GroundControlReflection.GetEcoInstance();
+        int goldMines = eco != null ? GroundControlReflection.CountGoldMines(eco, hq) : 0;
+        float enemyGross = eco != null ? GroundControlReflection.GetHqIncomePerMinute(eco, hq) : 0f;
+        float reserve = GroundControlReflection.GetEnemyBuildReserve(hq, out _, out bool resIncome);
+        PlayerThreatSnapshot threat = AiStrategicDirectorService.Instance.ReadPlayerThreat(hq);
+
+        if (threat.Aircraft >= 2 && hq.factionFunds >= reserve + 120f)
+        {
+            return true;
+        }
+
+        if (goldMines == 0 || enemyGross < 350f || (resIncome && reserve > 0f && hq.factionFunds < reserve + 100f))
+        {
+            __result = 0f;
+            return false;
+        }
+
+        return true;
+    }
+}
+
+[HarmonyPatch]
+internal static class IsRecruitableMineGuardPatch
+{
+    private static bool Prepare() => GroundControlReflection.EnemyIsRecruitableMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EnemyIsRecruitableMethod!;
+
+    private static void Postfix(Unit? unit, ref bool __result)
+    {
+        if (__result
+            && AddonConfig.ModEnabled.Value
+            && AddonConfig.EnableTacticalQualityAi.Value
+            && RecruitAirDefenceTriadPatch.IsActiveMineGuard(unit))
+        {
+            __result = false;
+        }
     }
 }
 

@@ -1,11 +1,15 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text;
+using HarmonyLib;
 using Mirage;
 using Mirage.Serialization;
 using NuclearOption.Networking;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace GroundControlRtsExpanded;
 
@@ -21,6 +25,10 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
     private const int MaxWireBytes = 1050;
     private const int MaxPiecesPerPayload = 512;
     private const int MaxOpenPayloadsPerSender = 8;
+    private const int MaxRemoteRoadWaypoints = 64;
+    private const float MaxRemoteRoadTotalMeters = 50000f;
+    private const float FallbackMapHalfExtentMeters = 120000f;
+    private const float MaxRoadAltitudeMeters = 25000f;
     private const float PieceTimeoutSeconds = 30f;
     private const float HelloIntervalSeconds = 5.0f;
     private const float SyncIntervalSeconds = 0.5f;
@@ -28,6 +36,10 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
     private const string WireProtocolVersion = "gcre-1";
 
     private static readonly string SepText = Sep.ToString();
+    private static readonly FieldInfo? UnitPartDamageMaterialField = AccessTools.Field(typeof(UnitPart), "damageMaterial");
+    private static readonly FieldInfo? UnitPartDisintegrateObjectsField = AccessTools.Field(typeof(UnitPart), "disintegrateObjects");
+    private static readonly FieldInfo? UnitPartFragmentedField = AccessTools.Field(typeof(UnitPart), "fragmented");
+    private static readonly int HitPointsShaderId = Shader.PropertyToID("_HitPoints");
 
     internal static GcreNetworkSync Instance { get; } = new();
 
@@ -37,10 +49,12 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
     private MessageHandler? boundClient;
     private bool wasServerActive;
     private bool wasClientActive;
+    private bool preserveServerOnNextReset;
 
     private readonly HashSet<INetworkPlayer> moddedGuests = new();
     private readonly HashSet<INetworkPlayer> knownAuthPlayers = new();
     private readonly List<INetworkPlayer> prunePlayersScratch = new();
+    private readonly Dictionary<INetworkPlayer, FactionHQ?> lastGuestHqByPlayer = new();
 
     private readonly Dictionary<string, string?[]> pieceBuffers = new(StringComparer.Ordinal);
     private readonly Dictionary<string, float> pieceStartedAt = new(StringComparer.Ordinal);
@@ -51,8 +65,12 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
     private readonly List<(uint Pid, int KindInt, int Level)> citySyncScratch = new();
     private readonly List<GlobalPosition> remoteWaypointsScratch = new();
     private readonly List<bool> remoteForcedBridgeScratch = new();
+    private readonly List<PersistentID> inactiveEmconScratch = new();
     private readonly Dictionary<INetworkPlayer, string> lastAbmDigestByGuest = new();
+    private readonly Dictionary<uint, (bool Active, float ExpiresAt)> pendingClientEmcon = new();
+    private readonly List<uint> pendingEmconRemoveScratch = new();
 
+    private string[]? pendingHelloArgs;
     private float nextHelloAt;
     private float nextSyncAt;
     private float nextFullSyncAt;
@@ -97,7 +115,7 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
     internal static float RemoteBridgeCostPer100m { get; private set; } = 75f;
     internal static string RemoteCheatTier3HqName { get; private set; } = string.Empty;
     internal static string RemoteCheatIgnoreCapsHqName { get; private set; } = string.Empty;
-    internal static bool RemoteCheatIgnoreFactionLock { get; private set; }
+    internal static string RemoteCheatIgnoreFactionLockHqName { get; private set; } = string.Empty;
 
     internal static bool EffectiveEnableDynamicCaps =>
         (IsPureClient && HostHasGcre) ? RemoteEnableDynamicCaps : AddonConfig.EnableDynamicCaps.Value;
@@ -175,39 +193,54 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
         }
     }
 
+    internal void SetPreserveServerOnNextReset(bool preserve)
+    {
+        preserveServerOnNextReset = preserve;
+    }
+
     public void ResetSession()
     {
-        moddedGuests.Clear();
-        knownAuthPlayers.Clear();
+        bool preserveServer = preserveServerOnNextReset;
+        preserveServerOnNextReset = false;
+
+        if (!preserveServer)
+        {
+            moddedGuests.Clear();
+            knownAuthPlayers.Clear();
+            lastGuestHqByPlayer.Clear();
+            HostHasGcre = false;
+
+            RemoteEnableDynamicCaps = true;
+            RemoteStartGroundCap = 15;
+            RemoteStartAirCap = 2;
+            RemoteStartNavalCap = 2;
+            RemoteAbmMaxStockPerSite = 8;
+            RemoteAbmMissileCost = 200f;
+            RemoteAbmProductionSeconds = 90f;
+            RemoteEnforceContractorFactionLock = true;
+            RemoteEconomyPreset = "Fair";
+            RemoteEnableCapturedBaseIncome = true;
+            RemoteCapturedBaseIncomePerMinute = 50f;
+            RemoteRequirePhysicalConstruction = true;
+            RemoteMaxRoadGradePercent = 30f;
+            RemoteRoadCostPer100m = 25f;
+            RemoteBridgeCostPer100m = 75f;
+            RemoteCheatTier3HqName = string.Empty;
+            RemoteCheatIgnoreCapsHqName = string.Empty;
+            RemoteCheatIgnoreFactionLockHqName = string.Empty;
+        }
+
         pieceBuffers.Clear();
         pieceStartedAt.Clear();
         lastAbmDigestByGuest.Clear();
+        pendingHelloArgs = null;
+        pendingClientEmcon.Clear();
         cityDirty = true;
-        HostHasGcre = false;
         nextHelloAt = 0f;
         nextSyncAt = 0f;
         nextFullSyncAt = 0f;
         lastConfigDigest = string.Empty;
         lastCityDigest = string.Empty;
-
-        RemoteEnableDynamicCaps = true;
-        RemoteStartGroundCap = 15;
-        RemoteStartAirCap = 2;
-        RemoteStartNavalCap = 2;
-        RemoteAbmMaxStockPerSite = 8;
-        RemoteAbmMissileCost = 200f;
-        RemoteAbmProductionSeconds = 90f;
-        RemoteEnforceContractorFactionLock = true;
-        RemoteEconomyPreset = "Fair";
-        RemoteEnableCapturedBaseIncome = true;
-        RemoteCapturedBaseIncomePerMinute = 50f;
-        RemoteRequirePhysicalConstruction = true;
-        RemoteMaxRoadGradePercent = 30f;
-        RemoteRoadCostPer100m = 25f;
-        RemoteBridgeCostPer100m = 75f;
-        RemoteCheatTier3HqName = string.Empty;
-        RemoteCheatIgnoreCapsHqName = string.Empty;
-        RemoteCheatIgnoreFactionLock = false;
     }
 
     public void Tick()
@@ -259,13 +292,29 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
             boundServer.RegisterHandler<GcreNetMessage>(OnHostMessage, allowUnauthenticated: false);
         }
 
+        if (!IsGameplaySceneReady())
+        {
+            return;
+        }
+
         float now = Time.unscaledTime;
         IReadOnlyList<INetworkPlayer> players = server.AuthenticatedPlayers;
         bool newPlayerJoined = false;
         for (int i = 0; i < players.Count; i++)
         {
             INetworkPlayer p = players[i];
-            if (p != null && !p.IsHost && knownAuthPlayers.Add(p))
+            if (p == null || p.IsHost)
+            {
+                continue;
+            }
+
+            if (!p.SceneIsReady)
+            {
+                knownAuthPlayers.Remove(p);
+                continue;
+            }
+
+            if (knownAuthPlayers.Add(p))
             {
                 newPlayerJoined = true;
             }
@@ -296,6 +345,7 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
             FlushCitySync(forceFull || cityDirty, targetPlayer: null);
             cityDirty = false;
             FlushAbmSync(forceFull, targetPlayer: null);
+            FlushGuestHqRoadSync();
         }
     }
 
@@ -305,6 +355,18 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
         {
             boundClient = client.MessageHandler;
             boundClient.RegisterHandler<GcreNetMessage>(OnGuestMessage, allowUnauthenticated: false);
+        }
+
+        if (pendingHelloArgs != null && IsGameplaySceneReady())
+        {
+            string[] queued = pendingHelloArgs;
+            pendingHelloArgs = null;
+            HandleHelloOnClient(queued);
+        }
+
+        if (HostHasGcre && pendingClientEmcon.Count > 0)
+        {
+            FlushPendingClientEmcon();
         }
     }
 
@@ -389,13 +451,28 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
         }
 
         string payload = Join("toast", isAlert ? "1" : "0", text);
-        foreach (INetworkPlayer guest in Instance.moddedGuests)
+        Instance.SendToModdedGuestsForHq(hq, payload);
+    }
+
+    internal static void SendPlayerNotice(INetworkPlayer? player, string message)
+    {
+        if (player == null || string.IsNullOrEmpty(message) || !IsServerAuthority)
         {
-            if (guest != null && ReferenceEquals(ResolvePlayerHq(guest), hq))
-            {
-                Instance.SendToPlayer(guest, payload);
-            }
+            return;
         }
+
+        if (player.IsHost)
+        {
+            GroundControlReflection.NoticeFail(message);
+            return;
+        }
+
+        if (!messageRegistered || !Instance.moddedGuests.Contains(player) || !player.SceneIsReady)
+        {
+            return;
+        }
+
+        Instance.SendToPlayer(player, Join("toast", "0", message));
     }
 
     internal static void BroadcastGlobalToast(bool isAlert, string text)
@@ -416,6 +493,35 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
         }
 
         Instance.SendToAllModdedGuests(Join("part_heal", pidId.ToString(CultureInfo.InvariantCulture)));
+    }
+
+    internal static void BroadcastPartHeal(PersistentID unitId)
+    {
+        BroadcastPartHeal(unitId.Id);
+    }
+
+    internal static void BroadcastPartHeal(uint pidId, int partIndex)
+    {
+        if (!messageRegistered || Instance.moddedGuests.Count == 0 || !IsServerAuthority || pidId == 0)
+        {
+            return;
+        }
+
+        if (partIndex < 0)
+        {
+            BroadcastPartHeal(pidId);
+            return;
+        }
+
+        Instance.SendToAllModdedGuests(Join(
+            "part_heal",
+            pidId.ToString(CultureInfo.InvariantCulture),
+            partIndex.ToString(CultureInfo.InvariantCulture)));
+    }
+
+    internal static void BroadcastPartHeal(PersistentID unitId, int partIndex)
+    {
+        BroadcastPartHeal(unitId.Id, partIndex);
     }
 
     internal static void BroadcastRearmVisual(uint pidId, byte stationIndex, int ammoDelta)
@@ -445,6 +551,11 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
             active ? "1" : "0"));
     }
 
+    internal static void BroadcastRadarEmcon(PersistentID unitId, bool active)
+    {
+        BroadcastRadarEmcon(unitId.Id, active);
+    }
+
     internal static void BroadcastRoadCompleted(int id, IReadOnlyList<RoadSample> samples)
     {
         if (!messageRegistered || Instance.moddedGuests.Count == 0 || !IsServerAuthority || samples == null || samples.Count < 2)
@@ -458,23 +569,40 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
             PioneerRoadService.SerializeSamples(samples)));
     }
 
-    internal static void BroadcastRoadProgress(int id, FactionHQ? hq, float totalLength, float builtLength, bool cancelled, IReadOnlyList<RoadSample>? samples)
+    internal static void BroadcastRoadProgress(
+        int id,
+        FactionHQ? hq,
+        float totalLength,
+        float builtLength,
+        bool cancelled,
+        IReadOnlyList<RoadSample>? samples,
+        FactionHQ? ownerHq = null)
     {
         if (!messageRegistered || Instance.moddedGuests.Count == 0 || !IsServerAuthority)
         {
             return;
         }
 
-        string hqName = hq?.faction?.factionName ?? string.Empty;
+        FactionHQ? scopedHq = ownerHq ?? hq;
+        string hqName = scopedHq?.faction?.factionName ?? hq?.faction?.factionName ?? string.Empty;
         string sampleData = samples != null && samples.Count >= 2 ? PioneerRoadService.SerializeSamples(samples) : string.Empty;
-        Instance.SendToAllModdedGuests(Join(
+        string payload = Join(
             "road_prog",
             id.ToString(CultureInfo.InvariantCulture),
             hqName,
             totalLength.ToString("0.##", CultureInfo.InvariantCulture),
             builtLength.ToString("0.##", CultureInfo.InvariantCulture),
             cancelled ? "1" : "0",
-            sampleData));
+            sampleData);
+
+        if (scopedHq != null)
+        {
+            Instance.SendToModdedGuestsForHq(scopedHq, payload);
+        }
+        else
+        {
+            Instance.SendToAllModdedGuests(payload);
+        }
     }
 
     internal static void BroadcastHaulSync(
@@ -563,11 +691,16 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
 
     private void SendHelloToAll(IReadOnlyList<INetworkPlayer> players)
     {
+        if (!IsGameplaySceneReady())
+        {
+            return;
+        }
+
         string payload = Join("hello", WireProtocolVersion, BuildConfigPayloadBody());
         for (int i = 0; i < players.Count; i++)
         {
             INetworkPlayer p = players[i];
-            if (p != null && !p.IsHost)
+            if (p != null && !p.IsHost && p.SceneIsReady)
             {
                 SendToPlayer(p, payload);
             }
@@ -607,7 +740,9 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
         string ignoreCapsHq = (SingleplayerCheatService.IsAllowed && localHq != null && SingleplayerCheatService.IsIgnoreCapsActiveFor(localHq))
             ? (localHq.faction?.factionName ?? string.Empty)
             : string.Empty;
-        bool ignoreLock = SingleplayerCheatService.IsAllowed && SingleplayerCheatService.IsIgnoreFactionLockActive;
+        string ignoreLockHq = (SingleplayerCheatService.IsAllowed && localHq != null && SingleplayerCheatService.IsIgnoreFactionLockActiveFor(localHq))
+            ? (localHq.faction?.factionName ?? string.Empty)
+            : string.Empty;
 
         return string.Join("|",
             AddonConfig.EnableDynamicCaps.Value ? "1" : "0",
@@ -627,7 +762,7 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
             AddonConfig.BridgeCostPer100m.Value.ToString("0.#", CultureInfo.InvariantCulture),
             tier3Hq,
             ignoreCapsHq,
-            ignoreLock ? "1" : "0");
+            ignoreLockHq);
     }
 
     private void FlushCitySync(bool force, INetworkPlayer? targetPlayer)
@@ -671,10 +806,10 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
 
     private void FlushAbmSync(bool force, INetworkPlayer? targetPlayer)
     {
-        string threatsStr = AbmDefenseService.Instance.BuildServerThreatsPayload();
+        string allThreatsStr = AbmDefenseService.Instance.BuildServerThreatsPayload();
         foreach (INetworkPlayer guest in moddedGuests)
         {
-            if (guest == null || (targetPlayer != null && !ReferenceEquals(guest, targetPlayer)))
+            if (guest == null || guest.IsHost || !guest.SceneIsReady || (targetPlayer != null && !ReferenceEquals(guest, targetPlayer)))
             {
                 continue;
             }
@@ -683,19 +818,94 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
             string stateStr = guestHq != null
                 ? AbmDefenseService.Instance.BuildServerFactionPayload(guestHq)
                 : string.Empty;
-            string digest = stateStr + "#" + threatsStr;
+            bool guestHasEwAsset = HasEarlyWarningAssetFromStatePayload(stateStr);
+            string filteredThreatsStr = FilterThreatsForGuest(allThreatsStr, guestHq, guestHasEwAsset);
+            string digest = stateStr + "#" + filteredThreatsStr;
             if (!force && lastAbmDigestByGuest.TryGetValue(guest, out string prev) && string.Equals(prev, digest, StringComparison.Ordinal))
             {
                 continue;
             }
 
             lastAbmDigestByGuest[guest] = digest;
-            SendToPlayer(guest, Join("abm", guestHq?.faction?.factionName ?? string.Empty, stateStr, threatsStr));
+            SendToPlayer(guest, Join("abm", guestHq?.faction?.factionName ?? string.Empty, stateStr, filteredThreatsStr));
         }
+    }
+
+    private static bool HasEarlyWarningAssetFromStatePayload(string stateStr)
+    {
+        if (string.IsNullOrEmpty(stateStr))
+        {
+            return false;
+        }
+
+        string[] f = stateStr.Split(',');
+        if (f.Length < 5)
+        {
+            return false;
+        }
+
+        int radarCount = int.TryParse(f[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out int rc) ? rc : 0;
+        int siloCount = int.TryParse(f[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out int sc) ? sc : 0;
+        return radarCount > 0 || siloCount > 0;
+    }
+
+    private static string FilterThreatsForGuest(string allThreatsStr, FactionHQ? guestHq, bool guestHasEwAsset)
+    {
+        if (guestHq == null || string.IsNullOrEmpty(allThreatsStr))
+        {
+            return string.Empty;
+        }
+
+        string guestFactionName = guestHq.faction?.factionName ?? string.Empty;
+        var sb = new StringBuilder();
+        string[] items = allThreatsStr.Split(';');
+        for (int i = 0; i < items.Length; i++)
+        {
+            string item = items[i];
+            if (string.IsNullOrEmpty(item))
+            {
+                continue;
+            }
+
+            string[] tf = item.Split(',');
+            if (tf.Length < 6)
+            {
+                continue;
+            }
+
+            if (!string.IsNullOrEmpty(guestFactionName) &&
+                string.Equals(tf[1], guestFactionName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (!guestHasEwAsset &&
+                (!float.TryParse(tf[2], NumberStyles.Float, CultureInfo.InvariantCulture, out float yield) || yield <= 200f))
+            {
+                continue;
+            }
+
+            if (sb.Length > 0)
+            {
+                sb.Append(';');
+            }
+
+            sb.Append(item);
+        }
+
+        return sb.ToString();
     }
 
     private void ReplayInitialWorldState(INetworkPlayer guest)
     {
+        if (guest == null || guest.IsHost || !guest.SceneIsReady)
+        {
+            return;
+        }
+
+        FactionHQ? guestHq = ResolvePlayerHq(guest);
+        lastGuestHqByPlayer[guest] = guestHq;
+
         FlushConfigIfChanged(force: true, targetPlayer: guest);
         FlushCitySync(force: true, targetPlayer: guest);
         FlushAbmSync(force: true, targetPlayer: guest);
@@ -707,28 +917,78 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
             SendToPlayer(guest, Join("road_done", item.Id.ToString(CultureInfo.InvariantCulture), PioneerRoadService.SerializeSamples(item.Samples)));
         }
 
+        ReplayActiveRoadsForGuest(guest, guestHq);
+
+        inactiveEmconScratch.Clear();
+        AiRadarEmconService.Instance.CollectInactiveEmconUnitIds(inactiveEmconScratch);
+        for (int i = 0; i < inactiveEmconScratch.Count; i++)
+        {
+            PersistentID pid = inactiveEmconScratch[i];
+            if (pid.IsValid)
+            {
+                SendToPlayer(guest, Join("radar_emcon", pid.Id.ToString(CultureInfo.InvariantCulture), "0"));
+            }
+        }
+        inactiveEmconScratch.Clear();
+
+        MdsFlatbedHaulService.Instance.SendInitialSyncToPlayer(guest);
+    }
+
+    private void ReplayActiveRoadsForGuest(INetworkPlayer guest, FactionHQ? guestHq)
+    {
+        if (guestHq == null)
+        {
+            return;
+        }
+
         IReadOnlyList<RoadConstructionProject> activeRoads = PioneerRoadService.Instance.GetActiveProjects();
         for (int i = 0; i < activeRoads.Count; i++)
         {
             RoadConstructionProject p = activeRoads[i];
+            if (p.Hq == null || !ReferenceEquals(p.Hq, guestHq))
+            {
+                continue;
+            }
+
             SendToPlayer(guest, Join(
                 "road_prog",
                 p.Id.ToString(CultureInfo.InvariantCulture),
-                p.Hq?.faction?.factionName ?? string.Empty,
+                p.Hq.faction?.factionName ?? string.Empty,
                 p.TotalLengthMeters.ToString("0.##", CultureInfo.InvariantCulture),
                 p.BuiltLengthMeters.ToString("0.##", CultureInfo.InvariantCulture),
                 "0",
                 PioneerRoadService.SerializeSamples(p.Samples)));
         }
+    }
 
-        MdsFlatbedHaulService.Instance.SendInitialSyncToPlayer(guest);
+    private void FlushGuestHqRoadSync()
+    {
+        foreach (INetworkPlayer guest in moddedGuests)
+        {
+            if (guest == null || guest.IsHost || !guest.SceneIsReady)
+            {
+                continue;
+            }
+
+            FactionHQ? currentHq = ResolvePlayerHq(guest);
+            lastGuestHqByPlayer.TryGetValue(guest, out FactionHQ? prevHq);
+            if (!ReferenceEquals(currentHq, prevHq))
+            {
+                lastGuestHqByPlayer[guest] = currentHq;
+                if (currentHq != null)
+                {
+                    ReplayActiveRoadsForGuest(guest, currentHq);
+                }
+            }
+        }
     }
 
     // --- Message Handlers ---
 
     private void OnHostMessage(INetworkPlayer sender, GcreNetMessage message)
     {
-        string? full = TryReassemble(sender.ToString() ?? "guest", message.Text ?? string.Empty);
+        string senderTag = $"{sender}#{RuntimeHelpers.GetHashCode(sender)}";
+        string? full = TryReassemble(senderTag, message.Text ?? string.Empty);
         if (string.IsNullOrEmpty(full))
         {
             return;
@@ -743,6 +1003,11 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
         string verb = args[0];
         if (verb == "hi")
         {
+            if (!sender.SceneIsReady || !IsGameplaySceneReady())
+            {
+                return;
+            }
+
             bool added = moddedGuests.Add(sender);
             if (added)
             {
@@ -788,7 +1053,12 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
             case "req_road":
                 if (args.Length >= 3)
                 {
-                    ParseRemoteRoadArgs(args[1], args[2], remoteWaypointsScratch, remoteForcedBridgeScratch);
+                    if (!ParseRemoteRoadArgs(args[1], args[2], remoteWaypointsScratch, remoteForcedBridgeScratch, out string parseError))
+                    {
+                        SendToPlayer(sender, Join("toast", "0", parseError));
+                        break;
+                    }
+
                     if (!PioneerRoadService.Instance.TryCommitRemoteRoad(senderHq, remoteWaypointsScratch, remoteForcedBridgeScratch, out string roadMsg))
                     {
                         SendToPlayer(sender, Join("toast", "0", roadMsg));
@@ -856,19 +1126,7 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
         string verb = args[0];
         if (verb == "hello")
         {
-            string hostProto = args.Length > 1 ? args[1] : string.Empty;
-            if (args.Length > 2)
-            {
-                ApplyConfigBody(args[2]);
-            }
-
-            bool firstHandshake = !HostHasGcre;
-            HostHasGcre = string.Equals(hostProto, WireProtocolVersion, StringComparison.Ordinal);
-            if (HostHasGcre && firstHandshake)
-            {
-                AddonLog.Info($"[Net] Connected to GCRE host ({hostProto}). Sending 'hi'.");
-                SendToHost(Join("hi", WireProtocolVersion));
-            }
+            HandleHelloOnClient(args);
             return;
         }
 
@@ -919,12 +1177,27 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
                     if (pid.TryGetUnit(out Unit unit) && unit != null && !unit.disabled)
                     {
                         List<UnitPart> parts = unit.GetAllParts();
-                        for (int p = 0; p < parts.Count; p++)
+                        if (args.Length >= 3 && int.TryParse(args[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out int partIndex))
                         {
-                            UnitPart? part = parts[p];
-                            if (part != null && part.hitPoints > 0f && part.hitPoints < 99.9f)
+                            if (partIndex >= 0 && partIndex < parts.Count)
                             {
-                                part.Repair();
+                                UnitPart? part = parts[partIndex];
+                                if (part != null && part.hitPoints > 0f && part.hitPoints < 99.9f)
+                                {
+                                    RepairPartClientVisuals(part);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            for (int p = 0; p < parts.Count; p++)
+                            {
+                                UnitPart? part = parts[p];
+                                if (part != null && part.hitPoints > 0f && part.hitPoints < 99.9f)
+                                {
+                                    RepairPartClientVisuals(part);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -945,36 +1218,28 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
                         unit.weaponStations != null &&
                         stationIdx < unit.weaponStations.Count)
                     {
-                        unit.weaponStations[stationIdx]?.Rearm(ammoDelta);
+                        WeaponStation? station = unit.weaponStations[stationIdx];
+                        if (station != null && station.Weapons != null && station.Weapons.Count > 0)
+                        {
+                            station.Rearm(ammoDelta);
+                        }
                     }
                 }
                 break;
 
             case "radar_emcon":
                 if (args.Length >= 3 &&
-                    uint.TryParse(args[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out uint radarPid))
+                    uint.TryParse(args[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out uint radarPid) &&
+                    radarPid != 0)
                 {
                     bool active = args[2] == "1";
-                    var pid = new PersistentID { Id = radarPid };
-                    if (pid.TryGetUnit(out Unit unit) && unit != null && !unit.disabled)
+                    if (!ApplyClientRadarEmcon(radarPid, active))
                     {
-                        Radar[] radars = unit.GetComponentsInChildren<Radar>(true);
-                        for (int i = 0; i < radars.Length; i++)
-                        {
-                            Radar r = radars[i];
-                            if (r == null || !r.IsOperational())
-                            {
-                                continue;
-                            }
-
-                            r.activated = active;
-                            r.enabled = active || r.IsJammed();
-                            if (!active)
-                            {
-                                r.detectedTargets.Clear();
-                                r.ResetRotators();
-                            }
-                        }
+                        pendingClientEmcon[radarPid] = (active, Time.unscaledTime + 10f);
+                    }
+                    else
+                    {
+                        pendingClientEmcon.Remove(radarPid);
                     }
                 }
                 break;
@@ -1071,7 +1336,145 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
         if (float.TryParse(p[14], NumberStyles.Float, CultureInfo.InvariantCulture, out float bc)) RemoteBridgeCostPer100m = bc;
         RemoteCheatTier3HqName = p.Length > 15 ? p[15] : string.Empty;
         RemoteCheatIgnoreCapsHqName = p.Length > 16 ? p[16] : string.Empty;
-        RemoteCheatIgnoreFactionLock = p.Length > 17 && p[17] == "1";
+        RemoteCheatIgnoreFactionLockHqName = p.Length > 17 ? p[17] : string.Empty;
+    }
+
+    private void HandleHelloOnClient(string[] args)
+    {
+        if (!IsGameplaySceneReady())
+        {
+            pendingHelloArgs = args;
+            return;
+        }
+
+        pendingHelloArgs = null;
+        string hostProto = args.Length > 1 ? args[1] : string.Empty;
+        if (args.Length > 2)
+        {
+            ApplyConfigBody(args[2]);
+        }
+
+        bool firstHandshake = !HostHasGcre;
+        HostHasGcre = string.Equals(hostProto, WireProtocolVersion, StringComparison.Ordinal);
+        if (HostHasGcre && firstHandshake)
+        {
+            AddonLog.Info($"[Net] Connected to GCRE host ({hostProto}). Sending 'hi'.");
+            SendToHost(Join("hi", WireProtocolVersion));
+        }
+    }
+
+    private static bool IsGameplaySceneReady()
+    {
+        if (Encyclopedia.i == null)
+        {
+            return false;
+        }
+
+        if (GameManager.gameState != GameState.SinglePlayer && GameManager.gameState != GameState.Multiplayer)
+        {
+            return false;
+        }
+
+        if (NetworkManagerNuclearOption.IsLoadingScene || NetworkSceneSingleton<LevelInfo>.i == null)
+        {
+            return false;
+        }
+
+        string sceneName = SceneManager.GetActiveScene().name;
+        return string.IsNullOrEmpty(sceneName) ||
+            (sceneName.IndexOf("Menu", StringComparison.OrdinalIgnoreCase) < 0 &&
+             sceneName.IndexOf("Waiting", StringComparison.OrdinalIgnoreCase) < 0 &&
+             !string.Equals(sceneName, "empty", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static void RepairPartClientVisuals(UnitPart part)
+    {
+        part.Repair();
+
+        if (UnitPartDamageMaterialField?.GetValue(part) is DamageMaterial dmgMat && dmgMat.renderers != null)
+        {
+            for (int i = 0; i < dmgMat.renderers.Count; i++)
+            {
+                Renderer? renderer = dmgMat.renderers[i];
+                if (renderer != null && renderer.material != null)
+                {
+                    renderer.material.SetFloat(HitPointsShaderId, part.hitPoints);
+                }
+            }
+        }
+
+        if (UnitPartFragmentedField != null && UnitPartFragmentedField.GetValue(part) is bool isFragmented && isFragmented)
+        {
+            UnitPartFragmentedField.SetValue(part, false);
+            if (UnitPartDisintegrateObjectsField?.GetValue(part) is GameObject[] disintegrateObjects)
+            {
+                int restoreLayer = part.gameObject.layer;
+                for (int i = 0; i < disintegrateObjects.Length; i++)
+                {
+                    GameObject? obj = disintegrateObjects[i];
+                    if (obj == null)
+                    {
+                        continue;
+                    }
+
+                    if (obj.TryGetComponent(out Renderer renderer) && renderer != null)
+                    {
+                        renderer.enabled = true;
+                    }
+
+                    obj.layer = restoreLayer;
+                }
+            }
+        }
+    }
+
+    private static bool ApplyClientRadarEmcon(uint radarPid, bool active)
+    {
+        var pid = new PersistentID { Id = radarPid };
+        if (!pid.TryGetUnit(out Unit unit) || unit == null || unit.disabled)
+        {
+            return false;
+        }
+
+        Radar[] radars = unit.GetComponentsInChildren<Radar>(true);
+        for (int i = 0; i < radars.Length; i++)
+        {
+            Radar r = radars[i];
+            if (r == null || !r.IsOperational())
+            {
+                continue;
+            }
+
+            r.activated = active;
+            r.enabled = active || r.IsJammed();
+            if (!active)
+            {
+                r.detectedTargets.Clear();
+                r.ResetRotators();
+            }
+        }
+
+        return true;
+    }
+
+    private void FlushPendingClientEmcon()
+    {
+        float now = Time.unscaledTime;
+        pendingEmconRemoveScratch.Clear();
+        foreach (KeyValuePair<uint, (bool Active, float ExpiresAt)> kv in pendingClientEmcon)
+        {
+            if (now >= kv.Value.ExpiresAt || ApplyClientRadarEmcon(kv.Key, kv.Value.Active))
+            {
+                pendingEmconRemoveScratch.Add(kv.Key);
+            }
+        }
+
+        for (int i = 0; i < pendingEmconRemoveScratch.Count; i++)
+        {
+            pendingClientEmcon.Remove(pendingEmconRemoveScratch[i]);
+        }
+
+        pendingEmconRemoveScratch.Clear();
     }
 
     private void HandleCitySyncOnClient(string[] args)
@@ -1102,39 +1505,127 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
         }
     }
 
-    private static void ParseRemoteRoadArgs(
+    private static bool ParseRemoteRoadArgs(
         string waypointsStr,
         string forcedStr,
         List<GlobalPosition> outWaypoints,
-        List<bool> outForced)
+        List<bool> outForced,
+        out string error)
     {
         outWaypoints.Clear();
         outForced.Clear();
+        error = string.Empty;
 
-        if (!string.IsNullOrEmpty(waypointsStr))
+        if (string.IsNullOrEmpty(waypointsStr))
         {
-            string[] pts = waypointsStr.Split(';');
-            for (int i = 0; i < pts.Length; i++)
+            error = "Invalid road request: missing waypoints.";
+            return false;
+        }
+
+        string[] pts = waypointsStr.Split(';');
+        if (pts.Length < 2 || pts.Length > MaxRemoteRoadWaypoints)
+        {
+            error = $"Invalid road waypoint count ({pts.Length}, allowed 2..{MaxRemoteRoadWaypoints}).";
+            return false;
+        }
+
+        float totalHorizMeters = 0f;
+        for (int i = 0; i < pts.Length; i++)
+        {
+            string[] c = pts[i].Split(',');
+            if (c.Length < 3 ||
+                !float.TryParse(c[0], NumberStyles.Float, CultureInfo.InvariantCulture, out float x) ||
+                !float.TryParse(c[1], NumberStyles.Float, CultureInfo.InvariantCulture, out float y) ||
+                !float.TryParse(c[2], NumberStyles.Float, CultureInfo.InvariantCulture, out float z) ||
+                !IsFinite(x) || !IsFinite(y) || !IsFinite(z) ||
+                !IsWithinMapBounds(x, y, z))
             {
-                string[] c = pts[i].Split(',');
-                if (c.Length >= 3 &&
-                    float.TryParse(c[0], NumberStyles.Float, CultureInfo.InvariantCulture, out float x) &&
-                    float.TryParse(c[1], NumberStyles.Float, CultureInfo.InvariantCulture, out float y) &&
-                    float.TryParse(c[2], NumberStyles.Float, CultureInfo.InvariantCulture, out float z))
+                outWaypoints.Clear();
+                error = "Invalid road waypoint coordinates.";
+                return false;
+            }
+
+            var wp = new GlobalPosition(x, y, z);
+            if (i > 0)
+            {
+                GlobalPosition prev = outWaypoints[i - 1];
+                float dx = wp.x - prev.x;
+                float dz = wp.z - prev.z;
+                float segLen = Mathf.Sqrt(dx * dx + dz * dz);
+                if (!IsFinite(segLen))
                 {
-                    outWaypoints.Add(new GlobalPosition(x, y, z));
+                    outWaypoints.Clear();
+                    error = "Invalid road segment length.";
+                    return false;
+                }
+
+                totalHorizMeters += segLen;
+                if (totalHorizMeters > MaxRemoteRoadTotalMeters)
+                {
+                    outWaypoints.Clear();
+                    error = $"Road route exceeds maximum length ({MaxRemoteRoadTotalMeters:0} m).";
+                    return false;
                 }
             }
+
+            outWaypoints.Add(wp);
         }
 
         if (!string.IsNullOrEmpty(forcedStr))
         {
             string[] fl = forcedStr.Split(',');
+            int maxForced = outWaypoints.Count - 1;
+            if (fl.Length > maxForced)
+            {
+                outWaypoints.Clear();
+                error = "Invalid road bridge flag count.";
+                return false;
+            }
+
             for (int i = 0; i < fl.Length; i++)
             {
                 outForced.Add(fl[i] == "1");
             }
         }
+
+        return true;
+    }
+
+    private static bool IsFinite(float value) => !float.IsNaN(value) && !float.IsInfinity(value);
+
+    private static bool IsWithinMapBounds(float x, float y, float z)
+    {
+        if (Mathf.Abs(y) > MaxRoadAltitudeMeters)
+        {
+            return false;
+        }
+
+        float halfX = FallbackMapHalfExtentMeters;
+        float halfZ = FallbackMapHalfExtentMeters;
+        LevelInfo? levelInfo = NetworkSceneSingleton<LevelInfo>.i;
+        if (levelInfo != null)
+        {
+            if (levelInfo.LoadedMapSettings != null)
+            {
+                Vector2 mapSize = levelInfo.LoadedMapSettings.MapSize;
+                if (mapSize.x > 100f)
+                {
+                    halfX = mapSize.x * 0.5f;
+                }
+
+                if (mapSize.y > 100f)
+                {
+                    halfZ = mapSize.y * 0.5f;
+                }
+            }
+            else if (levelInfo.mapSize > 100f)
+            {
+                halfX = levelInfo.mapSize * 0.5f;
+                halfZ = levelInfo.mapSize * 0.5f;
+            }
+        }
+
+        return Mathf.Abs(x) <= halfX && Mathf.Abs(z) <= halfZ;
     }
 
     // --- Transport / Chunking / Player Resolution ---
@@ -1157,6 +1648,7 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
         {
             moddedGuests.Remove(prunePlayersScratch[i]);
             lastAbmDigestByGuest.Remove(prunePlayersScratch[i]);
+            lastGuestHqByPlayer.Remove(prunePlayersScratch[i]);
         }
 
         prunePlayersScratch.Clear();
@@ -1228,7 +1720,26 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
         List<string> chunks = SplitPayload(payload);
         foreach (INetworkPlayer player in moddedGuests)
         {
-            if (player == null) continue;
+            if (player == null || player.IsHost || !player.SceneIsReady) continue;
+            for (int c = 0; c < chunks.Count; c++)
+            {
+                player.Send(new GcreNetMessage { Text = chunks[c] });
+            }
+        }
+    }
+
+    private void SendToModdedGuestsForHq(FactionHQ targetHq, string payload)
+    {
+        if (moddedGuests.Count == 0 || targetHq == null || string.IsNullOrEmpty(payload))
+        {
+            return;
+        }
+
+        List<string> chunks = SplitPayload(payload);
+        foreach (INetworkPlayer player in moddedGuests)
+        {
+            if (player == null || player.IsHost || !player.SceneIsReady) continue;
+            if (!ReferenceEquals(ResolvePlayerHq(player), targetHq)) continue;
             for (int c = 0; c < chunks.Count; c++)
             {
                 player.Send(new GcreNetMessage { Text = chunks[c] });
@@ -1311,13 +1822,14 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
             return null;
         }
 
-        string[] parts = text.Split(Sep);
-        if (parts.Length == 0 || parts[0] != PartVerb)
+        if (!text.StartsWith(PartVerb + SepText, StringComparison.Ordinal))
         {
             return text;
         }
 
-        if (parts.Length < 5 ||
+        string[] parts = text.Split(new[] { Sep }, 5);
+        if (parts.Length != 5 ||
+            parts[0] != PartVerb ||
             !int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int id) ||
             !int.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out int idx) ||
             !int.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out int total))
@@ -1333,10 +1845,10 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
         float now = Time.unscaledTime;
         PruneStalePieces(now);
 
-        string key = senderTag + ":" + id.ToString(CultureInfo.InvariantCulture);
+        string key = $"{senderTag}{Sep}{id.ToString(CultureInfo.InvariantCulture)}";
         if (!pieceBuffers.TryGetValue(key, out string?[] buf))
         {
-            if (pieceBuffers.Count >= MaxOpenPayloadsPerSender * 4)
+            if (CountOpenPayloads(senderTag) >= MaxOpenPayloadsPerSender)
             {
                 return null;
             }
@@ -1364,6 +1876,21 @@ internal sealed class GcreNetworkSync : IAddonTick, IAddonResetSession
         pieceBuffers.Remove(key);
         pieceStartedAt.Remove(key);
         return string.Concat(buf);
+    }
+
+    private int CountOpenPayloads(string senderTag)
+    {
+        string prefix = senderTag + SepText;
+        int count = 0;
+        foreach (string key in pieceBuffers.Keys)
+        {
+            if (key.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                count++;
+            }
+        }
+
+        return count;
     }
 
     private void PruneStalePieces(float now)

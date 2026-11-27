@@ -1,6 +1,8 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Reflection;
+using HarmonyLib;
 using Mirage;
 using NuclearOption.Networking;
 using UnityEngine;
@@ -30,6 +32,7 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
     {
         internal FactionHQ Hq = null!;
         internal GlobalPosition Destination;
+        internal Unit? TargetRepairUnit;
         internal float TimeoutAt;
         internal float LastOrderAt;
     }
@@ -51,6 +54,23 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
     internal static AiOperationalManeuverService Instance { get; } = new();
     internal static bool IsIssuingManagedOrder { get; private set; }
 
+    private static readonly MethodInfo? IsBallisticLauncherMethod = GroundControlReflection.EnemyCommanderType != null
+        ? AccessTools.Method(
+            GroundControlReflection.EnemyCommanderType,
+            "IsBallisticLauncherType",
+            new[] { typeof(VehicleDefinition) })
+        : null;
+
+    private static readonly Type? AreaFireType = AccessTools.TypeByName("GroundControlRts.CommanderAreaFire");
+    private static readonly MethodInfo? AreaFireIsAreaFiringMethod = AreaFireType != null
+        ? AccessTools.Method(AreaFireType, "IsAreaFiring", new[] { typeof(Unit) })
+        : null;
+
+    private static readonly FieldInfo? GroundVehicleCommandedDestField =
+        AccessTools.Field(typeof(GroundVehicle), "commandedDestination");
+    private static readonly FieldInfo? GroundVehicleHoldAtPlayerDestField =
+        AccessTools.Field(typeof(GroundVehicle), "holdAtPlayerCommandedDestination");
+
     private readonly Dictionary<Unit, RetreatEntry> retreatingUnits = new();
     private readonly Dictionary<Unit, FactionHQ> qrfUnits = new();
     private readonly Dictionary<FactionHQ, QrfFactionState> qrfByFaction = new();
@@ -58,7 +78,9 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
     private readonly Dictionary<Unit, float> artilleryCooldownUntil = new();
     private readonly Dictionary<Unit, float> artilleryScootUntil = new();
     private readonly Dictionary<Unit, GlobalPosition> artilleryScootDestinations = new();
+    private readonly HashSet<Unit> artilleryNearThreatLatched = new();
     private readonly Dictionary<Unit, GlobalPosition> managedExpectedDestinations = new();
+    private readonly Dictionary<Unit, bool> savedHoldAtDestination = new();
     private readonly Dictionary<Aircraft, (GlobalPosition AlertPos, float NextRetargetAt)> qrfAirRetargets = new();
     private readonly Dictionary<FactionHQ, ReconRefreshState> reconStates = new();
 
@@ -90,7 +112,9 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         artilleryCooldownUntil.Clear();
         artilleryScootUntil.Clear();
         artilleryScootDestinations.Clear();
+        artilleryNearThreatLatched.Clear();
         managedExpectedDestinations.Clear();
+        savedHoldAtDestination.Clear();
         qrfAirRetargets.Clear();
         reconStates.Clear();
         pruneScratch.Clear();
@@ -175,9 +199,9 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
 
         object? enemyService = GroundControlReflection.GetEnemyInstance();
         object? captureService = GroundControlReflection.GetCaptureInstance();
-        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
         GroundControlReflection.NetworkRunAsHostTeam(() =>
         {
+            FactionHQ? localHq = GroundControlReflection.GetLocalHq();
             foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
             {
                 if (hq == null || !((NetworkBehaviour)hq).IsServer || !GroundControlReflection.IsSafeAiFaction(hq, localHq))
@@ -276,6 +300,21 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
             lastArtilleryAmmo.Remove(pruneScratch[i]);
             artilleryCooldownUntil.Remove(pruneScratch[i]);
             artilleryScootDestinations.Remove(pruneScratch[i]);
+            artilleryNearThreatLatched.Remove(pruneScratch[i]);
+        }
+
+        pruneScratch.Clear();
+        foreach (Unit u in artilleryNearThreatLatched)
+        {
+            if (u == null || u.disabled)
+            {
+                pruneScratch.Add(u!);
+            }
+        }
+
+        for (int i = 0; i < pruneScratch.Count; i++)
+        {
+            artilleryNearThreatLatched.Remove(pruneScratch[i]);
         }
 
         pruneScratch.Clear();
@@ -290,6 +329,20 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         for (int i = 0; i < pruneScratch.Count; i++)
         {
             managedExpectedDestinations.Remove(pruneScratch[i]);
+        }
+
+        pruneScratch.Clear();
+        foreach (Unit u in savedHoldAtDestination.Keys)
+        {
+            if (u == null || u.disabled)
+            {
+                pruneScratch.Add(u!);
+            }
+        }
+
+        for (int i = 0; i < pruneScratch.Count; i++)
+        {
+            savedHoldAtDestination.Remove(pruneScratch[i]);
         }
 
         pruneScratch.Clear();
@@ -364,15 +417,38 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
             }
 
             Unit unit = kv.Key;
+            RetreatEntry entry = kv.Value;
             float cond = GroundControlReflection.GetUnitCondition(unit);
-            if (cond >= RetreatHealCompleteCondition || now >= kv.Value.TimeoutAt)
+            if (cond >= RetreatHealCompleteCondition || now >= entry.TimeoutAt)
             {
                 pruneScratch.Add(unit);
+                continue;
             }
-            else if (now >= kv.Value.LastOrderAt + 12f)
+
+            bool destinationShifted = false;
+            if (entry.TargetRepairUnit != null)
             {
-                IssueManagedPin(unit, kv.Value.Destination);
-                kv.Value.LastOrderAt = now;
+                GlobalPosition unitPos = unit.GlobalPosition();
+                if (entry.TargetRepairUnit.disabled
+                    || !GroundControlReflection.CanDriveBetween(unitPos, entry.TargetRepairUnit.GlobalPosition()))
+                {
+                    // Jackknife died or became unreachable; release now so this tick can re-route if another healer exists.
+                    pruneScratch.Add(unit);
+                    continue;
+                }
+
+                GlobalPosition liveSpot = OffsetAndValidateRepairSpot(unitPos, entry.TargetRepairUnit.GlobalPosition());
+                if (!FastMath.InRange(entry.Destination, liveSpot, 35f))
+                {
+                    entry.Destination = liveSpot;
+                    destinationShifted = true;
+                }
+            }
+
+            if (destinationShifted || now >= entry.LastOrderAt + 12f)
+            {
+                IssueManagedPin(unit, entry.Destination);
+                entry.LastOrderAt = now;
             }
         }
 
@@ -405,16 +481,12 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
             }
         }
 
+        IDictionary? batteries = cmdState != null ? GroundControlReflection.StateBatteriesProp?.GetValue(cmdState) as IDictionary : null;
+
         foreach (PersistentID pid in hq.factionUnits)
         {
             if (!pid.TryGetUnit(out Unit unit) || unit == null || unit.disabled)
             {
-                continue;
-            }
-
-            if (unit is Building && unit.definition is BuildingDefinition bd && bd.buildingType == BuildingType.DEP)
-            {
-                repairDepotPosScratch.Add(unit.GlobalPosition());
                 continue;
             }
 
@@ -426,6 +498,11 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
             if (GroundControlReflection.IsRepairUnit(unit))
             {
                 repairJackknifeScratch.Add(unit);
+                continue;
+            }
+
+            if (vdef.vehicleType == VehicleType.ART || (batteries != null && batteries.Contains(unit)))
+            {
                 continue;
             }
 
@@ -509,7 +586,7 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
                 continue;
             }
 
-            if (!TryFindNearestRepairSpot(unitPos, out GlobalPosition repairSpot))
+            if (!TryFindNearestRepairSpot(unitPos, out GlobalPosition repairSpot, out Unit? repairUnit))
             {
                 continue;
             }
@@ -523,6 +600,7 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
             {
                 Hq = hq,
                 Destination = repairSpot,
+                TargetRepairUnit = repairUnit,
                 TimeoutAt = now + RetreatTimeoutSeconds,
                 LastOrderAt = now,
             };
@@ -554,9 +632,10 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         return false;
     }
 
-    private bool TryFindNearestRepairSpot(GlobalPosition fromPos, out GlobalPosition spot)
+    private bool TryFindNearestRepairSpot(GlobalPosition fromPos, out GlobalPosition spot, out Unit? targetUnit)
     {
         spot = default;
+        targetUnit = null;
         float bestEffectiveDist = float.MaxValue;
         bool found = false;
 
@@ -572,6 +651,7 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
 
             bestEffectiveDist = lowerBound;
             spot = candidate;
+            targetUnit = null;
             found = true;
         }
 
@@ -593,29 +673,39 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
 
             bestEffectiveDist = lowerBound;
             spot = candidate;
+            targetUnit = jackknife;
             found = true;
         }
 
         if (found)
         {
-            Vector3 backDir = fromPos.AsVector3() - spot.AsVector3();
-            backDir.y = 0f;
-            if (backDir.sqrMagnitude > 1f)
-            {
-                backDir.Normalize();
-                GlobalPosition offset = new GlobalPosition(
-                    spot.x + backDir.x * 45f,
-                    spot.y,
-                    spot.z + backDir.z * 45f);
-                GlobalPosition snapped = GroundControlReflection.SnapToTerrain(offset);
-                if (!GroundControlReflection.IsBelowSeaLevel(snapped))
-                {
-                    spot = snapped;
-                }
-            }
+            spot = OffsetAndValidateRepairSpot(fromPos, spot);
         }
 
         return found;
+    }
+
+    private static GlobalPosition OffsetAndValidateRepairSpot(GlobalPosition fromPos, GlobalPosition candidate)
+    {
+        Vector3 backDir = fromPos.AsVector3() - candidate.AsVector3();
+        backDir.y = 0f;
+        if (backDir.sqrMagnitude > 1f)
+        {
+            backDir.Normalize();
+            GlobalPosition offset = new GlobalPosition(
+                candidate.x + backDir.x * 45f,
+                candidate.y,
+                candidate.z + backDir.z * 45f);
+            GlobalPosition snapped = GroundControlReflection.SnapToTerrain(offset);
+            if (!GroundControlReflection.IsBelowSeaLevel(snapped)
+                && GroundControlReflection.CanDriveBetween(fromPos, snapped)
+                && GroundControlReflection.TerrainRouteIsDrivable(fromPos, snapped))
+            {
+                return snapped;
+            }
+        }
+
+        return candidate;
     }
 
     private static float ComputeRepairSpotThreatPenalty(FactionHQ hq, GlobalPosition candidate)
@@ -706,6 +796,14 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
                 continue;
             }
 
+            if (IsBallisticOrAreaFiring(gun))
+            {
+                artilleryScootUntil.Remove(gun);
+                artilleryScootDestinations.Remove(gun);
+                artilleryNearThreatLatched.Remove(gun);
+                continue;
+            }
+
             GlobalPosition gunPos = gun.GlobalPosition();
             if (artilleryScootUntil.TryGetValue(gun, out float scootUntil)
                 && now < scootUntil
@@ -738,13 +836,20 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
                 }
             }
 
+            bool nearThreat = HasTrackedCounterBatteryOrSurfaceThreat(hq, gunPos, ArtilleryThreatRadiusMeters);
+            if (!nearThreat)
+            {
+                artilleryNearThreatLatched.Remove(gun);
+            }
+
+            bool shouldProximityScoot = nearThreat && !artilleryNearThreatLatched.Contains(gun);
+
             if (artilleryCooldownUntil.TryGetValue(gun, out float cdUntil) && now < cdUntil)
             {
                 continue;
             }
 
-            bool nearThreat = HasTrackedCounterBatteryOrSurfaceThreat(hq, gunPos, ArtilleryThreatRadiusMeters);
-            if (!ammoDropped && !nearThreat)
+            if (!ammoDropped && !shouldProximityScoot)
             {
                 continue;
             }
@@ -766,11 +871,48 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
                 artilleryCooldownUntil[gun] = now + ArtilleryScootCooldownSeconds;
                 artilleryScootUntil[gun] = now + ArtilleryScootHoldWindowSeconds;
                 artilleryScootDestinations[gun] = scootSpot;
+                if (nearThreat)
+                {
+                    artilleryNearThreatLatched.Add(gun);
+                }
+
                 IssueManagedHold(gun, scootSpot);
             }
         }
 
         batteryKeyScratch.Clear();
+    }
+
+    private static bool IsBallisticOrAreaFiring(Unit gun)
+    {
+        if (gun == null)
+        {
+            return true;
+        }
+
+        if (AreaFireIsAreaFiringMethod?.Invoke(null, new object?[] { gun }) is bool isAreaFiring && isAreaFiring)
+        {
+            return true;
+        }
+
+        if (gun.definition is VehicleDefinition vdef)
+        {
+            if (IsBallisticLauncherMethod != null
+                && IsBallisticLauncherMethod.Invoke(null, new object?[] { vdef }) is bool isBallistic
+                && isBallistic)
+            {
+                return true;
+            }
+
+            if (vdef.vehicleType == VehicleType.ART
+                && !string.IsNullOrEmpty(vdef.unitName)
+                && vdef.unitName.EndsWith("Ballistic Missile Launcher", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool HasTrackedCounterBatteryOrSurfaceThreat(FactionHQ aiHq, GlobalPosition gunPos, float radiusMeters)
@@ -796,7 +938,14 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
                 continue;
             }
 
-            if (unit is GroundVehicle)
+            if (unit is Building)
+            {
+                if (FastMath.SquareDistance(gunPos, info.GetPosition()) <= rSq)
+                {
+                    return true;
+                }
+            }
+            else if (unit is GroundVehicle || unit is Ship)
             {
                 if (levelNow - info.lastSpottedTime <= 90f && FastMath.SquareDistance(gunPos, info.GetPosition()) <= rSq)
                 {
@@ -909,6 +1058,7 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
                     ReleaseQrfForFaction(hq, qrfState);
                 }
 
+                AiBattlefieldIntelService.Instance.ClearRearQrfAlert(hq);
                 return;
             }
 
@@ -916,6 +1066,11 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         }
 
         bool hostileNearAlert = HasTrackedHostileNear(hq, alertPos, 3000f);
+        if (!qrfState.Active && attacker == null && !hostileNearAlert)
+        {
+            return;
+        }
+
         bool alertShifted = false;
         if (!qrfState.Active)
         {
@@ -1061,7 +1216,7 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         }
     }
 
-    private static bool HasFriendlyAirDefenceNear(FactionHQ hq, GlobalPosition center, float radiusMeters)
+    internal static bool HasFriendlyAirDefenceNear(FactionHQ hq, GlobalPosition center, float radiusMeters)
     {
         if (hq.factionUnits == null)
         {
@@ -1145,7 +1300,7 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
 
         bool objectiveShifted = state.LastObjectivePos.Equals(default)
             || FastMath.Distance(state.LastObjectivePos, objectivePos) > ReconShiftThresholdMeters;
-        if (!objectiveShifted && now < state.NextRefreshAt && reconPosts.Count > 0)
+        if (!objectiveShifted && now < state.NextRefreshAt)
         {
             return;
         }
@@ -1174,14 +1329,16 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
                 objectivePos.y,
                 objectivePos.z + dir.z * standoff);
             GlobalPosition high = GroundControlReflection.EnemyFindHighGround(raw);
-            if (!GroundControlReflection.IsBelowSeaLevel(high))
+            if (!GroundControlReflection.IsBelowSeaLevel(high)
+                && GroundControlReflection.CanDriveBetween(ownCenter, high)
+                && GroundControlReflection.TerrainRouteIsDrivable(ownCenter, high))
             {
                 reconPosts.Add(high);
             }
         }
     }
 
-    private static bool HasTrackedHostileNear(FactionHQ aiHq, GlobalPosition center, float radiusMeters)
+    internal static bool HasTrackedHostileNear(FactionHQ aiHq, GlobalPosition center, float radiusMeters)
     {
         if (aiHq.trackingDatabase == null)
         {
@@ -1315,10 +1472,22 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         return false;
     }
 
+    private void SaveOriginalHoldFlagIfNeeded(Unit? unit)
+    {
+        if (unit is GroundVehicle gv
+            && GroundVehicleHoldAtPlayerDestField != null
+            && !savedHoldAtDestination.ContainsKey(unit)
+            && GroundVehicleHoldAtPlayerDestField.GetValue(gv) is bool origHold)
+        {
+            savedHoldAtDestination[unit] = origHold;
+        }
+    }
+
     private void IssueManagedPin(Unit unit, GlobalPosition spot)
     {
         if (unit != null)
         {
+            SaveOriginalHoldFlagIfNeeded(unit);
             managedExpectedDestinations[unit] = spot;
         }
 
@@ -1338,6 +1507,7 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
     {
         if (unit != null)
         {
+            SaveOriginalHoldFlagIfNeeded(unit);
             managedExpectedDestinations[unit] = spot;
         }
 
@@ -1365,6 +1535,15 @@ internal sealed class AiOperationalManeuverService : IAddonTick, IAddonResetSess
         try
         {
             GroundControlReflection.EnemyReleaseCommandedDestination(unit);
+            if (unit is GroundVehicle gv)
+            {
+                GroundVehicleCommandedDestField?.SetValue(gv, false);
+                if (savedHoldAtDestination.TryGetValue(unit, out bool origHold))
+                {
+                    savedHoldAtDestination.Remove(unit);
+                    GroundVehicleHoldAtPlayerDestField?.SetValue(gv, origHold);
+                }
+            }
         }
         finally
         {

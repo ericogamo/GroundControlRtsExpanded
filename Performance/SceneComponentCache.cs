@@ -8,31 +8,45 @@ internal static class SceneComponentCache
 {
     private const float CacheTtlSeconds = 0.5f;
 
+    private static int unitGraphGeneration = 1;
+
     private static FireControl[] cachedFireControls = Array.Empty<FireControl>();
     private static float fireControlsExpireAt;
-    private static int fireControlsUnitCount = -1;
+    private static int fireControlsGeneration = -1;
 
     private static Turret[] cachedTurrets = Array.Empty<Turret>();
     private static float turretsExpireAt;
-    private static int turretsUnitCount = -1;
+    private static int turretsGeneration = -1;
 
     private static Factory[] cachedFactories = Array.Empty<Factory>();
     private static float factoriesExpireAt;
-    private static int factoriesUnitCount = -1;
+    private static int factoriesGeneration = -1;
 
     private static readonly List<VehicleDepot> CachedVehicleDepots = new(32);
     private static float vehicleDepotsExpireAt;
-    private static int vehicleDepotsUnitCount = -1;
+    private static int vehicleDepotsGeneration = -1;
+
+    internal static void BumpGeneration()
+    {
+        unchecked
+        {
+            unitGraphGeneration++;
+            if (unitGraphGeneration <= 0)
+            {
+                unitGraphGeneration = 1;
+            }
+        }
+    }
 
     internal static FireControl[] GetFireControls()
     {
         float now = Time.unscaledTime;
-        int unitCount = UnitRegistry.allUnits.Count;
-        if (now >= fireControlsExpireAt || unitCount != fireControlsUnitCount || ContainsDestroyed(cachedFireControls))
+        int gen = unitGraphGeneration;
+        if (now >= fireControlsExpireAt || gen != fireControlsGeneration || ContainsDestroyed(cachedFireControls))
         {
             cachedFireControls = UnityEngine.Object.FindObjectsOfType<FireControl>();
             fireControlsExpireAt = now + CacheTtlSeconds;
-            fireControlsUnitCount = unitCount;
+            fireControlsGeneration = gen;
         }
 
         return cachedFireControls;
@@ -41,12 +55,12 @@ internal static class SceneComponentCache
     internal static Turret[] GetTurrets()
     {
         float now = Time.unscaledTime;
-        int unitCount = UnitRegistry.allUnits.Count;
-        if (now >= turretsExpireAt || unitCount != turretsUnitCount || ContainsDestroyed(cachedTurrets))
+        int gen = unitGraphGeneration;
+        if (now >= turretsExpireAt || gen != turretsGeneration || ContainsDestroyed(cachedTurrets))
         {
             cachedTurrets = UnityEngine.Object.FindObjectsOfType<Turret>();
             turretsExpireAt = now + CacheTtlSeconds;
-            turretsUnitCount = unitCount;
+            turretsGeneration = gen;
         }
 
         return cachedTurrets;
@@ -55,12 +69,12 @@ internal static class SceneComponentCache
     internal static Factory[] GetFactories()
     {
         float now = Time.unscaledTime;
-        int unitCount = UnitRegistry.allUnits.Count;
-        if (now >= factoriesExpireAt || unitCount != factoriesUnitCount || ContainsDestroyed(cachedFactories))
+        int gen = unitGraphGeneration;
+        if (now >= factoriesExpireAt || gen != factoriesGeneration || ContainsDestroyed(cachedFactories))
         {
             cachedFactories = UnityEngine.Object.FindObjectsOfType<Factory>();
             factoriesExpireAt = now + CacheTtlSeconds;
-            factoriesUnitCount = unitCount;
+            factoriesGeneration = gen;
         }
 
         return cachedFactories;
@@ -69,8 +83,8 @@ internal static class SceneComponentCache
     internal static List<VehicleDepot> GetVehicleDepots()
     {
         float now = Time.unscaledTime;
-        int unitCount = UnitRegistry.allUnits.Count;
-        if (now >= vehicleDepotsExpireAt || unitCount != vehicleDepotsUnitCount)
+        int gen = unitGraphGeneration;
+        if (now >= vehicleDepotsExpireAt || gen != vehicleDepotsGeneration)
         {
             CachedVehicleDepots.Clear();
             for (int i = 0; i < UnitRegistry.allUnits.Count; i++)
@@ -82,7 +96,7 @@ internal static class SceneComponentCache
             }
 
             vehicleDepotsExpireAt = now + CacheTtlSeconds;
-            vehicleDepotsUnitCount = unitCount;
+            vehicleDepotsGeneration = gen;
         }
         else
         {
@@ -122,9 +136,10 @@ internal static class SceneComponentCache
         turretsExpireAt = 0f;
         factoriesExpireAt = 0f;
         vehicleDepotsExpireAt = 0f;
-        fireControlsUnitCount = -1;
-        turretsUnitCount = -1;
-        factoriesUnitCount = -1;
-        vehicleDepotsUnitCount = -1;
+        fireControlsGeneration = -1;
+        turretsGeneration = -1;
+        factoriesGeneration = -1;
+        vehicleDepotsGeneration = -1;
+        BumpGeneration();
     }
 }

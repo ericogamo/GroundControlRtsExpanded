@@ -299,18 +299,21 @@ internal static class EcoStartingBuildersContextGuardPatch
     private static bool Prepare() => GroundControlReflection.EcoTryGiveStartingBuildersMethod != null;
     private static MethodBase TargetMethod() => GroundControlReflection.EcoTryGiveStartingBuildersMethod!;
 
-    private static void Prefix(FactionHQ hq, out FactionHQ? __state)
+    private static void Prefix(FactionHQ hq, out (FactionHQ? PrevHq, bool PrevBuilderScope) __state)
     {
-        __state = ReviewContextGuardPatch.ActiveAiHq;
-        if (__state == null && hq != null)
+        __state = (ReviewContextGuardPatch.ActiveAiHq, DynamicCapAndTechService.BuilderExemptionScope);
+        if (__state.PrevHq == null && hq != null)
         {
             ReviewContextGuardPatch.ActiveAiHq = hq;
         }
+
+        DynamicCapAndTechService.BuilderExemptionScope = true;
     }
 
-    private static Exception? Finalizer(Exception? __exception, FactionHQ? __state)
+    private static Exception? Finalizer(Exception? __exception, (FactionHQ? PrevHq, bool PrevBuilderScope) __state)
     {
-        ReviewContextGuardPatch.ActiveAiHq = __state;
+        ReviewContextGuardPatch.ActiveAiHq = __state.PrevHq;
+        DynamicCapAndTechService.BuilderExemptionScope = __state.PrevBuilderScope;
         return __exception;
     }
 }
@@ -321,18 +324,21 @@ internal static class EcoLocalBuilderContextGuardPatch
     private static bool Prepare() => GroundControlReflection.EcoTrySpawnLocalBuilderMethod != null;
     private static MethodBase TargetMethod() => GroundControlReflection.EcoTrySpawnLocalBuilderMethod!;
 
-    private static void Prefix(object site, out FactionHQ? __state)
+    private static void Prefix(object site, out (FactionHQ? PrevHq, bool PrevBuilderScope) __state)
     {
-        __state = ReviewContextGuardPatch.ActiveAiHq;
-        if (__state == null && site != null && GroundControlReflection.SiteHqProp?.GetValue(site) is FactionHQ hq)
+        __state = (ReviewContextGuardPatch.ActiveAiHq, DynamicCapAndTechService.BuilderExemptionScope);
+        if (__state.PrevHq == null && site != null && GroundControlReflection.SiteHqProp?.GetValue(site) is FactionHQ hq)
         {
             ReviewContextGuardPatch.ActiveAiHq = hq;
         }
+
+        DynamicCapAndTechService.BuilderExemptionScope = true;
     }
 
-    private static Exception? Finalizer(Exception? __exception, FactionHQ? __state)
+    private static Exception? Finalizer(Exception? __exception, (FactionHQ? PrevHq, bool PrevBuilderScope) __state)
     {
-        ReviewContextGuardPatch.ActiveAiHq = __state;
+        ReviewContextGuardPatch.ActiveAiHq = __state.PrevHq;
+        DynamicCapAndTechService.BuilderExemptionScope = __state.PrevBuilderScope;
         return __exception;
     }
 }
@@ -512,6 +518,83 @@ internal static class EconomyGetStructureCostPatch
     }
 }
 
+internal static class StructureLabelHqScope
+{
+    [ThreadStatic]
+    internal static FactionHQ? ActiveBuildHq;
+}
+
+[HarmonyPatch]
+internal static class EconomyCommitBuildHqContextPatch
+{
+    private static bool Prepare() => GroundControlReflection.EconomyCommitBuildMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EconomyCommitBuildMethod!;
+
+    [HarmonyPriority(Priority.First)]
+    private static void Prefix(FactionHQ? hq, out FactionHQ? __state)
+    {
+        __state = StructureLabelHqScope.ActiveBuildHq;
+        if (hq != null)
+        {
+            StructureLabelHqScope.ActiveBuildHq = hq;
+        }
+    }
+
+    private static Exception? Finalizer(Exception? __exception, FactionHQ? __state)
+    {
+        StructureLabelHqScope.ActiveBuildHq = __state;
+        return __exception;
+    }
+}
+
+[HarmonyPatch]
+internal static class EconomyHostBuildHqContextPatch
+{
+    private static readonly MethodInfo? HostBuildMethod =
+        GroundControlReflection.EconomyServiceType != null
+            ? AccessTools.Method(GroundControlReflection.EconomyServiceType, "HostBuild", new[] { typeof(FactionHQ), typeof(string[]) })
+            : null;
+
+    private static bool Prepare() => HostBuildMethod != null;
+    private static MethodBase TargetMethod() => HostBuildMethod!;
+
+    [HarmonyPriority(Priority.First)]
+    private static void Prefix(FactionHQ? hq, out FactionHQ? __state)
+    {
+        __state = StructureLabelHqScope.ActiveBuildHq;
+        if (hq != null)
+        {
+            StructureLabelHqScope.ActiveBuildHq = hq;
+        }
+    }
+
+    private static Exception? Finalizer(Exception? __exception, FactionHQ? __state)
+    {
+        StructureLabelHqScope.ActiveBuildHq = __state;
+        return __exception;
+    }
+}
+
+[HarmonyPatch]
+internal static class EconomyUiDrawCatalogHqContextPatch
+{
+    private static bool Prepare() => GroundControlReflection.EcoUiDrawCatalogMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EcoUiDrawCatalogMethod!;
+
+    [HarmonyPriority(Priority.First)]
+    private static void Prefix(out FactionHQ? __state)
+    {
+        __state = StructureLabelHqScope.ActiveBuildHq;
+        StructureLabelHqScope.ActiveBuildHq = GroundControlReflection.GetLocalHq();
+    }
+
+    private static Exception? Finalizer(Exception? __exception, FactionHQ? __state)
+    {
+        StructureLabelHqScope.ActiveBuildHq = __state;
+        return __exception;
+    }
+}
+
 [HarmonyPatch]
 internal static class EconomyGetStructureLabelPatch
 {
@@ -520,10 +603,10 @@ internal static class EconomyGetStructureLabelPatch
 
     private static bool Prefix(BuildingDefinition? definition, ref string __result)
     {
+        FactionHQ? targetHq = StructureLabelHqScope.ActiveBuildHq ?? GroundControlReflection.GetLocalHq();
         if (RtsBuildingCatalog.TryGetSpec(definition, out RtsBuildingSpec spec))
         {
-            FactionHQ? localHq = GroundControlReflection.GetLocalHq();
-            int tier = localHq != null ? DynamicCapAndTechService.Instance.GetSnapshot(localHq).TechTier : 1;
+            int tier = targetHq != null ? DynamicCapAndTechService.Instance.GetSnapshot(targetHq).TechTier : 1;
             __result = spec.RequiredTechTier > tier
                 ? $"{spec.DisplayName} [Need T{spec.RequiredTechTier}]"
                 : spec.DisplayName;
@@ -534,7 +617,7 @@ internal static class EconomyGetStructureLabelPatch
             && MdsBridgeBootstrap.IsMdsBuildDefinition?.Invoke(definition) == true
             && MdsBridgeBootstrap.GetMdsBuildLabel != null)
         {
-            __result = MdsBridgeBootstrap.GetMdsBuildLabel(definition, GroundControlReflection.GetLocalHq());
+            __result = MdsBridgeBootstrap.GetMdsBuildLabel(definition, targetHq);
             return false;
         }
 
@@ -575,5 +658,146 @@ internal static class EconomyReviewEnemyCityPatch
     private static void Prefix(object __instance, FactionHQ hq)
     {
         DynamicCapAndTechService.Instance.TickAiCityDecision(__instance, hq);
+        if (AddonConfig.ModEnabled.Value && hq != null && ((Mirage.NetworkBehaviour)hq).IsServer)
+        {
+            MdsBridgeBootstrap.TickAiMdsDeploymentAction?.Invoke(hq);
+        }
+    }
+}
+
+[HarmonyPatch(typeof(VehicleDepot), nameof(VehicleDepot.TrySpawnVehicle), new[] { typeof(VehicleDefinition) })]
+internal static class VehicleDepotTrySpawnVehicleCapPatch
+{
+    [HarmonyPriority(Priority.First)]
+    private static void Prefix(VehicleDefinition? vehicleDefinition, out bool __state)
+    {
+        __state = DynamicCapAndTechService.BuilderExemptionScope;
+        if (vehicleDefinition != null && GroundControlReflection.IsBuilderVehicle(vehicleDefinition))
+        {
+            DynamicCapAndTechService.BuilderExemptionScope = true;
+        }
+    }
+
+    private static void Postfix(VehicleDepot __instance, bool __result)
+    {
+        if (__result && __instance != null && __instance.NetworkHQ != null && DynamicCapAndTechService.IsActive)
+        {
+            DynamicCapAndTechService.Instance.InvalidateCache(__instance.NetworkHQ);
+        }
+    }
+
+    private static Exception? Finalizer(Exception? __exception, bool __state)
+    {
+        DynamicCapAndTechService.BuilderExemptionScope = __state;
+        return __exception;
+    }
+}
+
+[HarmonyPatch]
+internal static class SpawnServiceQueueVehicleBuilderContextPatch
+{
+    private static readonly MethodInfo? QueueVehicleMethod =
+        GroundControlReflection.SpawnServiceType != null
+            ? AccessTools.Method(GroundControlReflection.SpawnServiceType, "QueueVehicle", new[] { typeof(VehicleDefinition) })
+            : null;
+
+    private static bool Prepare() => QueueVehicleMethod != null;
+    private static MethodBase TargetMethod() => QueueVehicleMethod!;
+
+    [HarmonyPriority(Priority.First)]
+    private static void Prefix(VehicleDefinition? definition, out bool __state)
+    {
+        __state = DynamicCapAndTechService.BuilderExemptionScope;
+        if (definition != null && GroundControlReflection.IsBuilderVehicle(definition))
+        {
+            DynamicCapAndTechService.BuilderExemptionScope = true;
+        }
+    }
+
+    private static Exception? Finalizer(Exception? __exception, bool __state)
+    {
+        DynamicCapAndTechService.BuilderExemptionScope = __state;
+        return __exception;
+    }
+}
+
+[HarmonyPatch]
+internal static class NavalTryPurchaseCapInvalidatePatch
+{
+    private static readonly MethodInfo? TryPurchaseForHqMethod =
+        GroundControlReflection.NavalPurchaseServiceType != null
+            ? AccessTools.Method(
+                GroundControlReflection.NavalPurchaseServiceType,
+                "TryPurchaseForHq",
+                new[] { typeof(FactionHQ), typeof(ShipDefinition), typeof(GlobalPosition), typeof(Ship).MakeByRefType(), typeof(GlobalPosition?) })
+            : null;
+
+    private static bool Prepare() => TryPurchaseForHqMethod != null;
+    private static MethodBase TargetMethod() => TryPurchaseForHqMethod!;
+
+    private static void Postfix(FactionHQ? hq, float __result)
+    {
+        if (__result >= 0f && hq != null && DynamicCapAndTechService.IsActive)
+        {
+            DynamicCapAndTechService.Instance.InvalidateCache(hq);
+        }
+    }
+}
+
+[HarmonyPatch]
+internal static class NavalCompletePurchaseCapInvalidatePatch
+{
+    private static readonly MethodInfo? CompletePurchaseMethod =
+        GroundControlReflection.NavalPurchaseServiceType != null
+            ? AccessTools.Method(
+                GroundControlReflection.NavalPurchaseServiceType,
+                "CompletePurchase",
+                new[] { typeof(ShipDefinition), typeof(FactionHQ), typeof(Unit), typeof(float) })
+            : null;
+
+    private static bool Prepare() => CompletePurchaseMethod != null;
+    private static MethodBase TargetMethod() => CompletePurchaseMethod!;
+
+    private static void Postfix(FactionHQ? hq, bool __result)
+    {
+        if (__result && hq != null && DynamicCapAndTechService.IsActive)
+        {
+            DynamicCapAndTechService.Instance.InvalidateCache(hq);
+        }
+    }
+}
+
+[HarmonyPatch]
+internal static class SupplyHeliSpawnCapInvalidatePatch
+{
+    private static readonly MethodInfo? TrySpawnCargoRunAtAirbaseMethod =
+        GroundControlReflection.SupplyHeliServiceType != null && GroundControlReflection.SupplyHeliQueuedSpawnType != null
+            ? AccessTools.Method(
+                GroundControlReflection.SupplyHeliServiceType,
+                "TrySpawnCargoRunAtAirbase",
+                new[] { GroundControlReflection.SupplyHeliQueuedSpawnType, typeof(Airbase), typeof(FactionHQ) })
+            : null;
+
+    private static bool Prepare() => TrySpawnCargoRunAtAirbaseMethod != null;
+    private static MethodBase TargetMethod() => TrySpawnCargoRunAtAirbaseMethod!;
+
+    private static void Postfix(FactionHQ? hq)
+    {
+        if (hq != null && DynamicCapAndTechService.IsActive)
+        {
+            DynamicCapAndTechService.Instance.InvalidateCache(hq);
+        }
+    }
+}
+
+[HarmonyPatch(typeof(Unit), nameof(Unit.UnitDisabled), new[] { typeof(bool), typeof(bool) })]
+internal static class UnitDisabledCapInvalidatePatch
+{
+    private static void Postfix(Unit __instance)
+    {
+        if (__instance != null && __instance.NetworkHQ != null && DynamicCapAndTechService.IsActive)
+        {
+            DynamicCapAndTechService.Instance.InvalidateCache(__instance.NetworkHQ);
+        }
     }
 }

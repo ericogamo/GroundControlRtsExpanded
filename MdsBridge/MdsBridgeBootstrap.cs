@@ -20,6 +20,7 @@ internal static class MdsBridgeBootstrap
     internal static Action<FactionHQ, System.Collections.Generic.List<GlobalPosition>>? CollectFriendlyMdsEwPositions { get; set; }
     internal static Func<FactionHQ, int>? GetHostileMdsCompensation { get; set; }
     internal static Func<FactionHQ, int>? CountKnownHostileMdsSites { get; set; }
+    internal static Action<Unit, GlobalPosition>? UpdateMdsSitePosition { get; set; }
 
     // Future Milestone 6 (ABM Interceptor Plant) hook points
     internal static Func<FactionHQ, int>? ExternalAbmStockpileQuery { get; set; }
@@ -140,6 +141,8 @@ internal static class MdsBridgeBootstrap
         CollectFriendlyMdsEwPositions = null;
         GetHostileMdsCompensation = null;
         CountKnownHostileMdsSites = null;
+        UpdateMdsSitePosition = null;
+        RaiseBallisticThreatAction = null;
         EnsureAirdropMountsInjectedAction = null;
         IsMdsAirdropMountAllowedForHq = null;
         GetMdsAirdropMountSuffix = null;

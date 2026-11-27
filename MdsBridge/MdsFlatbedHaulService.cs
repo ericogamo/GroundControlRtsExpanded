@@ -26,9 +26,10 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
         internal float LoadStartedAt { get; set; }
         internal float LoadDurationSeconds { get; set; } = 2.4f;
         internal float GroundClearanceY { get; set; }
+        internal float ApproachStartedAt { get; set; }
         internal float NextOrderAt { get; set; }
         internal float StoppedSince { get; set; } = float.MaxValue;
-        internal Collider[] SavedColliders { get; set; } = Array.Empty<Collider>();
+        internal List<(Collider ContainerCol, Collider HaulerCol)> IgnoredCollisionPairs { get; } = new();
         internal bool WasKinematic { get; set; }
     }
 
@@ -42,16 +43,21 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
         internal Vector3 BedOffset { get; set; }
         internal Vector3 LoadStartPos { get; set; }
         internal Quaternion LoadStartRot { get; set; }
+        internal float CreatedAt { get; set; }
         internal float LoadStartedAt { get; set; }
         internal float LoadDurationSeconds { get; set; } = 2.4f;
         internal bool PhysicsLocked { get; set; }
-        internal Collider[] SavedColliders { get; set; } = Array.Empty<Collider>();
+        internal List<(Collider ContainerCol, Collider HaulerCol)> IgnoredCollisionPairs { get; } = new();
         internal bool WasKinematic { get; set; }
     }
 
     private const float MaxTractorSearchMeters = 300f;
     private const float StagingDistanceMeters = 14f;
     private const float HitchArrivalMeters = 18f;
+    private const float StalledHitchRadiusMeters = 22f;
+    private const float MaxApproachTimeoutSeconds = 90f;
+    private const float ClientUnresolvedTimeoutSeconds = 5f;
+    private const float ClientRelocationTimeoutSeconds = 30f;
     private const float BedHeightMeters = 0.82f;
 
     internal static MdsFlatbedHaulService Instance { get; } = new();
@@ -59,6 +65,8 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
     private readonly List<HaulJob> jobs = new();
     private readonly Dictionary<uint, ClientMirroredHaulJob> clientJobs = new();
     private readonly Dictionary<uint, (GlobalPosition Pos, float Yaw)> relocatedBuildings = new();
+    private readonly Dictionary<uint, (GlobalPosition Pos, float Yaw, float AddedAt)> pendingClientRelocations = new();
+    private readonly List<uint> relocationScratch = new();
     private readonly List<uint> clientCleanupScratch = new();
     private float nextAirdropRetryAt;
     private Unit? availabilityContainer;
@@ -94,6 +102,8 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
         jobs.Clear();
         clientJobs.Clear();
         relocatedBuildings.Clear();
+        pendingClientRelocations.Clear();
+        relocationScratch.Clear();
         clientCleanupScratch.Clear();
         nextAirdropRetryAt = 0f;
         availabilityContainer = null;
@@ -127,9 +137,21 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
                 targetPlayer: guest);
         }
 
+        relocationScratch.Clear();
         foreach (KeyValuePair<uint, (GlobalPosition Pos, float Yaw)> kv in relocatedBuildings)
         {
+            if (!new PersistentID { Id = kv.Key }.TryGetUnit(out Unit unit) || unit == null || unit.disabled)
+            {
+                relocationScratch.Add(kv.Key);
+                continue;
+            }
+
             GcreNetworkSync.BroadcastRelocatedBuilding(kv.Key, kv.Value.Pos, kv.Value.Yaw, targetPlayer: guest);
+        }
+
+        for (int i = 0; i < relocationScratch.Count; i++)
+        {
+            relocatedBuildings.Remove(relocationScratch[i]);
         }
     }
 
@@ -416,15 +438,32 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
             return false;
         }
 
+        bool isLocal = ReferenceEquals(job.Hq, GroundControlReflection.GetLocalHq());
         if (job.Stage == HaulStage.Loaded)
         {
+            if (!TryResolveDryDropPosition(job, allowHaulerFallback: false, out _, out _))
+            {
+                if (isLocal)
+                {
+                    SetFeedback("Cannot drop container over water.");
+                }
+
+                return true;
+            }
+
             UnloadJob(job);
-            SetFeedback("Trailer dropped.");
+            if (isLocal)
+            {
+                SetFeedback("Trailer dropped.");
+            }
         }
         else
         {
             CancelApproachingOrLoadingJob(job);
-            SetFeedback("Trailer pickup cancelled.");
+            if (isLocal)
+            {
+                SetFeedback("Trailer pickup cancelled.");
+            }
         }
 
         return true;
@@ -454,6 +493,12 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
 
         if (job.Stage == HaulStage.Loaded)
         {
+            if (!TryResolveDryDropPosition(job, allowHaulerFallback: false, out _, out _))
+            {
+                reply = "Cannot drop container over water.";
+                return true;
+            }
+
             UnloadJob(job);
             reply = "Trailer dropped.";
         }
@@ -512,6 +557,19 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
                 }
 
                 RestoreContainerPhysics(job, placeOnGround: false);
+                if (job.Container != null && job.Container.persistentID.IsValid)
+                {
+                    uint deadContainerPid = job.Container.persistentID.Id;
+                    relocatedBuildings.Remove(deadContainerPid);
+                    uint haulerPid = job.Hauler != null && job.Hauler.persistentID.IsValid ? job.Hauler.persistentID.Id : 0u;
+                    GcreNetworkSync.BroadcastHaulDrop(
+                        deadContainerPid,
+                        haulerPid,
+                        placedOnGround: false,
+                        job.Container.GlobalPosition(),
+                        job.Container.transform.eulerAngles.y);
+                }
+
                 jobs.RemoveAt(i);
                 continue;
             }
@@ -522,6 +580,16 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
                 {
                     DropContainerAtCurrentSpot(job);
                 }
+                else if (job.Container.persistentID.IsValid)
+                {
+                    uint haulerPid = job.Hauler != null && job.Hauler.persistentID.IsValid ? job.Hauler.persistentID.Id : 0u;
+                    GcreNetworkSync.BroadcastHaulDrop(
+                        job.Container.persistentID.Id,
+                        haulerPid,
+                        placedOnGround: false,
+                        job.Container.GlobalPosition(),
+                        job.Container.transform.eulerAngles.y);
+                }
 
                 jobs.RemoveAt(i);
                 continue;
@@ -529,13 +597,26 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
 
             if (job.Stage == HaulStage.Approaching)
             {
+                if (now - job.ApproachStartedAt >= MaxApproachTimeoutSeconds)
+                {
+                    string timeoutMsg = $"{GroundControlReflection.GetUnitLabel(job.Hauler)} could not reach {GroundControlReflection.GetUnitLabel(job.Container)} (approach timed out).";
+                    if (ReferenceEquals(job.Hq, GroundControlReflection.GetLocalHq()))
+                    {
+                        SetFeedback(timeoutMsg);
+                    }
+
+                    AddonLog.Warn($"[Trailer] {timeoutMsg}");
+                    CancelApproachingOrLoadingJob(job);
+                    continue;
+                }
+
                 Vector3 delta = job.Hauler.transform.position - job.Container.transform.position;
                 delta.y = 0f;
                 float dist = delta.magnitude;
                 bool stopped = Mathf.Abs(job.Hauler.speed) <= 1.0f;
                 job.StoppedSince = stopped ? Mathf.Min(job.StoppedSince, now) : float.MaxValue;
 
-                if (dist <= HitchArrivalMeters || (dist <= 60f && (now - job.StoppedSince) >= 4.0f))
+                if (dist <= HitchArrivalMeters || (dist <= StalledHitchRadiusMeters && (now - job.StoppedSince) >= 4.0f))
                 {
                     BeginLoadingOntoBed(job, now);
                 }
@@ -567,7 +648,11 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
                     GroundControlReflection.SetUnitHoldPosition(job.Hauler, false);
                     BroadcastJobState(job, now);
                     string msg = $"{GroundControlReflection.GetUnitLabel(job.Container)} loaded onto {GroundControlReflection.GetUnitLabel(job.Hauler)}.";
-                    SetFeedback(msg);
+                    if (ReferenceEquals(job.Hq, GroundControlReflection.GetLocalHq()))
+                    {
+                        SetFeedback(msg);
+                    }
+
                     AddonLog.Info($"[Trailer] {msg}");
                 }
 
@@ -601,24 +686,34 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
     {
         if (FindJobByUnit(container) != null || FindJobByUnit(hauler) != null)
         {
-            SetFeedback("Unit is already involved in a trailer task.");
+            if (ReferenceEquals(hq, GroundControlReflection.GetLocalHq()))
+            {
+                SetFeedback("Unit is already involved in a trailer task.");
+            }
+
             return;
         }
 
+        float now = Time.time;
         var job = new HaulJob
         {
             Container = container,
             Hauler = hauler,
             Hq = hq,
             Stage = HaulStage.Approaching,
+            ApproachStartedAt = now,
             NextOrderAt = 0f,
         };
         jobs.Add(job);
 
         GlobalPosition pickupPt = ComputeApproachPoint(hauler, container);
         IssueHaulerDestination(hauler, pickupPt);
-        BroadcastJobState(job, Time.time);
-        SetFeedback($"{GroundControlReflection.GetUnitLabel(hauler)} dispatched to load container.");
+        BroadcastJobState(job, now);
+        if (ReferenceEquals(hq, GroundControlReflection.GetLocalHq()))
+        {
+            SetFeedback($"{GroundControlReflection.GetUnitLabel(hauler)} dispatched to load container.");
+        }
+
         AddonLog.Info($"[Trailer] Dispatched '{GroundControlReflection.GetUnitLabel(hauler)}' to load '{GroundControlReflection.GetUnitLabel(container)}'.");
     }
 
@@ -630,18 +725,7 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
         GlobalPosition groundAtContainer = GroundControlReflection.SnapToTerrain(job.Container.GlobalPosition());
         job.GroundClearanceY = Mathf.Clamp(job.Container.transform.position.y - groundAtContainer.ToLocalPosition().y, 0f, 3f);
 
-        Collider[] allColliders = job.Container.GetComponentsInChildren<Collider>(true);
-        var enabledList = new List<Collider>(allColliders.Length);
-        for (int i = 0; i < allColliders.Length; i++)
-        {
-            if (allColliders[i] != null && allColliders[i].enabled)
-            {
-                allColliders[i].enabled = false;
-                enabledList.Add(allColliders[i]);
-            }
-        }
-
-        job.SavedColliders = enabledList.ToArray();
+        IgnoreContainerHaulerCollisions(job.Container, job.Hauler, job.IgnoredCollisionPairs);
         if (job.Container.rb != null)
         {
             job.WasKinematic = job.Container.rb.isKinematic;
@@ -675,7 +759,11 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
         DropContainerAtCurrentSpot(job);
 
         string msg = $"{GroundControlReflection.GetUnitLabel(job.Container)} unloaded & deploying.";
-        SetFeedback(msg);
+        if (ReferenceEquals(job.Hq, GroundControlReflection.GetLocalHq()))
+        {
+            SetFeedback(msg);
+        }
+
         AddonLog.Info($"[Trailer] {msg}");
     }
 
@@ -690,6 +778,7 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
         (GlobalPosition dropPos, float yaw) = RestoreContainerPhysics(job, placeOnGround: true);
         MdsBridgeBootstrap.SetMdsHaulerOutriggersDeployed?.Invoke(job.Hauler, false);
         MdsBridgeBootstrap.SetMdsContainerTransitState?.Invoke(job.Container, false);
+        MdsBridgeBootstrap.UpdateMdsSitePosition?.Invoke(job.Container, dropPos);
 
         if (job.Container.persistentID.IsValid)
         {
@@ -703,10 +792,64 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
         }
     }
 
+    private static bool TryResolveDryDropPosition(
+        HaulJob job,
+        bool allowHaulerFallback,
+        out GlobalPosition snappedDry,
+        out float yawDeg)
+    {
+        snappedDry = default;
+        yawDeg = job.Hauler != null ? job.Hauler.transform.eulerAngles.y : job.Container.transform.eulerAngles.y;
+
+        if (job.Hauler != null && !job.Hauler.disabled)
+        {
+            float halfHaulerDrop = Mathf.Max(3.0f, (job.Hauler.definition?.length ?? 9f) * 0.5f);
+            float halfCargoDrop = Mathf.Max(2.0f, (job.Container.definition?.length ?? 6.06f) * 0.5f);
+            float dropBackDist = Mathf.Max(7.5f, halfHaulerDrop + halfCargoDrop + 1.0f);
+            Vector3 haulerPos = job.Hauler.transform.position;
+            Vector3 fwd = job.Hauler.transform.forward;
+            Vector3 right = job.Hauler.transform.right;
+
+            Vector3[] candidates =
+            {
+                haulerPos - fwd * dropBackDist,
+                haulerPos + fwd * dropBackDist,
+                haulerPos + right * 6.0f,
+                haulerPos - right * 6.0f,
+            };
+
+            for (int i = 0; i < candidates.Length; i++)
+            {
+                GlobalPosition candidate = GroundControlReflection.SnapToTerrain(candidates[i].ToGlobalPosition());
+                if (!GroundControlReflection.IsBelowSeaLevel(candidate))
+                {
+                    snappedDry = candidate;
+                    return true;
+                }
+            }
+
+            if (allowHaulerFallback)
+            {
+                GlobalPosition haulerSnapped = GroundControlReflection.SnapToTerrain(job.Hauler.GlobalPosition());
+                snappedDry = !GroundControlReflection.IsBelowSeaLevel(haulerSnapped)
+                    ? haulerSnapped
+                    : GroundControlReflection.SnapToTerrain(candidates[0].ToGlobalPosition());
+                return !GroundControlReflection.IsBelowSeaLevel(snappedDry);
+            }
+
+            return false;
+        }
+
+        GlobalPosition containerSnapped = GroundControlReflection.SnapToTerrain(job.Container.GlobalPosition());
+        snappedDry = containerSnapped;
+        return !GroundControlReflection.IsBelowSeaLevel(containerSnapped);
+    }
+
     private static (GlobalPosition Pos, float Yaw) RestoreContainerPhysics(HaulJob job, bool placeOnGround)
     {
         if (job.Container == null)
         {
+            RestoreIgnoredCollisions(job.IgnoredCollisionPairs);
             return default;
         }
 
@@ -715,21 +858,13 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
 
         if (placeOnGround)
         {
-            float halfHaulerDrop = Mathf.Max(3.0f, (job.Hauler?.definition?.length ?? 9f) * 0.5f);
-            float halfCargoDrop = Mathf.Max(2.0f, (job.Container.definition?.length ?? 6.06f) * 0.5f);
-            float dropBackDist = Mathf.Max(7.5f, halfHaulerDrop + halfCargoDrop + 1.0f);
-            Vector3 dropBase = job.Hauler != null && !job.Hauler.disabled
-                ? job.Hauler.transform.position - job.Hauler.transform.forward * dropBackDist
-                : job.Container.transform.position;
-
-            GlobalPosition snapped = GroundControlReflection.SnapToTerrain(dropBase.ToGlobalPosition());
+            TryResolveDryDropPosition(job, allowHaulerFallback: true, out GlobalPosition snapped, out resultYaw);
             BoxCollider? box = job.Container.GetComponent<BoxCollider>();
             float clearanceY = (job.Container is Container && box != null)
                 ? Mathf.Max(0f, -(box.center.y - (box.size.y * 0.5f)))
                 : job.GroundClearanceY;
             Vector3 worldDrop = snapped.ToLocalPosition() + Vector3.up * clearanceY;
             resultPos = worldDrop.ToGlobalPosition();
-            resultYaw = job.Hauler != null ? job.Hauler.transform.eulerAngles.y : job.Container.transform.eulerAngles.y;
             Quaternion dropRot = Quaternion.Euler(0f, resultYaw, 0f);
             ApplyContainerTransform(job.Container, worldDrop, dropRot);
 
@@ -740,16 +875,8 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
             }
         }
 
-        for (int i = 0; i < job.SavedColliders.Length; i++)
-        {
-            Collider? col = job.SavedColliders[i];
-            if (col != null)
-            {
-                col.enabled = true;
-            }
-        }
-
-        job.SavedColliders = Array.Empty<Collider>();
+        Physics.SyncTransforms();
+        RestoreIgnoredCollisions(job.IgnoredCollisionPairs);
         if (job.Container.rb != null)
         {
             job.Container.rb.isKinematic = job.WasKinematic;
@@ -792,6 +919,7 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
             {
                 ContainerPid = containerPid,
                 HaulerPid = haulerPid,
+                CreatedAt = Time.time,
             };
             clientJobs[containerPid] = cj;
         }
@@ -865,15 +993,50 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
             return;
         }
 
-        if (new PersistentID { Id = pid }.TryGetUnit(out Unit unit) && unit != null && !unit.disabled)
+        if (new PersistentID { Id = pid }.TryGetUnit(out Unit unit) && unit != null)
         {
-            ApplyContainerTransform(unit, pos.ToLocalPosition(), Quaternion.Euler(0f, yaw, 0f));
-            Physics.SyncTransforms();
+            pendingClientRelocations.Remove(pid);
+            if (!unit.disabled)
+            {
+                ApplyContainerTransform(unit, pos.ToLocalPosition(), Quaternion.Euler(0f, yaw, 0f));
+                Physics.SyncTransforms();
+            }
+
+            return;
         }
+
+        pendingClientRelocations[pid] = (pos, yaw, Time.time);
     }
 
     private void TickClientMirroredJobs(float now)
     {
+        if (pendingClientRelocations.Count > 0)
+        {
+            relocationScratch.Clear();
+            foreach (KeyValuePair<uint, (GlobalPosition Pos, float Yaw, float AddedAt)> kv in pendingClientRelocations)
+            {
+                if (new PersistentID { Id = kv.Key }.TryGetUnit(out Unit unit) && unit != null)
+                {
+                    if (!unit.disabled)
+                    {
+                        ApplyContainerTransform(unit, kv.Value.Pos.ToLocalPosition(), Quaternion.Euler(0f, kv.Value.Yaw, 0f));
+                        Physics.SyncTransforms();
+                    }
+
+                    relocationScratch.Add(kv.Key);
+                }
+                else if (now - kv.Value.AddedAt > ClientRelocationTimeoutSeconds)
+                {
+                    relocationScratch.Add(kv.Key);
+                }
+            }
+
+            for (int i = 0; i < relocationScratch.Count; i++)
+            {
+                pendingClientRelocations.Remove(relocationScratch[i]);
+            }
+        }
+
         if (clientJobs.Count == 0)
         {
             return;
@@ -884,9 +1047,15 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
         {
             ClientMirroredHaulJob cj = kv.Value;
             ResolveClientJobUnits(cj);
-            if (cj.Container == null || cj.Container.disabled || cj.Hauler == null || cj.Hauler.disabled)
+            if ((cj.Container != null && cj.Container.disabled) || (cj.Hauler != null && cj.Hauler.disabled))
             {
-                if (cj.Container == null || cj.Container.disabled)
+                clientCleanupScratch.Add(kv.Key);
+                continue;
+            }
+
+            if (cj.Container == null || cj.Hauler == null)
+            {
+                if (cj.PhysicsLocked || now - cj.CreatedAt > ClientUnresolvedTimeoutSeconds)
                 {
                     clientCleanupScratch.Add(kv.Key);
                 }
@@ -900,6 +1069,10 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
             }
 
             LockClientContainerPhysics(cj);
+            if (cj.IgnoredCollisionPairs.Count == 0)
+            {
+                IgnoreContainerHaulerCollisions(cj.Container, cj.Hauler, cj.IgnoredCollisionPairs);
+            }
 
             if (cj.Stage == HaulStage.Loading)
             {
@@ -930,6 +1103,11 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
             uint key = clientCleanupScratch[i];
             if (clientJobs.TryGetValue(key, out ClientMirroredHaulJob? dead))
             {
+                if (dead.Hauler != null)
+                {
+                    MdsBridgeBootstrap.SetMdsHaulerOutriggersDeployed?.Invoke(dead.Hauler, false);
+                }
+
                 RestoreClientContainerPhysics(dead);
                 clientJobs.Remove(key);
             }
@@ -963,18 +1141,11 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
             cj.LoadStartRot = cj.Container.transform.rotation;
         }
 
-        Collider[] allColliders = cj.Container.GetComponentsInChildren<Collider>(true);
-        var enabledList = new List<Collider>(allColliders.Length);
-        for (int i = 0; i < allColliders.Length; i++)
+        if (cj.Hauler != null)
         {
-            if (allColliders[i] != null && allColliders[i].enabled)
-            {
-                allColliders[i].enabled = false;
-                enabledList.Add(allColliders[i]);
-            }
+            IgnoreContainerHaulerCollisions(cj.Container, cj.Hauler, cj.IgnoredCollisionPairs);
         }
 
-        cj.SavedColliders = enabledList.ToArray();
         if (cj.Container.rb != null)
         {
             cj.WasKinematic = cj.Container.rb.isKinematic;
@@ -990,20 +1161,13 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
 
     private static void RestoreClientContainerPhysics(ClientMirroredHaulJob cj)
     {
+        RestoreIgnoredCollisions(cj.IgnoredCollisionPairs);
         if (cj.Container == null)
         {
+            cj.PhysicsLocked = false;
             return;
         }
 
-        for (int i = 0; i < cj.SavedColliders.Length; i++)
-        {
-            if (cj.SavedColliders[i] != null)
-            {
-                cj.SavedColliders[i].enabled = true;
-            }
-        }
-
-        cj.SavedColliders = Array.Empty<Collider>();
         if (cj.Container.rb != null)
         {
             cj.Container.rb.isKinematic = cj.WasKinematic;
@@ -1018,6 +1182,59 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
 
         cj.PhysicsLocked = false;
         Physics.SyncTransforms();
+    }
+
+    private static void IgnoreContainerHaulerCollisions(
+        Unit container,
+        GroundVehicle hauler,
+        List<(Collider ContainerCol, Collider HaulerCol)> ignoredPairs)
+    {
+        if (container == null || hauler == null)
+        {
+            return;
+        }
+
+        Collider[] containerColliders = container.GetComponentsInChildren<Collider>(true);
+        Collider[] haulerColliders = hauler.GetComponentsInChildren<Collider>(true);
+        for (int c = 0; c < containerColliders.Length; c++)
+        {
+            Collider? cCol = containerColliders[c];
+            if (cCol == null || !cCol.enabled || !cCol.gameObject.activeInHierarchy)
+            {
+                continue;
+            }
+
+            for (int h = 0; h < haulerColliders.Length; h++)
+            {
+                Collider? hCol = haulerColliders[h];
+                if (hCol == null || !hCol.enabled || !hCol.gameObject.activeInHierarchy)
+                {
+                    continue;
+                }
+
+                Physics.IgnoreCollision(cCol, hCol, true);
+                ignoredPairs.Add((cCol, hCol));
+            }
+        }
+    }
+
+    private static void RestoreIgnoredCollisions(List<(Collider ContainerCol, Collider HaulerCol)> ignoredPairs)
+    {
+        for (int i = 0; i < ignoredPairs.Count; i++)
+        {
+            (Collider cCol, Collider hCol) = ignoredPairs[i];
+            if (cCol != null
+                && hCol != null
+                && cCol.enabled
+                && hCol.enabled
+                && cCol.gameObject.activeInHierarchy
+                && hCol.gameObject.activeInHierarchy)
+            {
+                Physics.IgnoreCollision(cCol, hCol, false);
+            }
+        }
+
+        ignoredPairs.Clear();
     }
 
     private ClientMirroredHaulJob? FindClientJobByUnit(Unit unit)
@@ -1098,8 +1315,9 @@ internal sealed class MdsFlatbedHaulService : IAddonTick, IAddonGui, IAddonReset
                 continue;
             }
 
-            float dSq = FastMath.SquareDistance(gv.GlobalPosition(), containerPos);
-            if (dSq <= maxSq && dSq < bestMeters)
+            GlobalPosition haulerPos = gv.GlobalPosition();
+            float dSq = FastMath.SquareDistance(haulerPos, containerPos);
+            if (dSq <= maxSq && dSq < bestMeters && GroundControlReflection.CanDriveBetween(haulerPos, containerPos))
             {
                 bestMeters = dSq;
                 best = gv;

@@ -482,6 +482,7 @@ internal static class DuelOppositeAirbaseStartPatch
 
                 if (isSceneOrBuiltIn)
                 {
+                    hq.RemoveFactionUnit(bldg);
                     bldg.NetworkHQ = null;
                     continue;
                 }
@@ -498,13 +499,11 @@ internal static class DuelOppositeAirbaseStartPatch
             }
             else if (unit is GroundVehicle veh)
             {
-                float angle = (movedVehs % 8) * (Mathf.PI * 0.25f);
-                float radius = 120f + movedVehs * 18f;
-                var targetProbe = new GlobalPosition(
-                    newBasePos.x + Mathf.Cos(angle) * radius,
-                    newBasePos.y,
-                    newBasePos.z + Mathf.Sin(angle) * radius);
-                GlobalPosition snapped = GroundControlReflection.SnapToTerrain(targetProbe);
+                if (!TryFindSafeVehicleRelocationSpot(hq, newOwnBase, newBasePos, movedVehs, out GlobalPosition snapped))
+                {
+                    continue;
+                }
+
                 Vector3 localPos = snapped.ToLocalPosition() + Vector3.up * 0.5f;
 
                 veh.NetworknetworkStationary = false;
@@ -532,11 +531,128 @@ internal static class DuelOppositeAirbaseStartPatch
         }
     }
 
+    private static bool TryFindSafeVehicleRelocationSpot(
+        FactionHQ hq,
+        Airbase newOwnBase,
+        GlobalPosition newBasePos,
+        int movedVehs,
+        out GlobalPosition snapped)
+    {
+        float preferredAngle = (movedVehs % 8) * (Mathf.PI * 0.25f);
+        float preferredRadius = 120f + movedVehs * 18f;
+        var preferredProbe = new GlobalPosition(
+            newBasePos.x + Mathf.Cos(preferredAngle) * preferredRadius,
+            newBasePos.y,
+            newBasePos.z + Mathf.Sin(preferredAngle) * preferredRadius);
+        snapped = GroundControlReflection.SnapToTerrain(preferredProbe);
+        if (!GroundControlReflection.IsBelowSeaLevel(snapped)
+            && !IsNearBaseStructure(hq, newOwnBase, snapped, 18f)
+            && GroundControlReflection.CanDriveBetween(newBasePos, snapped))
+        {
+            return true;
+        }
+
+        float[] radii = { 95f, 140f, 185f, 235f, 290f };
+        for (int pass = 0; pass < 2; pass++)
+        {
+            bool requireDriveable = pass == 0;
+            float minStructureClearance = pass == 0 ? 18f : 12f;
+            for (int r = 0; r < radii.Length; r++)
+            {
+                float radius = radii[r];
+                for (int a = 0; a < 16; a++)
+                {
+                    float angle = ((a + movedVehs) % 16) * (Mathf.PI * 2f / 16f);
+                    var probe = new GlobalPosition(
+                        newBasePos.x + Mathf.Cos(angle) * radius,
+                        newBasePos.y,
+                        newBasePos.z + Mathf.Sin(angle) * radius);
+                    GlobalPosition cand = GroundControlReflection.SnapToTerrain(probe);
+                    if (GroundControlReflection.IsBelowSeaLevel(cand)
+                        || IsNearBaseStructure(hq, newOwnBase, cand, minStructureClearance))
+                    {
+                        continue;
+                    }
+
+                    if (requireDriveable && !GroundControlReflection.CanDriveBetween(newBasePos, cand))
+                    {
+                        continue;
+                    }
+
+                    snapped = cand;
+                    return true;
+                }
+            }
+        }
+
+        if (hq.TryGetNearestDepot(newBasePos.ToLocalPosition(), 2000f, out VehicleDepot nearestDepot)
+            && nearestDepot != null
+            && !nearestDepot.disabled)
+        {
+            Vector3 depotBase = nearestDepot.transform.position;
+            Vector3 depotFwd = nearestDepot.transform.forward;
+            float[] offsets = { 24f, 34f, 44f };
+            for (int i = 0; i < offsets.Length; i++)
+            {
+                GlobalPosition laneProbe = (depotBase + depotFwd * offsets[i]).ToGlobalPosition();
+                GlobalPosition cand = GroundControlReflection.SnapToTerrain(laneProbe);
+                if (!GroundControlReflection.IsBelowSeaLevel(cand))
+                {
+                    snapped = cand;
+                    return true;
+                }
+            }
+        }
+
+        GlobalPosition centerSnapped = GroundControlReflection.SnapToTerrain(newBasePos);
+        if (!GroundControlReflection.IsBelowSeaLevel(centerSnapped))
+        {
+            snapped = centerSnapped;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsNearBaseStructure(FactionHQ hq, Airbase newOwnBase, GlobalPosition candidate, float minDistMeters)
+    {
+        float minSq = minDistMeters * minDistMeters;
+        if (newOwnBase.buildings != null)
+        {
+            for (int i = 0; i < newOwnBase.buildings.Count; i++)
+            {
+                Building? b = newOwnBase.buildings[i];
+                if (b != null && !b.disabled && FastMath.SquareDistance(b.GlobalPosition(), candidate) < minSq)
+                {
+                    return true;
+                }
+            }
+        }
+
+        if (hq.factionUnits != null)
+        {
+            foreach (PersistentID pid in hq.factionUnits)
+            {
+                if (pid.TryGetUnit(out Unit u) && u != null && !u.disabled && u is Building && FastMath.SquareDistance(u.GlobalPosition(), candidate) < minSq)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
     private static void SilentDespawnUnit(Unit unit)
     {
         if (unit == null)
         {
             return;
+        }
+
+        if (unit.NetworkHQ != null)
+        {
+            unit.NetworkHQ.RemoveFactionUnit(unit);
         }
 
         unit.NetworkHQ = null;
@@ -728,6 +844,11 @@ internal static class DuelOppositeAirbaseStartPatch
                     Building? bldg = oldAb.buildings[b];
                     if (bldg != null)
                     {
+                        if (bldg.NetworkHQ != null)
+                        {
+                            bldg.NetworkHQ.RemoveFactionUnit(bldg);
+                        }
+
                         bldg.NetworkHQ = null;
                     }
                 }

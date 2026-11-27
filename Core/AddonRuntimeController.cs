@@ -1,4 +1,6 @@
+using System;
 using System.Collections.Generic;
+using NuclearOption.Networking;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
@@ -87,11 +89,20 @@ internal sealed class AddonRuntimeController : MonoBehaviour
 
     internal void TriggerNetworkSessionReset()
     {
+        GcreNetworkSync.Instance.SetPreserveServerOnNextReset(false);
         ExecuteSessionReset("network disconnect/stop");
     }
 
     private void OnActiveSceneChanged(Scene previousScene, Scene newScene)
     {
+        bool isMenuOrEmpty =
+            newScene.name.IndexOf("Menu", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            string.Equals(newScene.name, "empty", StringComparison.OrdinalIgnoreCase);
+        bool preserveServer = !isMenuOrEmpty &&
+            NetworkManagerNuclearOption.i != null &&
+            NetworkManagerNuclearOption.i.Server != null &&
+            NetworkManagerNuclearOption.i.Server.Active;
+        GcreNetworkSync.Instance.SetPreserveServerOnNextReset(preserveServer);
         ExecuteSessionReset($"scene change -> {newScene.name}");
     }
 

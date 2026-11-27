@@ -77,6 +77,8 @@ internal sealed class AiBattlefieldIntelService : IAddonTick, IAddonResetSession
         internal float MainObjectiveUpdatedAt;
         internal GlobalPosition QrfAlertPos;
         internal Unit? QrfAttacker;
+        internal bool QrfHadTrackedAttacker;
+        internal bool QrfWasAirAttacker;
         internal float QrfAlertUntil;
     }
 
@@ -114,9 +116,9 @@ internal sealed class AiBattlefieldIntelService : IAddonTick, IAddonResetSession
 
         nextTickAt = now + RefreshIntervalSeconds;
 
-        FactionHQ? localHq = GroundControlReflection.GetLocalHq();
         GroundControlReflection.NetworkRunAsHostTeam(() =>
         {
+            FactionHQ? localHq = GroundControlReflection.GetLocalHq();
             foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
             {
                 if (hq != null && ((NetworkBehaviour)hq).IsServer && GroundControlReflection.IsSafeAiFaction(hq, localHq))
@@ -234,6 +236,8 @@ internal sealed class AiBattlefieldIntelService : IAddonTick, IAddonResetSession
         {
             state.QrfAlertUntil = 0f;
             state.QrfAttacker = null;
+            state.QrfHadTrackedAttacker = false;
+            state.QrfWasAirAttacker = false;
         }
 
         // Refresh MainObjectiveBase from active MainEffort (slot -1) or primary active ground drive
@@ -771,7 +775,10 @@ internal sealed class AiBattlefieldIntelService : IAddonTick, IAddonResetSession
 
         FactionIntelState state = GetOrCreateState(aiHq);
         state.QrfAlertPos = pos;
-        state.QrfAttacker = attacker != null && !attacker.disabled ? attacker : null;
+        bool validAttacker = attacker != null && !attacker.disabled;
+        state.QrfAttacker = validAttacker ? attacker : null;
+        state.QrfHadTrackedAttacker = validAttacker;
+        state.QrfWasAirAttacker = validAttacker && attacker is Aircraft;
         state.QrfAlertUntil = Time.time + RearQrfAlertTtlSeconds;
     }
 
@@ -789,9 +796,67 @@ internal sealed class AiBattlefieldIntelService : IAddonTick, IAddonResetSession
             return false;
         }
 
+        Unit? liveAttacker = state.QrfAttacker != null && !state.QrfAttacker.disabled ? state.QrfAttacker : null;
+        if (state.QrfHadTrackedAttacker && liveAttacker == null)
+        {
+            liveAttacker = FindActiveHostileNear(aiHq, state.QrfAlertPos, 3000f, preferAircraft: state.QrfWasAirAttacker);
+            if (liveAttacker == null)
+            {
+                state.QrfAlertUntil = 0f;
+                state.QrfAttacker = null;
+                state.QrfHadTrackedAttacker = false;
+                state.QrfWasAirAttacker = false;
+                return false;
+            }
+
+            state.QrfAttacker = liveAttacker;
+            state.QrfWasAirAttacker = liveAttacker is Aircraft;
+        }
+
         alertPos = state.QrfAlertPos;
-        attacker = state.QrfAttacker != null && !state.QrfAttacker.disabled ? state.QrfAttacker : null;
+        attacker = liveAttacker;
         return true;
+    }
+
+    private static Unit? FindActiveHostileNear(FactionHQ aiHq, GlobalPosition center, float radiusMeters, bool preferAircraft)
+    {
+        if (aiHq.trackingDatabase == null)
+        {
+            return null;
+        }
+
+        float levelNow = Time.timeSinceLevelLoad;
+        Unit? fallback = null;
+        foreach (KeyValuePair<PersistentID, TrackingInfo> kv in aiHq.trackingDatabase)
+        {
+            TrackingInfo? info = kv.Value;
+            if (info == null
+                || !info.TryGetUnit(out Unit unit)
+                || unit == null
+                || unit.disabled
+                || unit is Building
+                || unit.NetworkHQ == null
+                || ReferenceEquals(unit.NetworkHQ, aiHq)
+                || levelNow - info.lastSpottedTime > VehicleContactExpireSeconds)
+            {
+                continue;
+            }
+
+            if (!FastMath.InRange(info.GetPosition(), center, radiusMeters))
+            {
+                continue;
+            }
+
+            bool isAircraft = unit is Aircraft;
+            if (isAircraft == preferAircraft)
+            {
+                return unit;
+            }
+
+            fallback ??= unit;
+        }
+
+        return fallback;
     }
 
     internal void ClearRearQrfAlert(FactionHQ? aiHq)
@@ -800,6 +865,8 @@ internal sealed class AiBattlefieldIntelService : IAddonTick, IAddonResetSession
         {
             state.QrfAlertUntil = 0f;
             state.QrfAttacker = null;
+            state.QrfHadTrackedAttacker = false;
+            state.QrfWasAirAttacker = false;
         }
     }
 

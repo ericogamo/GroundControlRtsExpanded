@@ -156,27 +156,22 @@ internal static class TryBuildEnemyMinePatch
             return;
         }
 
-        if (HasFriendlyAirDefenceNear(hq, sites, minePos, 950f))
+        if (!HasFriendlyAirDefenceNear(hq, sites, minePos, 950f)
+            && (GroundControlReflection.CountGoldMines(__instance, hq) >= 1
+                || AiEconomySettings.GetEffectiveAiGrossIncome(__instance, hq, AiEconomySettings.GetActiveProfile()) >= 250f))
         {
-            return;
-        }
-
-        BuildingDefinition? defBuilding = GroundControlReflection.ResolveCategoryDefinitionMethod?.Invoke(null, new object?[] { BuildingType.DEF, true }) as BuildingDefinition;
-        if (defBuilding == null)
-        {
-            return;
-        }
-
-        float defCost = GroundControlReflection.GetStructureCost(defBuilding);
-        if (hq.factionFunds < defCost + 80f || !GroundControlReflection.HasAnyBlueprintRoom(hq))
-        {
-            return;
-        }
-
-        if (GroundControlReflection.TryFindSiteNear(__instance, hq, defBuilding, minePos, out GlobalPosition defSite, 12))
-        {
-            string label = GroundControlReflection.GetStructureLabel(defBuilding);
-            GroundControlReflection.QueueEnemyStructureBlueprint(__instance, hq, defBuilding, defSite, defCost, label);
+            BuildingDefinition? defBuilding = GroundControlReflection.ResolveCategoryDefinitionMethod?.Invoke(null, new object?[] { BuildingType.DEF, true }) as BuildingDefinition;
+            if (defBuilding != null)
+            {
+                float defCost = GroundControlReflection.GetStructureCost(defBuilding);
+                if (hq.factionFunds >= defCost + 150f
+                    && GroundControlReflection.HasAnyBlueprintRoom(hq)
+                    && GroundControlReflection.TryFindSiteNear(__instance, hq, defBuilding, minePos, out GlobalPosition defSite, 12))
+                {
+                    string label = GroundControlReflection.GetStructureLabel(defBuilding);
+                    GroundControlReflection.QueueEnemyStructureBlueprint(__instance, hq, defBuilding, defSite, defCost, label);
+                }
+            }
         }
     }
 
@@ -332,13 +327,34 @@ internal static class EnemyTier3DepotHelper
             return false;
         }
 
-        if ((GroundControlReflection.CountGoldMines(ecoInstance, hq) < 1 && GroundControlReflection.GetHqIncomePerMinute(ecoInstance, hq) < 450f)
-            || GroundControlReflection.GetEnemyNetIncomePerMinute(hq) < 350f)
+        AiEconomySettings.GetEffectiveAiIncome(ecoInstance, hq, profile, out float enemyGross, out float enemyNet);
+        if ((GroundControlReflection.CountGoldMines(ecoInstance, hq) < 1 && enemyGross < 450f)
+            || enemyNet < 350f)
         {
             return false;
         }
 
         return HasBaseNeedingTier3Depot(hq, out upgradeCost);
+    }
+}
+
+[HarmonyPatch]
+internal static class IsEnemyMineOpenPatch
+{
+    private static bool Prepare() => GroundControlReflection.EcoIsEnemyMineOpenMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EcoIsEnemyMineOpenMethod!;
+
+    private static void Postfix(object __instance, FactionHQ? hq, ref bool __result)
+    {
+        if (__result || hq == null || AiEconomySettings.GetActiveProfile().IsVanilla)
+        {
+            return;
+        }
+
+        if (AiEconomySettings.GetEffectiveAiGrossIncome(__instance, hq, AiEconomySettings.GetActiveProfile()) >= 150f || hq.factionFunds >= 600f)
+        {
+            __result = true;
+        }
     }
 }
 
@@ -356,7 +372,21 @@ internal static class HasDepotUpgradeIncomePatch
             return true;
         }
 
-        __result = GroundControlReflection.GetHqIncomePerMinute(__instance, hq) >= 150f;
+        int goldMines = GroundControlReflection.CountGoldMines(__instance, hq);
+        float gross = AiEconomySettings.GetEffectiveAiGrossIncome(__instance, hq, profile);
+        int bestDepot = GroundControlReflection.GetBestDepotLevel(hq);
+
+        if (bestDepot < 2)
+        {
+            __result = goldMines >= 1 && gross >= 350f;
+        }
+        else
+        {
+            __result = goldMines >= 2
+                && gross >= 600f
+                && !AiEconomySettings.IsBelowEffectiveIncomeTarget(__instance, hq, profile);
+        }
+
         return false;
     }
 }
@@ -378,11 +408,50 @@ internal static class TryBuildEnemyDepotThrottlePatch
         if (AiStrategicDirectorService.Instance.ShouldSuppressOpeningDepotSpam(__instance, hq))
         {
             perBase = 1;
-            if (GroundControlReflection.CountBuildings(hq, BuildingType.DEP) >= 2)
+            int depots = GroundControlReflection.CountBuildings(hq, BuildingType.DEP);
+            int goldMines = GroundControlReflection.CountGoldMines(__instance, hq);
+            if ((goldMines == 0 && depots >= 1) || depots >= 2)
             {
                 __result = false;
                 return false;
             }
+        }
+
+        return true;
+    }
+}
+
+[HarmonyPatch]
+internal static class TryBuildEnemyEconomyPriorityPatch
+{
+    private static bool Prepare() => GroundControlReflection.TryBuildEnemyEconomyMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.TryBuildEnemyEconomyMethod!;
+
+    private static bool Prefix(object __instance, FactionHQ? hq, ref bool __result)
+    {
+        AiEconomyProfile profile = AiEconomySettings.GetActiveProfile();
+        if (profile.IsVanilla || hq == null || !((Mirage.NetworkBehaviour)hq).IsServer)
+        {
+            return true;
+        }
+
+        AiIncomePriorityKind action = AiEconomySettings.EvaluatePriorityIncomeAction(
+            __instance,
+            hq,
+            profile,
+            out float cost,
+            out _);
+
+        if (action == AiIncomePriorityKind.UpgradeIncome)
+        {
+            __result = hq.factionFunds >= cost && GroundControlReflection.TryUpgradeEnemyIncome(__instance, hq, 1f);
+            return false;
+        }
+
+        if (action == AiIncomePriorityKind.BuildMine)
+        {
+            __result = hq.factionFunds >= cost && GroundControlReflection.TryBuildEnemyMine(__instance, hq);
+            return false;
         }
 
         return true;
@@ -415,7 +484,8 @@ internal static class EnemyTier3NavalDockHelper
             return false;
         }
 
-        if (GroundControlReflection.GetEnemyNetIncomePerMinute(hq) < 450f)
+        AiEconomySettings.GetEffectiveAiIncome(ecoInstance, hq, profile, out _, out float enemyNet);
+        if (enemyNet < 450f)
         {
             return false;
         }
@@ -450,6 +520,20 @@ internal static class GetEnemyBuildReservePatch
             return;
         }
 
+        AiIncomePriorityKind prio = AiEconomySettings.EvaluatePriorityIncomeAction(
+            eco,
+            hq,
+            profile,
+            out float prioCost,
+            out bool prioGoldMine);
+        if (prio != AiIncomePriorityKind.None)
+        {
+            __result = prioCost;
+            goldMine = prioGoldMine;
+            income = true;
+            return;
+        }
+
         if (income)
         {
             bool blocked = goldMine
@@ -467,43 +551,26 @@ internal static class GetEnemyBuildReservePatch
             }
         }
 
-        if (AiStrategicDirectorService.Instance.ShouldSuppressOpeningDepotSpam(eco, hq)
-            && !income
-            && GroundControlReflection.CountBuildings(hq, BuildingType.DEP) >= 2)
-        {
-            if (GroundControlReflection.GetHqIncomePerMinute(eco, hq) >= 150f
-                && GroundControlReflection.HasBaseWithoutUpgradedDepot(eco, hq))
-            {
-                __result = Mathf.Max(__result, GroundControlReflection.GetDepotUpgradeCost(1));
-            }
-            else if (GroundControlReflection.FindEnemyIncomeUpgrade(eco, hq, out float upgradeCost) != null
-                && upgradeCost > 0f
-                && !AiEconomySettings.IsIncomeUpgradeBlocked(eco, hq, profile))
-            {
-                __result = upgradeCost;
-                goldMine = false;
-                income = true;
-            }
-            else if (!AiEconomySettings.IsMineBuildBlocked(eco, hq, profile))
-            {
-                object? nextKind = GroundControlReflection.ChooseEnemyIncomeKind(eco, hq);
-                bool isMine = GroundControlReflection.IsMineBuildKind(nextKind);
-                float nextCost = GroundControlReflection.GetEnemyIncomeReserve(eco, hq, nextKind);
-                __result = Mathf.Max(isMine ? 1f : 50f, nextCost);
-                goldMine = isMine;
-                income = true;
-            }
-        }
+        int goldMines = GroundControlReflection.CountGoldMines(eco, hq);
+        float gross = AiEconomySettings.GetEffectiveAiGrossIncome(eco, hq, profile);
 
-        if (DynamicCapAndTechService.IsActive && AddonConfig.EnableAiCityBuilding.Value && !income)
+        if (DynamicCapAndTechService.IsActive
+            && AddonConfig.EnableAiCityBuilding.Value
+            && !income
+            && goldMines >= 1
+            && gross >= 350f)
         {
             FactionCapSnapshot snap = DynamicCapAndTechService.Instance.GetSnapshot(hq);
-            float gross = GroundControlReflection.GetHqIncomePerMinute(eco, hq);
-            if (snap.CommandHqCount == 0 && gross >= 100f)
+            if (snap.CommandHqCount == 0)
             {
-                __result = Mathf.Max(__result, 180f);
+                if (DynamicCapAndTechService.Instance.CountInProgressBlueprints(hq, RtsBuildingKind.CommandHq) == 0)
+                {
+                    __result = Mathf.Max(__result, 180f);
+                }
             }
-            else if (snap.CommandHqLevel == 1 && GroundControlReflection.GetBestDepotLevel(hq) >= 2 && GroundControlReflection.CountGoldMines(eco, hq) >= 1)
+            else if (snap.CommandHqLevel == 1
+                && GroundControlReflection.GetBestDepotLevel(hq) >= 2
+                && AiStrategicDirectorService.Instance.CanReserveCommandHqLevel2(eco, hq))
             {
                 __result = Mathf.Max(__result, 320f);
             }
@@ -538,7 +605,7 @@ internal static class ReviewEnemyTier3DepotPatch
         }
 
         if (EnemyTier3DepotHelper.IsReadyForTier3DepotPlanning(__instance, hq, out float l3Cost)
-            && GroundControlReflection.HasDepotUpgradeIncome(__instance, hq)
+            && AiEconomySettings.GetEffectiveAiGrossIncome(__instance, hq, AiEconomySettings.GetActiveProfile()) >= 450f
             && hq.factionFunds >= l3Cost)
         {
             GroundControlReflection.TryUpgradeEnemyDepot(__instance, hq);
@@ -573,7 +640,7 @@ internal static class GetEnemyFactoryTargetPatch
 
         bool hasEconomyBase = eco != null
             && (GroundControlReflection.CountGoldMines(eco, hq) >= 1
-                || GroundControlReflection.GetHqIncomePerMinute(eco, hq) >= 300f);
+                || AiEconomySettings.GetEffectiveAiGrossIncome(eco, hq, profile) >= 300f);
         if (hasEconomyBase)
         {
             int desiredTarget = 4 + Mathf.Min(2, GroundControlReflection.CountLandBases(hq));
@@ -612,8 +679,7 @@ internal static class TryBuildEnemyFactoryPatch
             if (eco != null)
             {
                 int goldMines = GroundControlReflection.CountGoldMines(eco, hq);
-                float gross = GroundControlReflection.GetHqIncomePerMinute(eco, hq);
-                if (goldMines == 0 && gross >= 150f && !AiEconomySettings.IsMineBuildBlocked(eco, hq, profile))
+                if (goldMines == 0 && !AiEconomySettings.IsMineBuildBlocked(eco, hq, profile))
                 {
                     __result = false;
                     return false;
@@ -655,8 +721,7 @@ internal static class GetEnemyFactoryReservePatch
             if (eco != null)
             {
                 int goldMines = GroundControlReflection.CountGoldMines(eco, hq);
-                float gross = GroundControlReflection.GetHqIncomePerMinute(eco, hq);
-                if (goldMines == 0 && gross >= 150f && !AiEconomySettings.IsMineBuildBlocked(eco, hq, profile))
+                if (goldMines == 0 && !AiEconomySettings.IsMineBuildBlocked(eco, hq, profile))
                 {
                     __result = 0f;
                     return false;
@@ -672,6 +737,109 @@ internal static class GetEnemyFactoryReservePatch
         }
 
         return true;
+    }
+}
+
+[HarmonyPatch]
+internal static class GetSavedBuildReservePatch
+{
+    private static bool Prepare() => GroundControlReflection.EnemyGetSavedBuildReserveMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EnemyGetSavedBuildReserveMethod!;
+
+    private static void Postfix(FactionHQ? hq, object? state, ref float __result)
+    {
+        AiEconomyProfile profile = AiEconomySettings.GetActiveProfile();
+        if (profile.IsVanilla || hq == null || state == null)
+        {
+            return;
+        }
+
+        object? eco = GroundControlReflection.GetEcoInstance();
+        float reserve = GroundControlReflection.GetEnemyBuildReserve(hq, out _, out bool resIncome);
+        if (reserve <= 0f)
+        {
+            return;
+        }
+
+        if (resIncome || AiStrategicDirectorService.Instance.EvaluatePhase(eco, hq) == AiStrategicPhase.OpeningEconomy)
+        {
+            bool ecoCatchUp = AiStrategicDirectorService.Instance.IsInEcoCatchUp(eco, hq, out _);
+            float ratio = ecoCatchUp ? 1.0f : 0.85f;
+            bool defending = GroundControlReflection.GetStateBool(state, GroundControlReflection.StateDefendingProp);
+            int liveCombat = AiStrategicDirectorService.CountLiveGroundCombat(hq);
+            float emergencyCarveOut = (defending && liveCombat < 6) ? 45f : 0f;
+            float desired = Mathf.Clamp(
+                Mathf.Min(hq.factionFunds, reserve * ratio) - emergencyCarveOut,
+                0f,
+                Mathf.Max(0f, hq.factionFunds));
+
+            if (desired > __result)
+            {
+                __result = desired;
+            }
+
+            float mineFund = GroundControlReflection.GetStateFloat(state, GroundControlReflection.StateMineFundProp);
+            if (__result > mineFund)
+            {
+                GroundControlReflection.SetStateFloat(state, GroundControlReflection.StateMineFundProp, __result);
+            }
+        }
+    }
+}
+
+[HarmonyPatch]
+internal static class TakeWarFundPatch
+{
+    private static bool Prepare() => GroundControlReflection.EnemyTakeWarFundMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.EnemyTakeWarFundMethod!;
+
+    private static void Postfix(FactionHQ? hq, object? state, ref float __result)
+    {
+        AiEconomyProfile profile = AiEconomySettings.GetActiveProfile();
+        if (profile.IsVanilla || hq == null || state == null || __result <= 0f)
+        {
+            return;
+        }
+
+        object? eco = GroundControlReflection.GetEcoInstance();
+        float reserve = GroundControlReflection.GetEnemyBuildReserve(hq, out _, out bool resIncome);
+        if (!resIncome || reserve <= 0f || hq.factionFunds >= reserve)
+        {
+            return;
+        }
+
+        int goldMines = eco != null ? GroundControlReflection.CountGoldMines(eco, hq) : 0;
+        float enemyGross = eco != null ? AiEconomySettings.GetEffectiveAiGrossIncome(eco, hq, profile) : 0f;
+        bool defending = GroundControlReflection.GetStateBool(state, GroundControlReflection.StateDefendingProp);
+        int liveCombat = AiStrategicDirectorService.CountLiveGroundCombat(hq);
+        bool ecoCatchUp = AiStrategicDirectorService.Instance.IsInEcoCatchUp(eco, hq, out _);
+
+        if (goldMines == 0 || enemyGross < 300f)
+        {
+            if (defending && liveCombat < 6)
+            {
+                __result = Mathf.Min(__result, 40f);
+            }
+            else if (liveCombat < 4)
+            {
+                __result = Mathf.Min(__result, 18f);
+            }
+            else
+            {
+                __result = 0f;
+            }
+        }
+        else if (ecoCatchUp)
+        {
+            if (!defending && liveCombat >= 8)
+            {
+                __result = hq.factionFunds >= reserve * 0.55f ? 0f : Mathf.Min(__result, 25f);
+            }
+            else
+            {
+                __result *= 0.35f;
+            }
+        }
     }
 }
 
@@ -692,25 +860,39 @@ internal static class EnemyReviewAirFundGuardPatch
             return;
         }
 
-        object? eco = GroundControlReflection.GetEcoInstance();
-        float gross = GroundControlReflection.GetHqIncomePerMinute(eco, hq);
-        if (gross < 250f || hq.factionFunds < 350f)
-        {
-            return;
-        }
-
         object? cmdState = GroundControlReflection.TryGetCommanderState(__instance, hq);
         if (cmdState == null)
         {
             return;
         }
 
-        float airFund = GroundControlReflection.GetStateFloat(cmdState, GroundControlReflection.StateAirFundProp);
-        if (airFund < 220f)
+        object? eco = GroundControlReflection.GetEcoInstance();
+        int goldMines = eco != null ? GroundControlReflection.CountGoldMines(eco, hq) : 0;
+        float gross = AiEconomySettings.GetEffectiveAiGrossIncome(eco, hq, profile);
+        float reserve = GroundControlReflection.GetEnemyBuildReserve(hq, out _, out bool resIncome);
+        int airborne = GroundControlReflection.EnemyCountAirborne(hq);
+        PlayerThreatSnapshot threat = AiStrategicDirectorService.Instance.ReadPlayerThreat(hq);
+
+        if (goldMines == 0
+            || gross < 350f
+            || (resIncome && reserve > 0f && hq.factionFunds < reserve + 120f))
         {
-            // Keep the virtual AirFund allocation hydrated from healthy faction cash so savedBuildReserve cannot starve air launches.
-            float floor = Mathf.Min(300f, hq.factionFunds * 0.35f);
-            if (floor > airFund)
+            GroundControlReflection.SetStateFloat(cmdState, GroundControlReflection.StateAirFundProp, 0f);
+            bool emergencyAirDefence = threat.Aircraft >= 2 && airborne == 0 && hq.factionFunds >= 120f;
+            if (!GroundControlReflection.EnemyHasAirStock(hq) && !emergencyAirDefence)
+            {
+                GroundControlReflection.SetStateInt(cmdState, GroundControlReflection.StatePendingAirBuysProp, 0);
+            }
+
+            return;
+        }
+
+        if (goldMines >= 1 && gross >= 450f && hq.factionFunds >= reserve + 250f)
+        {
+            float airFund = GroundControlReflection.GetStateFloat(cmdState, GroundControlReflection.StateAirFundProp);
+            float surplus = Mathf.Max(0f, hq.factionFunds - reserve);
+            float floor = Mathf.Min(260f, surplus * 0.30f);
+            if (airFund < 200f && floor > airFund)
             {
                 GroundControlReflection.SetStateFloat(cmdState, GroundControlReflection.StateAirFundProp, floor);
             }
@@ -776,7 +958,7 @@ internal static class ChooseEnemyProductionPatch
         }
 
         CollectOwnedFactoryProducts(__instance, hq, BuiltProductsScratch);
-        float enemyGross = GroundControlReflection.GetHqIncomePerMinute(__instance, hq);
+        float enemyGross = AiEconomySettings.GetEffectiveAiGrossIncome(__instance, hq, profile);
         bool capsActive = DynamicCapAndTechService.IsActive;
         FactionCapSnapshot snap = capsActive ? DynamicCapAndTechService.Instance.GetSnapshot(hq) : default;
 
@@ -901,7 +1083,36 @@ internal static class ChooseEnemyProductionPatch
             }
         }
 
-        List<AircraftDefinition> tierPool = AirUnlockedScratch.Count > 0 ? AirUnlockedScratch : basePool;
+        bool airUnlockedEmpty = AirUnlockedScratch.Count == 0;
+        List<AircraftDefinition> tierPool;
+        if (!airUnlockedEmpty)
+        {
+            tierPool = AirUnlockedScratch;
+        }
+        else
+        {
+            int minReqTier = int.MaxValue;
+            for (int i = 0; i < AirAllScratch.Count; i++)
+            {
+                int reqTier = DynamicCapAndTechService.GetRequiredAircraftTechTier(AirAllScratch[i]);
+                if (reqTier < minReqTier)
+                {
+                    minReqTier = reqTier;
+                }
+            }
+
+            for (int i = 0; i < AirAllScratch.Count; i++)
+            {
+                AircraftDefinition adef = AirAllScratch[i];
+                if (DynamicCapAndTechService.GetRequiredAircraftTechTier(adef) == minReqTier)
+                {
+                    AirUnlockedScratch.Add(adef);
+                }
+            }
+
+            tierPool = AirUnlockedScratch.Count > 0 ? AirUnlockedScratch : AirAllScratch;
+        }
+
         AirRunwayScratch.Clear();
         for (int i = 0; i < tierPool.Count; i++)
         {
@@ -916,12 +1127,21 @@ internal static class ChooseEnemyProductionPatch
         activeThreatScratch = AiStrategicDirectorService.Instance.ReadPlayerThreat(hq);
 
         float maxAirCost = Mathf.Max(500f, Mathf.Max(enemyGross * 2.75f, hq.factionFunds * 1.15f));
+        System.Func<AircraftDefinition, float> scorer = airUnlockedEmpty
+            ? ScoreLowestTierAircraftFallback
+            : ScoreAircraftCandidate;
         return SelectBestProductionCandidate(
             pool,
             builtProducts,
             maxAirCost,
-            static def => ScoreAircraftCandidate(def),
-            preferCheapestFallback: false) ?? options[0];
+            scorer,
+            preferCheapestFallback: airUnlockedEmpty) ?? options[0];
+    }
+
+    private static float ScoreLowestTierAircraftFallback(AircraftDefinition def)
+    {
+        int tier = DynamicCapAndTechService.GetRequiredAircraftTechTier(def);
+        return Mathf.Max(0.1f, 1000f - tier * 100f - Mathf.Min(def.value, 500f));
     }
 
     private static bool CanOperateFromAnyOwnedBase(FactionHQ hq, AircraftDefinition adef)
@@ -1144,11 +1364,41 @@ internal static class ChooseEnemyProductionPatch
             return options[0];
         }
 
+        bool groundUnlockedEmpty = GroundUnlockedScratch.Count == 0;
         GroundStage1Scratch.Clear();
-        List<VehicleDefinition> srcStage1 = GroundUnlockedScratch.Count > 0 ? GroundUnlockedScratch : GroundAllScratch;
-        for (int i = 0; i < srcStage1.Count; i++)
+        if (!groundUnlockedEmpty)
         {
-            GroundStage1Scratch.Add(srcStage1[i]);
+            for (int i = 0; i < GroundUnlockedScratch.Count; i++)
+            {
+                GroundStage1Scratch.Add(GroundUnlockedScratch[i]);
+            }
+        }
+        else
+        {
+            int minReqDepot = int.MaxValue;
+            int minReqTech = int.MaxValue;
+            for (int i = 0; i < GroundAllScratch.Count; i++)
+            {
+                VehicleDefinition vdef = GroundAllScratch[i];
+                int reqDepot = GroundControlReflection.GetRequiredDepotLevel(vdef);
+                int reqTech = (capsActive && reqDepot >= 3) ? 2 : 1;
+                if (reqDepot < minReqDepot || (reqDepot == minReqDepot && reqTech < minReqTech))
+                {
+                    minReqDepot = reqDepot;
+                    minReqTech = reqTech;
+                }
+            }
+
+            for (int i = 0; i < GroundAllScratch.Count; i++)
+            {
+                VehicleDefinition vdef = GroundAllScratch[i];
+                int reqDepot = GroundControlReflection.GetRequiredDepotLevel(vdef);
+                int reqTech = (capsActive && reqDepot >= 3) ? 2 : 1;
+                if (reqDepot == minReqDepot && reqTech == minReqTech)
+                {
+                    GroundStage1Scratch.Add(vdef);
+                }
+            }
         }
 
         GroundCombatScratch.Clear();
@@ -1172,7 +1422,7 @@ internal static class ChooseEnemyProductionPatch
 
         List<VehicleDefinition> stage2Pool = GroundCombatScratch.Count > 0 ? GroundCombatScratch : GroundStage1Scratch;
         List<VehicleDefinition> finalPool = stage2Pool;
-        if (bestDepot >= 2)
+        if (!groundUnlockedEmpty && bestDepot >= 2)
         {
             float maxCombatValue = 0f;
             for (int i = 0; i < stage2Pool.Count; i++)
@@ -1204,12 +1454,21 @@ internal static class ChooseEnemyProductionPatch
         }
 
         float maxGroundCost = Mathf.Max(450f, Mathf.Max(enemyGross * 2.5f, hq.factionFunds * 1.15f));
+        System.Func<VehicleDefinition, float> scorer = groundUnlockedEmpty
+            ? ScoreLowestTierGroundFallback
+            : ScoreGroundCandidate;
         return SelectBestProductionCandidate(
             finalPool,
             builtProducts,
             maxGroundCost,
-            static def => ScoreGroundCandidate(def),
-            preferCheapestFallback: false) ?? options[0];
+            scorer,
+            preferCheapestFallback: groundUnlockedEmpty) ?? options[0];
+    }
+
+    private static float ScoreLowestTierGroundFallback(VehicleDefinition def)
+    {
+        int reqDepot = GroundControlReflection.GetRequiredDepotLevel(def);
+        return Mathf.Max(0.1f, 1000f - reqDepot * 100f - Mathf.Min(def.value, 500f));
     }
 
     private static void CountOwnedGroundFactoryRoles(

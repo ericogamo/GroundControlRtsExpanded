@@ -27,6 +27,23 @@ internal static class MdsBridgeAdapter
 
     private static readonly MethodInfo? GameInteropResolveHqMethod =
         AccessTools.Method("MDSFramework.GameInteropHelpers:TryResolveFactionHQ", new[] { typeof(FactionAffinity) });
+    private static readonly MethodInfo? EcoPayDefenceUpkeepMethod =
+        AccessTools.Method(GroundControlReflection.EconomyServiceType, "PayDefenceUpkeep", Type.EmptyTypes);
+    private static readonly MethodInfo? EcoRestockFromBaseMethod =
+        GroundControlReflection.EconomyServiceType != null && GroundControlReflection.SupplyStoreServiceType != null
+            ? AccessTools.Method(
+                GroundControlReflection.EconomyServiceType,
+                "RestockFromBase",
+                new[] { typeof(FactionHQ), typeof(Unit), GroundControlReflection.SupplyStoreServiceType, typeof(float) })
+            : null;
+    private static readonly PropertyInfo? SupplyStoreInstanceProp =
+        AccessTools.Property(GroundControlReflection.SupplyStoreServiceType, "Instance");
+    private static readonly PropertyInfo? SettingsSupplyStoreRangeKmProp =
+        AccessTools.Property(GroundControlReflection.SettingsType, "SupplyStoreRangeKm");
+    private static readonly Type? FeatureGateType =
+        AccessTools.TypeByName("GroundControlRts.CommanderFeatureGate");
+    private static readonly PropertyInfo? FeatureGateAdvancedProp =
+        AccessTools.Property(FeatureGateType, "AdvancedFeaturesEnabled");
     private static Harmony? interopHarmony;
 
     [ThreadStatic]
@@ -86,13 +103,25 @@ internal static class MdsBridgeAdapter
         caps.SetPendingBlueprintCapProvider(uiTransport.CountPendingBlueprintCapForHq);
         caps.SetDestroyedSiteHqConsumer(aiThreats.ConsumeDestroyedSiteHq);
 
-        if (interopHarmony == null && GameInteropResolveHqMethod != null)
+        if (interopHarmony == null && (GameInteropResolveHqMethod != null || EcoPayDefenceUpkeepMethod != null))
         {
             interopHarmony = new Harmony("com.groundcontrolrtsexpanded.mdsinterop");
-            MethodInfo? prefix = AccessTools.Method(typeof(MdsBridgeAdapter), nameof(TryResolveFactionHqPrefix));
-            if (prefix != null)
+            if (GameInteropResolveHqMethod != null)
             {
-                interopHarmony.Patch(GameInteropResolveHqMethod, prefix: new HarmonyMethod(prefix));
+                MethodInfo? prefix = AccessTools.Method(typeof(MdsBridgeAdapter), nameof(TryResolveFactionHqPrefix));
+                if (prefix != null)
+                {
+                    interopHarmony.Patch(GameInteropResolveHqMethod, prefix: new HarmonyMethod(prefix));
+                }
+            }
+
+            if (EcoPayDefenceUpkeepMethod != null)
+            {
+                MethodInfo? upkeepPostfix = AccessTools.Method(typeof(MdsBridgeAdapter), nameof(PayDefenceUpkeepPostfix));
+                if (upkeepPostfix != null)
+                {
+                    interopHarmony.Patch(EcoPayDefenceUpkeepMethod, postfix: new HarmonyMethod(upkeepPostfix));
+                }
             }
         }
 
@@ -108,6 +137,7 @@ internal static class MdsBridgeAdapter
         MdsBridgeBootstrap.CollectFriendlyMdsEwPositions = aiThreats.CollectActiveFriendlyMdsEwPositions;
         MdsBridgeBootstrap.GetHostileMdsCompensation = aiThreats.GetHostileMdsCompensationForHq;
         MdsBridgeBootstrap.CountKnownHostileMdsSites = aiThreats.CountKnownHostileSitesForHq;
+        MdsBridgeBootstrap.UpdateMdsSitePosition = aiThreats.UpdateSiteUnitPosition;
         MdsBridgeBootstrap.RaiseBallisticThreatAction = abmStockpile.RaiseBallisticThreat;
 
         MdsBridgeBootstrap.EnsureAirdropMountsInjectedAction = uiTransport.EnsureAirdropMountsInjected;
@@ -149,6 +179,9 @@ internal static class MdsBridgeAdapter
         MdsBridgeBootstrap.IsMdsMobileVehicleDefinition = uiTransport.IsMdsMobileVehicleDefinition;
         MdsBridgeBootstrap.GetMdsVehicleRequiredDepotLevel = uiTransport.GetMdsVehicleRequiredDepotLevel;
         RtsBridgeHost.QueryUnitHoldFire = GroundControlReflection.IsUnitHoldingFire;
+        RtsBridgeHost.RefundAbmInterceptor = abmStockpile.RefundAbmInterceptor;
+        RtsBridgeHost.QueryActiveAbmInterceptorsForThreat = AbmDefenseService.Instance.CountActiveInterceptorsForThreatId;
+        RtsBridgeHost.SyncMdsSiteHoldFireToRts = GroundControlReflection.SetUnitHoldFireStance;
 
         UpdateStatusSummary();
         ContractorRegistry.OnPackageRegistered -= OnPackageRegistered;
@@ -159,6 +192,9 @@ internal static class MdsBridgeAdapter
     {
         ContractorRegistry.OnPackageRegistered -= OnPackageRegistered;
         RtsBridgeHost.QueryUnitHoldFire = null;
+        RtsBridgeHost.RefundAbmInterceptor = null;
+        RtsBridgeHost.QueryActiveAbmInterceptorsForThreat = null;
+        RtsBridgeHost.SyncMdsSiteHoldFireToRts = null;
         if (interopHarmony != null)
         {
             interopHarmony.UnpatchSelf();
@@ -169,6 +205,58 @@ internal static class MdsBridgeAdapter
         if (MdsBridgeBootstrap.IsMdsAttached)
         {
             RtsBridgeHost.ResetToVanillaDefaults();
+        }
+    }
+
+    private static void PayDefenceUpkeepPostfix(object __instance)
+    {
+        if (!AddonConfig.ModEnabled.Value ||
+            __instance == null ||
+            uiTransport == null ||
+            EcoRestockFromBaseMethod == null ||
+            SupplyStoreInstanceProp == null)
+        {
+            return;
+        }
+
+        if (FeatureGateAdvancedProp != null &&
+            !(FeatureGateAdvancedProp.GetValue(null) is bool adv && adv))
+        {
+            return;
+        }
+
+        object? supplyStoreInstance = SupplyStoreInstanceProp.GetValue(null);
+        if (supplyStoreInstance == null)
+        {
+            return;
+        }
+
+        float rangeKm = SettingsSupplyStoreRangeKmProp?.GetValue(null) is float km ? km : 5f;
+        float rangeMeters = Mathf.Max(0f, rangeKm) * 1000f;
+        if (rangeMeters <= 0f)
+        {
+            return;
+        }
+
+        foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
+        {
+            if (hq == null || !((NetworkBehaviour)hq).IsServer || hq.factionUnits == null)
+            {
+                continue;
+            }
+
+            foreach (PersistentID pid in hq.factionUnits)
+            {
+                if (!pid.TryGetUnit(out Unit unit) || unit == null || unit.disabled || unit is not Container)
+                {
+                    continue;
+                }
+
+                if (uiTransport.IsMdsContainerWeaponSiteReadyToRestock(unit))
+                {
+                    EcoRestockFromBaseMethod.Invoke(__instance, new object[] { hq, unit, supplyStoreInstance, rangeMeters });
+                }
+            }
         }
     }
 
@@ -231,9 +319,16 @@ internal static class MdsBridgeAdapter
         return null;
     }
 
+    internal static FactionHQ? ResolveHqExact(FactionAffinity affinity)
+        => affinity == FactionAffinity.Any ? null : ResolveHq(affinity);
+
     internal sealed class RtsEconomyBridgeImpl : IRtsEconomyBridge
     {
         private const string VanguardPackageId = "vanguard.skyshield";
+        private static readonly MethodInfo? IgnoreFactionLockForHqMethod =
+            AccessTools.Method(typeof(SingleplayerCheatService), "IsIgnoreFactionLockActiveFor", new[] { typeof(FactionHQ) });
+        private static readonly PropertyInfo? RemoteIgnoreFactionLockHqNameProp =
+            AccessTools.Property(typeof(GcreNetworkSync), "RemoteCheatIgnoreFactionLockHqName");
 
         public int QueryFactionTechTier(FactionAffinity faction)
             => QueryFactionTechTier(activeDeliveryHq ?? ResolveHq(faction));
@@ -273,13 +368,16 @@ internal static class MdsBridgeAdapter
         }
 
         public bool IsPackageAllowedForFaction(ContractorPackage package, FactionAffinity faction)
+            => IsPackageAllowedForFaction(package, activeDeliveryHq ?? ResolveHqExact(faction), faction);
+
+        internal bool IsPackageAllowedForFaction(ContractorPackage package, FactionHQ? hq, FactionAffinity fallbackFaction = FactionAffinity.Any)
         {
             if (package == null)
             {
                 return false;
             }
 
-            if (SingleplayerCheatService.IsIgnoreFactionLockActive)
+            if (IsIgnoreFactionLockActiveForHq(hq))
             {
                 return true;
             }
@@ -289,9 +387,7 @@ internal static class MdsBridgeAdapter
                 return true;
             }
 
-            FactionAffinity effective = faction != FactionAffinity.Any
-                ? faction
-                : ToAffinity(GroundControlReflection.GetLocalHq());
+            FactionAffinity effective = hq != null ? ToAffinity(hq) : fallbackFaction;
 
             // Strict Westmacht (Boscali) lock for Vanguard Defence regardless of package config.
             if (string.Equals(package.PackageId, VanguardPackageId, StringComparison.OrdinalIgnoreCase)
@@ -306,6 +402,35 @@ internal static class MdsBridgeAdapter
             }
 
             return true;
+        }
+
+        private static bool IsIgnoreFactionLockActiveForHq(FactionHQ? hq)
+        {
+            if (hq == null)
+            {
+                return false;
+            }
+
+            if (IgnoreFactionLockForHqMethod != null)
+            {
+                return IgnoreFactionLockForHqMethod.Invoke(null, new object?[] { hq }) is bool scoped && scoped;
+            }
+
+            if (GcreNetworkSync.IsPureClient && GcreNetworkSync.HostHasGcre && RemoteIgnoreFactionLockHqNameProp != null)
+            {
+                string? allowedHqName = RemoteIgnoreFactionLockHqNameProp.GetValue(null) as string;
+                return !string.IsNullOrEmpty(allowedHqName)
+                    && hq.faction != null
+                    && string.Equals(hq.faction.factionName, allowedHqName, StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (!SingleplayerCheatService.IsIgnoreFactionLockActive)
+            {
+                return false;
+            }
+
+            FactionHQ? localHq = GroundControlReflection.GetLocalHq();
+            return localHq != null && ReferenceEquals(hq, localHq);
         }
     }
 
@@ -437,7 +562,7 @@ internal static class MdsBridgeAdapter
                         {
                             groundCount++;
                         }
-                        else if (unit is Aircraft)
+                        else if (unit is Aircraft aircraft && aircraft.Player == null)
                         {
                             airCount++;
                         }
@@ -487,9 +612,14 @@ internal static class MdsBridgeAdapter
 
         internal bool TryConsumeCap(FactionHQ? hq, string capCategory, int weight)
         {
+            if (hq == null || !((NetworkBehaviour)hq).IsServer)
+            {
+                return false;
+            }
+
             if (!CanConsumeCap(hq, capCategory, weight, out string blockReason))
             {
-                if (hq != null && ReferenceEquals(hq, GroundControlReflection.GetLocalHq()))
+                if (ReferenceEquals(hq, GroundControlReflection.GetLocalHq()))
                 {
                     float now = Time.unscaledTime;
                     if (now - lastCapBlockNoticeAt >= 1.25f)
@@ -505,11 +635,6 @@ internal static class MdsBridgeAdapter
             if (weight <= 0)
             {
                 return true;
-            }
-
-            if (hq == null)
-            {
-                return false;
             }
 
             if (!reservedByHq.TryGetValue(hq, out ReservedCaps? r))
@@ -543,13 +668,18 @@ internal static class MdsBridgeAdapter
                 return;
             }
 
-            FactionHQ? hq = destroyedSiteHqConsumer?.Invoke(faction) ?? activeDeliveryHq ?? ResolveHq(faction);
+            FactionHQ? hq = destroyedSiteHqConsumer?.Invoke(faction)
+                ?? activeDeliveryHq
+                ?? ResolveHqExact(faction);
             ReleaseCap(hq, capCategory, weight);
         }
 
         internal void ReleaseCap(FactionHQ? hq, string capCategory, int weight)
         {
-            if (weight <= 0 || hq == null || !reservedByHq.TryGetValue(hq, out ReservedCaps? r))
+            if (weight <= 0
+                || hq == null
+                || !((NetworkBehaviour)hq).IsServer
+                || !reservedByHq.TryGetValue(hq, out ReservedCaps? r))
             {
                 return;
             }
@@ -665,6 +795,8 @@ internal static class MdsBridgeAdapter
             internal FactionAffinity Affinity;
             internal ModularUnitSpec Spec = null!;
             internal Aircraft? Helo;
+            internal AircraftDefinition? PendingHeloDef;
+            internal float SpawnPendingUntil;
             internal GlobalPosition DropPos;
             internal float YawDeg;
             internal float CreatedAt;
@@ -682,6 +814,14 @@ internal static class MdsBridgeAdapter
         private const float AiBuildTimeoutSeconds = 420f;
         private const float TarantulaArrivalRadiusMeters = 165f;
         private const float TarantulaLoweringSeconds = 3.0f;
+        private const float TarantulaDelayedSpawnTimeoutSeconds = 25.0f;
+
+        private static readonly Type? ModularSiteManagerType =
+            AccessTools.TypeByName("MDSFramework.Deployment.ModularSiteManager");
+        private static readonly PropertyInfo? ModularSiteManagerInstanceProp =
+            AccessTools.Property(ModularSiteManagerType, "Instance");
+        private static readonly PropertyInfo? LastPhysicalKitSpawnSucceededProp =
+            AccessTools.Property(ModularSiteManagerType, "LastPhysicalKitSpawnSucceeded");
 
         private readonly RtsEconomyBridgeImpl ecoBridge;
         private readonly RtsCapBridgeImpl capBridge;
@@ -825,7 +965,7 @@ internal static class MdsBridgeAdapter
         }
 
         public bool RequestEngineerBuildSite(FactionAffinity faction, ModularUnitSpec spec, Vector3 worldPos, float yawDeg)
-            => RequestEngineerBuildSite(ResolveHq(faction), faction, spec, worldPos, yawDeg);
+            => RequestEngineerBuildSite(activeDeliveryHq ?? ResolveHq(faction), faction, spec, worldPos, yawDeg);
 
         internal bool RequestEngineerBuildSite(FactionHQ? hq, FactionAffinity faction, ModularUnitSpec spec, Vector3 worldPos, float yawDeg)
         {
@@ -838,12 +978,7 @@ internal static class MdsBridgeAdapter
             GlobalPosition siteGlobal = GroundControlReflection.SnapToTerrain(worldPos.ToGlobalPosition());
             if (!AddonConfig.RequirePhysicalConstruction.Value)
             {
-                using (new DeliveryHqScope(hq))
-                {
-                    OnPhysicalKitDelivered?.Invoke(spec.UnitId, resolvedAffinity, siteGlobal.ToLocalPosition(), yawDeg);
-                }
-
-                return true;
+                return InvokePhysicalKitDelivered(hq, spec.UnitId, resolvedAffinity, siteGlobal.ToLocalPosition(), yawDeg);
             }
 
             GameObject marker = ModelRegistry.InstantiateModel("sam_kit", Datum.origin, addBoxCollider: false);
@@ -879,7 +1014,7 @@ internal static class MdsBridgeAdapter
 
         public bool RequestTarantulaSlingKit(FactionAffinity faction, ModularUnitSpec spec, Vector3 dropPos, float yawDeg)
         {
-            FactionHQ? hq = ResolveHq(faction);
+            FactionHQ? hq = activeDeliveryHq ?? ResolveHq(faction);
             if (hq == null || !((NetworkBehaviour)hq).IsServer || spec == null)
             {
                 return false;
@@ -899,18 +1034,14 @@ internal static class MdsBridgeAdapter
             }
 
             GlobalPosition dropGlobal = GroundControlReflection.SnapToTerrain(dropPos.ToGlobalPosition());
+            FactionAffinity resolvedAffinity = faction != FactionAffinity.Any ? faction : ToAffinity(hq);
             if (!AddonConfig.RequirePhysicalConstruction.Value)
             {
-                using (new DeliveryHqScope(hq))
-                {
-                    OnPhysicalKitDelivered?.Invoke(spec.UnitId, faction, dropGlobal.ToLocalPosition(), yawDeg);
-                }
-
-                return true;
+                return InvokePhysicalKitDelivered(hq, spec.UnitId, resolvedAffinity, dropGlobal.ToLocalPosition(), yawDeg);
             }
 
-            Aircraft? helo = FindOrLaunchAvailableTarantula(hq, dropGlobal);
-            if (helo == null)
+            (Aircraft? helo, AircraftDefinition? pendingDef) = FindOrLaunchAvailableTarantula(hq, dropGlobal);
+            if (helo == null && pendingDef == null)
             {
                 if (ReferenceEquals(hq, GroundControlReflection.GetLocalHq()))
                 {
@@ -936,27 +1067,42 @@ internal static class MdsBridgeAdapter
                 cable.sharedMaterial = cableMat;
             }
 
+            float now = Time.time;
             var sling = new TarantulaSlingOrder
             {
                 Id = nextOrderId++,
                 Hq = hq,
-                Affinity = faction != FactionAffinity.Any ? faction : ToAffinity(hq),
+                Affinity = resolvedAffinity,
                 Spec = spec,
                 Helo = helo,
+                PendingHeloDef = pendingDef,
+                SpawnPendingUntil = pendingDef != null ? now + TarantulaDelayedSpawnTimeoutSeconds : 0f,
                 DropPos = dropGlobal,
                 YawDeg = yawDeg,
-                CreatedAt = Time.time,
-                NextOrderAt = Time.unscaledTime + 2.0f,
+                CreatedAt = now,
+                NextOrderAt = helo != null ? now + 2.0f : 0f,
                 KitVisual = kitVisual,
                 CableLine = cable,
                 CableMat = cableMat,
             };
 
-            GroundControlReflection.SetAircraftMoveOrder(helo, dropGlobal);
-            UpdateSlingVisualTransform(sling, lowerRatio: 0f);
+            if (helo != null)
+            {
+                GroundControlReflection.SetAircraftMoveOrder(helo, dropGlobal);
+                UpdateSlingVisualTransform(sling, lowerRatio: 0f);
+            }
+            else
+            {
+                kitVisual.SetActive(false);
+                cable.enabled = false;
+            }
+
             slingOrders.Add(sling);
 
-            AddonLog.Info($"[MDS Bridge] Dispatched VL-49 Tarantula sling order #{sling.Id} for '{spec.DisplayName}' ({spec.Logistics.SlingKitMassKg:0} kg).");
+            AddonLog.Info(
+                helo != null
+                    ? $"[MDS Bridge] Dispatched VL-49 Tarantula sling order #{sling.Id} for '{spec.DisplayName}' ({spec.Logistics.SlingKitMassKg:0} kg)."
+                    : $"[MDS Bridge] Queued delayed hangar VL-49 Tarantula sling order #{sling.Id} for '{spec.DisplayName}' ({spec.Logistics.SlingKitMassKg:0} kg).");
             return true;
         }
 
@@ -967,9 +1113,14 @@ internal static class MdsBridgeAdapter
                 return;
             }
 
+            if (Time.timeScale <= 0f)
+            {
+                return;
+            }
+
             UpdateAllSlingVisualsFrame();
 
-            float now = Time.unscaledTime;
+            float now = Time.time;
             if (now < nextTickAt)
             {
                 return;
@@ -1120,12 +1271,36 @@ internal static class MdsBridgeAdapter
             return bestHq;
         }
 
-        internal void DeliverBuiltSiteImmediately(FactionHQ hq, string unitId, FactionAffinity affinity, Vector3 worldPos, float yawDeg)
+        internal bool DeliverBuiltSiteImmediately(FactionHQ hq, string unitId, FactionAffinity affinity, Vector3 worldPos, float yawDeg)
+            => InvokePhysicalKitDelivered(hq, unitId, affinity, worldPos, yawDeg);
+
+        private bool InvokePhysicalKitDelivered(
+            FactionHQ hq,
+            string unitId,
+            FactionAffinity affinity,
+            Vector3 worldPos,
+            float yawDeg)
         {
+            if (OnPhysicalKitDelivered == null)
+            {
+                return false;
+            }
+
             using (new DeliveryHqScope(hq))
             {
-                OnPhysicalKitDelivered?.Invoke(unitId, affinity, worldPos, yawDeg);
+                OnPhysicalKitDelivered.Invoke(unitId, affinity, worldPos, yawDeg);
             }
+
+            if (ModularSiteManagerInstanceProp != null && LastPhysicalKitSpawnSucceededProp != null)
+            {
+                object? mgr = ModularSiteManagerInstanceProp.GetValue(null);
+                if (mgr != null && LastPhysicalKitSpawnSucceededProp.GetValue(mgr) is bool ok)
+                {
+                    return ok;
+                }
+            }
+
+            return true;
         }
 
         private void TickEngineerOrders(float now, float dt)
@@ -1194,9 +1369,16 @@ internal static class MdsBridgeAdapter
             }
 
             Vector3 worldPos = order.SitePos.ToLocalPosition();
-            using (new DeliveryHqScope(order.Hq))
+            if (!InvokePhysicalKitDelivered(order.Hq, order.Spec.UnitId, order.Affinity, worldPos, order.YawDeg))
             {
-                OnPhysicalKitDelivered?.Invoke(order.Spec.UnitId, order.Affinity, worldPos, order.YawDeg);
+                capBridge.ReleaseCap(order.Hq, order.Spec.Logistics.CapCategory, order.Spec.Logistics.CapWeight);
+                ecoBridge.TrySpendFactionCredits(order.Hq, -order.Spec.Logistics.CreditCost, $"Refund failed {order.Spec.DisplayName}");
+                if (ReferenceEquals(order.Hq, GroundControlReflection.GetLocalHq()))
+                {
+                    GroundControlReflection.NoticeFail($"{order.Spec.DisplayName} failed to deploy (refunded {order.Spec.Logistics.CreditCost:0}).");
+                }
+
+                return;
             }
 
             AddonLog.Info($"[MDS Bridge] M12 Jackknife finished building '{order.Spec.DisplayName}' at {order.SitePos}.");
@@ -1223,7 +1405,73 @@ internal static class MdsBridgeAdapter
             for (int i = slingOrders.Count - 1; i >= 0; i--)
             {
                 TarantulaSlingOrder sling = slingOrders[i];
-                if (sling.Hq == null || sling.Helo == null || sling.Helo.disabled)
+                if (sling.Hq == null)
+                {
+                    slingOrders.RemoveAt(i);
+                    DestroySlingVisuals(sling);
+                    continue;
+                }
+
+                if (sling.Helo == null && sling.PendingHeloDef != null)
+                {
+                    Aircraft? spawnedHelo = null;
+                    for (int uIdx = UnitRegistry.allUnits.Count - 1; uIdx >= 0; uIdx--)
+                    {
+                        if (UnitRegistry.allUnits[uIdx] is Aircraft launched
+                            && !launched.disabled
+                            && launched.Player == null
+                            && ReferenceEquals(launched.NetworkHQ, sling.Hq)
+                            && ReferenceEquals(launched.definition, sling.PendingHeloDef)
+                            && !IsHeloInActiveSlingOrder(launched)
+                            && !GroundControlReflection.IsSlingLifting(launched))
+                        {
+                            spawnedHelo = launched;
+                            break;
+                        }
+                    }
+
+                    if (spawnedHelo != null)
+                    {
+                        sling.Helo = spawnedHelo;
+                        sling.PendingHeloDef = null;
+                        sling.NextOrderAt = now + 2.0f;
+                        if (sling.KitVisual != null)
+                        {
+                            sling.KitVisual.SetActive(true);
+                        }
+
+                        if (sling.CableLine != null)
+                        {
+                            sling.CableLine.enabled = true;
+                        }
+
+                        GroundControlReflection.SetAircraftMoveOrder(spawnedHelo, sling.DropPos);
+                        UpdateSlingVisualTransform(sling, lowerRatio: 0f);
+                        AddonLog.Info($"[MDS Bridge] Bound delayed hangar Tarantula '{GroundControlReflection.GetUnitLabel(spawnedHelo)}' to sling order #{sling.Id}.");
+                    }
+                    else if (now >= sling.SpawnPendingUntil)
+                    {
+                        slingOrders.RemoveAt(i);
+                        DestroySlingVisuals(sling);
+                        capBridge.ReleaseCap(sling.Hq, sling.Spec.Logistics.CapCategory, sling.Spec.Logistics.CapWeight);
+                        ecoBridge.TrySpendFactionCredits(sling.Hq, -sling.Spec.Logistics.CreditCost, $"Refund timed-out {sling.Spec.DisplayName}");
+
+                        string timeoutMsg = $"VL-49 TARANTULA SPAWN TIMED OUT — refunded {sling.Spec.DisplayName}!";
+                        AddonLog.Warn($"[MDS Bridge] {timeoutMsg}");
+                        if (ReferenceEquals(sling.Hq, GroundControlReflection.GetLocalHq()))
+                        {
+                            GroundControlReflection.NoticeFail(timeoutMsg);
+                        }
+
+                        continue;
+                    }
+                    else
+                    {
+                        continue;
+                    }
+                }
+
+                if (sling.Helo == null || sling.Helo.disabled)
                 {
                     // Shot down / lost in transit -> kit is destroyed (no credit refund), cap released.
                     slingOrders.RemoveAt(i);
@@ -1267,9 +1515,16 @@ internal static class MdsBridgeAdapter
                         DestroySlingVisuals(sling);
 
                         Vector3 worldPos = sling.DropPos.ToLocalPosition();
-                        using (new DeliveryHqScope(sling.Hq))
+                        if (!InvokePhysicalKitDelivered(sling.Hq, sling.Spec.UnitId, sling.Affinity, worldPos, sling.YawDeg))
                         {
-                            OnPhysicalKitDelivered?.Invoke(sling.Spec.UnitId, sling.Affinity, worldPos, sling.YawDeg);
+                            capBridge.ReleaseCap(sling.Hq, sling.Spec.Logistics.CapCategory, sling.Spec.Logistics.CapWeight);
+                            ecoBridge.TrySpendFactionCredits(sling.Hq, -sling.Spec.Logistics.CreditCost, $"Refund failed {sling.Spec.DisplayName}");
+                            if (ReferenceEquals(sling.Hq, GroundControlReflection.GetLocalHq()))
+                            {
+                                GroundControlReflection.NoticeFail($"{sling.Spec.DisplayName} failed to deploy (refunded {sling.Spec.Logistics.CreditCost:0}).");
+                            }
+
+                            continue;
                         }
 
                         AddonLog.Info($"[MDS Bridge] Tarantula delivered '{sling.Spec.DisplayName}' at {sling.DropPos}.");
@@ -1332,7 +1587,7 @@ internal static class MdsBridgeAdapter
             return false;
         }
 
-        private Aircraft? FindOrLaunchAvailableTarantula(FactionHQ hq, GlobalPosition dropGlobal)
+        private (Aircraft? Helo, AircraftDefinition? PendingDef) FindOrLaunchAvailableTarantula(FactionHQ hq, GlobalPosition dropGlobal)
         {
             Aircraft? bestExisting = null;
             float bestDistSq = float.MaxValue;
@@ -1368,14 +1623,14 @@ internal static class MdsBridgeAdapter
 
             if (bestExisting != null)
             {
-                return bestExisting;
+                return (bestExisting, null);
             }
 
             // Try spawning an available Tarantula / sling helicopter from the nearest compatible airbase.
             AircraftDefinition? heloDef = FindTarantulaDefinition();
             if (heloDef == null)
             {
-                return null;
+                return (null, null);
             }
 
             Loadout? slingLoadout = BuildSlingLoadout(heloDef);
@@ -1404,27 +1659,30 @@ internal static class MdsBridgeAdapter
 
             if (bestBase == null)
             {
-                return null;
+                return (null, null);
             }
 
             if (!GroundControlReflection.TryLaunchAiAircraft(hq, bestBase, heloDef, new LiveryKey(0), slingLoadout, 1f, hangar: null))
             {
-                return null;
+                return (null, null);
             }
 
             for (int i = UnitRegistry.allUnits.Count - 1; i >= 0; i--)
             {
                 if (UnitRegistry.allUnits[i] is Aircraft launched
                     && !launched.disabled
+                    && launched.Player == null
                     && ReferenceEquals(launched.NetworkHQ, hq)
                     && ReferenceEquals(launched.definition, heloDef)
-                    && !IsHeloInActiveSlingOrder(launched))
+                    && !IsHeloInActiveSlingOrder(launched)
+                    && !GroundControlReflection.IsSlingLifting(launched))
                 {
-                    return launched;
+                    return (launched, null);
                 }
             }
 
-            return null;
+            // Delayed-spawn hangars (e.g., carrier elevators / blast doors) return true before UnitRegistry spawns.
+            return (null, heloDef);
         }
 
         private static bool HasSlingWeaponStation(Aircraft ac)
@@ -1603,18 +1861,27 @@ internal static class MdsBridgeAdapter
             for (int i = 0; i < slingOrders.Count; i++)
             {
                 TarantulaSlingOrder s = slingOrders[i];
-                if (!ReferenceEquals(s.Hq, localHq) || s.Helo == null)
+                if (!ReferenceEquals(s.Hq, localHq) || (s.Helo == null && s.PendingHeloDef == null))
                 {
                     continue;
                 }
 
-                float dist = FastMath.Distance(s.Helo.GlobalPosition(), s.DropPos);
-                string state = s.Lowering ? $"Lowering {s.LoweringProgress * 100f:0}%" : $"Tarantula en route ({dist:0} m)";
+                string state;
+                if (s.Helo == null)
+                {
+                    state = "Tarantula launching from hangar...";
+                }
+                else
+                {
+                    float dist = FastMath.Distance(s.Helo.GlobalPosition(), s.DropPos);
+                    state = s.Lowering ? $"Lowering {s.LoweringProgress * 100f:0}%" : $"Tarantula en route ({dist:0} m)";
+                }
+
                 GUI.Box(new Rect(12f, y, innerW, 44f), string.Empty, NativeThemeBridge.Inset);
                 GUI.Label(new Rect(18f, y + 4f, innerW - 12f, 20f), $"{s.Spec.DisplayName}: {state}", NativeThemeBridge.Label);
                 NativeThemeBridge.DrawBar(
                     new Rect(18f, y + 28f, innerW - 12f, 8f),
-                    s.Lowering ? Mathf.Clamp01(s.LoweringProgress) : 0.2f,
+                    s.Lowering ? Mathf.Clamp01(s.LoweringProgress) : (s.Helo == null ? 0.1f : 0.2f),
                     NativeThemeBridge.Accent);
                 y += 50f;
             }
@@ -1684,7 +1951,7 @@ internal static class MdsBridgeAdapter
 
         public int GetAvailableAbmInterceptors(FactionAffinity faction)
         {
-            FactionHQ? hq = ResolveHq(faction);
+            FactionHQ? hq = activeDeliveryHq ?? ResolveHq(faction);
             if (hq != null && MdsBridgeBootstrap.ExternalAbmStockpileQuery != null)
             {
                 return MdsBridgeBootstrap.ExternalAbmStockpileQuery(hq);
@@ -1701,7 +1968,7 @@ internal static class MdsBridgeAdapter
 
         public bool TryReserveAbmInterceptor(FactionAffinity faction, string missileId)
         {
-            FactionHQ? hq = ResolveHq(faction);
+            FactionHQ? hq = activeDeliveryHq ?? ResolveHq(faction);
             if (hq != null && MdsBridgeBootstrap.ExternalAbmStockpileReserve != null)
             {
                 return MdsBridgeBootstrap.ExternalAbmStockpileReserve(hq, missileId);
@@ -1715,6 +1982,22 @@ internal static class MdsBridgeAdapter
 
             fallbackStock[faction] = avail - 1;
             return true;
+        }
+
+        internal void RefundAbmInterceptor(FactionAffinity faction, string missileId)
+        {
+            FactionHQ? hq = activeDeliveryHq ?? ResolveHq(faction);
+            if (hq != null && MdsBridgeBootstrap.ExternalAbmStockpileQuery != null)
+            {
+                AbmDefenseService.Instance.RefundInterceptor(hq);
+                return;
+            }
+
+            int max = Math.Max(4, AddonConfig.AbmMaxStockPerSite.Value);
+            if (fallbackStock.TryGetValue(faction, out int cur))
+            {
+                fallbackStock[faction] = Math.Min(max, cur + 1);
+            }
         }
 
         internal void ResetSession()
@@ -1753,7 +2036,7 @@ internal static class MdsBridgeAdapter
         private readonly List<Airbase> safeBaseScratch = new();
         private readonly List<GlobalPosition> friendlyFcuScratch = new();
         private readonly List<WeaponCascadeRole> desiredRoleOrderScratch = new();
-        private readonly Queue<(FactionAffinity Affinity, FactionHQ Hq, int Frame)> destroyedSiteHqQueue = new();
+        private readonly List<(FactionAffinity Affinity, FactionHQ Hq, int Frame)> destroyedSiteHqPending = new();
 
         internal RtsAiThreatSinkImpl(RtsEconomyBridgeImpl ecoBridge, RtsCapBridgeImpl capBridge, RtsLogisticsBridgeImpl logisticsBridge)
         {
@@ -1764,22 +2047,21 @@ internal static class MdsBridgeAdapter
 
         internal FactionHQ? ConsumeDestroyedSiteHq(FactionAffinity faction)
         {
-            while (destroyedSiteHqQueue.Count > 0)
+            for (int i = 0; i < destroyedSiteHqPending.Count; i++)
             {
-                (FactionAffinity affinity, FactionHQ hq, int frame) entry = destroyedSiteHqQueue.Peek();
+                (FactionAffinity affinity, FactionHQ hq, int frame) entry = destroyedSiteHqPending[i];
                 if (entry.hq == null || Time.frameCount - entry.frame > 1)
                 {
-                    destroyedSiteHqQueue.Dequeue();
+                    destroyedSiteHqPending.RemoveAt(i);
+                    i--;
                     continue;
                 }
 
                 if (entry.affinity == faction || faction == FactionAffinity.Any || ToAffinity(entry.hq) == faction)
                 {
-                    destroyedSiteHqQueue.Dequeue();
+                    destroyedSiteHqPending.RemoveAt(i);
                     return entry.hq;
                 }
-
-                break;
             }
 
             return null;
@@ -1843,7 +2125,7 @@ internal static class MdsBridgeAdapter
             for (int i = 0; i < UnitRegistry.allUnits.Count; i++)
             {
                 Unit? u = UnitRegistry.allUnits[i];
-                if (u == null || u.disabled || u.NetworkHQ == null)
+                if (u == null || u.disabled || u.NetworkHQ == null || !MdsUiAndTransportHelper.HasMdsComponent(u))
                 {
                     continue;
                 }
@@ -1865,13 +2147,40 @@ internal static class MdsBridgeAdapter
             return bestUnit;
         }
 
+        private static GlobalPosition GetSitePosition(TrackedSite site)
+        {
+            if (site.BoundUnit != null && !site.BoundUnit.disabled)
+            {
+                site.Pos = site.BoundUnit.GlobalPosition();
+            }
+
+            return site.Pos;
+        }
+
+        internal void UpdateSiteUnitPosition(Unit? unit, GlobalPosition newPos)
+        {
+            if (unit == null)
+            {
+                return;
+            }
+
+            foreach (TrackedSite site in trackedSites.Values)
+            {
+                if (ReferenceEquals(site.BoundUnit, unit))
+                {
+                    site.Pos = newPos;
+                    return;
+                }
+            }
+        }
+
         public void ReportSiteDestroyed(string siteId)
         {
             if (!string.IsNullOrEmpty(siteId))
             {
                 if (trackedSites.TryGetValue(siteId, out TrackedSite? dying) && dying.Hq != null)
                 {
-                    destroyedSiteHqQueue.Enqueue((dying.Faction, dying.Hq, Time.frameCount));
+                    destroyedSiteHqPending.Add((dying.Faction, dying.Hq, Time.frameCount));
                 }
 
                 // Cap release is handled cleanly by MDSFramework SensorNetworkManager.UnregisterSite -> Caps.ReleaseCap.
@@ -1886,7 +2195,7 @@ internal static class MdsBridgeAdapter
             safeBaseScratch.Clear();
             friendlyFcuScratch.Clear();
             desiredRoleOrderScratch.Clear();
-            destroyedSiteHqQueue.Clear();
+            destroyedSiteHqPending.Clear();
         }
 
         internal void CollectActiveFriendlyMdsEwPositions(FactionHQ hq, List<GlobalPosition> results)
@@ -1904,7 +2213,7 @@ internal static class MdsBridgeAdapter
                     && site.RadarActive
                     && (site.Role == WeaponCascadeRole.EarlyWarningRadar || site.Role == WeaponCascadeRole.FireControl))
                 {
-                    results.Add(site.Pos);
+                    results.Add(GetSitePosition(site));
                 }
             }
         }
@@ -1942,7 +2251,7 @@ internal static class MdsBridgeAdapter
                     continue;
                 }
 
-                if (FastMath.SquareDistance(site.Pos, pos) <= rSq)
+                if (FastMath.SquareDistance(GetSitePosition(site), pos) <= rSq)
                 {
                     return true;
                 }
@@ -1962,7 +2271,7 @@ internal static class MdsBridgeAdapter
             bool hasAllowedPackage = false;
             foreach (ContractorPackage pkg in ContractorRegistry.GetPackages())
             {
-                if (pkg != null && ecoBridge.IsPackageAllowedForFaction(pkg, aiAffinity))
+                if (pkg != null && ecoBridge.IsPackageAllowedForFaction(pkg, aiHq, aiAffinity))
                 {
                     hasAllowedPackage = true;
                     break;
@@ -1974,19 +2283,7 @@ internal static class MdsBridgeAdapter
                 return 0;
             }
 
-            int hostileSites = 0;
-            foreach (TrackedSite site in trackedSites.Values)
-            {
-                bool hostile = site.Hq != null
-                    ? !ReferenceEquals(site.Hq, aiHq)
-                    : (site.Faction != FactionAffinity.Any && site.Faction != aiAffinity);
-                if (hostile)
-                {
-                    hostileSites++;
-                }
-            }
-
-            return hostileSites;
+            return CountKnownHostileSitesForHq(aiHq);
         }
 
         internal int CountKnownHostileSitesForHq(FactionHQ aiHq)
@@ -2121,6 +2418,11 @@ internal static class MdsBridgeAdapter
                     continue;
                 }
 
+                if (site.BoundUnit != null && site.BoundUnit.disabled)
+                {
+                    continue;
+                }
+
                 if (requireActiveOrGrace && !site.RadarActive && (site.LastRadarActiveAt < 0f || now - site.LastRadarActiveAt > 15f))
                 {
                     continue;
@@ -2132,7 +2434,7 @@ internal static class MdsBridgeAdapter
                     return true;
                 }
 
-                float dSq = FastMath.SquareDistance(detectedPos, site.Pos);
+                float dSq = FastMath.SquareDistance(detectedPos, GetSitePosition(site));
                 if (dSq < bestSq)
                 {
                     bestSq = dSq;
@@ -2237,6 +2539,32 @@ internal static class MdsBridgeAdapter
             return count;
         }
 
+        private bool HasTierValidFcuSpec(FactionHQ aiHq, FactionAffinity aiAffinity, int techTier)
+        {
+            IReadOnlyCollection<ContractorPackage> packs = ContractorRegistry.GetPackages();
+            foreach (ContractorPackage pkg in packs)
+            {
+                if (pkg == null || !ecoBridge.IsPackageAllowedForFaction(pkg, aiHq, aiAffinity) || pkg.Units == null)
+                {
+                    continue;
+                }
+
+                for (int i = 0; i < pkg.Units.Count; i++)
+                {
+                    ModularUnitSpec spec = pkg.Units[i];
+                    if (spec != null
+                        && !spec.IsMobileVehicle
+                        && spec.Role == WeaponCascadeRole.FireControl
+                        && spec.Logistics.RequiredTechTier <= techTier)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
         private ModularUnitSpec? PickAiModularSpec(FactionHQ aiHq, FactionAffinity aiAffinity, int techTier, int totalSites, float protectedReserve = 0f)
         {
             int fcuCount = CountRoleOwnedAndPending(aiHq, aiAffinity, WeaponCascadeRole.FireControl);
@@ -2249,58 +2577,65 @@ internal static class MdsBridgeAdapter
 
             desiredRoleOrderScratch.Clear();
 
-            // Always ensure first Fire Control hub before FCU-dependent launchers.
-            if (fcuCount == 0)
+            // Always ensure first Fire Control hub before FCU-dependent launchers or secondary sites.
+            if (fcuCount == 0 && HasTierValidFcuSpec(aiHq, aiAffinity, techTier))
             {
                 desiredRoleOrderScratch.Add(WeaponCascadeRole.FireControl);
             }
-
-            // Build balanced core point/area layers (ShortMed -> LaserHel -> CloseInGun -> LongSam -> Tier3 ABM).
-            if (shortMedCount == 0)
+            else
             {
+                if (fcuCount == 0)
+                {
+                    desiredRoleOrderScratch.Add(WeaponCascadeRole.FireControl);
+                }
+
+                // Build balanced core point/area layers (ShortMed -> LaserHel -> CloseInGun -> LongSam -> Tier3 ABM).
+                if (shortMedCount == 0)
+                {
+                    desiredRoleOrderScratch.Add(WeaponCascadeRole.ShortMedSam);
+                }
+
+                if (helCount == 0)
+                {
+                    desiredRoleOrderScratch.Add(WeaponCascadeRole.LaserHel);
+                }
+
+                if (closeInCount == 0)
+                {
+                    desiredRoleOrderScratch.Add(WeaponCascadeRole.CloseInGun);
+                }
+
+                // Build redundant 2nd networked FCU once Tech Tier 2+ and initial firing unit(s) exist.
+                if (techTier >= 2 && fcuCount == 1 && totalSites >= 2)
+                {
+                    desiredRoleOrderScratch.Add(WeaponCascadeRole.FireControl);
+                }
+
+                if (longSamCount == 0 && techTier >= 2)
+                {
+                    desiredRoleOrderScratch.Add(WeaponCascadeRole.LongRangeSam);
+                }
+
+                if (abmVlsCount == 0 && techTier >= 3)
+                {
+                    desiredRoleOrderScratch.Add(WeaponCascadeRole.AbmVls);
+                }
+
+                if (ewCount == 0)
+                {
+                    desiredRoleOrderScratch.Add(WeaponCascadeRole.EarlyWarningRadar);
+                }
+
+                // Expansion duplicates once initial balanced network exists.
                 desiredRoleOrderScratch.Add(WeaponCascadeRole.ShortMedSam);
-            }
-
-            if (helCount == 0)
-            {
                 desiredRoleOrderScratch.Add(WeaponCascadeRole.LaserHel);
-            }
-
-            if (closeInCount == 0)
-            {
-                desiredRoleOrderScratch.Add(WeaponCascadeRole.CloseInGun);
-            }
-
-            // Build redundant 2nd networked FCU once Tech Tier 2+ and initial firing unit(s) exist.
-            if (techTier >= 2 && fcuCount == 1 && totalSites >= 2)
-            {
-                desiredRoleOrderScratch.Add(WeaponCascadeRole.FireControl);
-            }
-
-            if (longSamCount == 0 && techTier >= 2)
-            {
                 desiredRoleOrderScratch.Add(WeaponCascadeRole.LongRangeSam);
-            }
-
-            if (abmVlsCount == 0 && techTier >= 3)
-            {
                 desiredRoleOrderScratch.Add(WeaponCascadeRole.AbmVls);
-            }
-
-            if (ewCount == 0)
-            {
-                desiredRoleOrderScratch.Add(WeaponCascadeRole.EarlyWarningRadar);
-            }
-
-            // Expansion duplicates once initial balanced network exists.
-            desiredRoleOrderScratch.Add(WeaponCascadeRole.ShortMedSam);
-            desiredRoleOrderScratch.Add(WeaponCascadeRole.LaserHel);
-            desiredRoleOrderScratch.Add(WeaponCascadeRole.LongRangeSam);
-            desiredRoleOrderScratch.Add(WeaponCascadeRole.AbmVls);
-            desiredRoleOrderScratch.Add(WeaponCascadeRole.CloseInGun);
-            if (techTier >= 2 && fcuCount < 2)
-            {
-                desiredRoleOrderScratch.Add(WeaponCascadeRole.FireControl);
+                desiredRoleOrderScratch.Add(WeaponCascadeRole.CloseInGun);
+                if (techTier >= 2 && fcuCount < 2)
+                {
+                    desiredRoleOrderScratch.Add(WeaponCascadeRole.FireControl);
+                }
             }
 
             IReadOnlyCollection<ContractorPackage> packs = ContractorRegistry.GetPackages();
@@ -2309,7 +2644,7 @@ internal static class MdsBridgeAdapter
                 WeaponCascadeRole role = desiredRoleOrderScratch[r];
                 foreach (ContractorPackage pkg in packs)
                 {
-                    if (pkg == null || !ecoBridge.IsPackageAllowedForFaction(pkg, aiAffinity) || pkg.Units == null)
+                    if (pkg == null || !ecoBridge.IsPackageAllowedForFaction(pkg, aiHq, aiAffinity) || pkg.Units == null)
                     {
                         continue;
                     }
@@ -2317,7 +2652,7 @@ internal static class MdsBridgeAdapter
                     for (int i = 0; i < pkg.Units.Count; i++)
                     {
                         ModularUnitSpec spec = pkg.Units[i];
-                        if (spec == null || spec.Role != role)
+                        if (spec == null || spec.IsMobileVehicle || spec.Role != role)
                         {
                             continue;
                         }
@@ -2353,7 +2688,7 @@ internal static class MdsBridgeAdapter
                 bool owned = ReferenceEquals(site.Hq, aiHq) || (site.Hq == null && site.Faction == affinity);
                 if (owned && site.Role == WeaponCascadeRole.FireControl)
                 {
-                    friendlyFcuScratch.Add(site.Pos);
+                    friendlyFcuScratch.Add(GetSitePosition(site));
                 }
             }
 
@@ -2369,7 +2704,7 @@ internal static class MdsBridgeAdapter
             foreach (TrackedSite site in trackedSites.Values)
             {
                 bool owned = ReferenceEquals(site.Hq, aiHq) || (site.Hq == null && site.Faction == affinity);
-                if (owned && FastMath.SquareDistance(site.Pos, candidate) < minSq)
+                if (owned && FastMath.SquareDistance(GetSitePosition(site), candidate) < minSq)
                 {
                     return false;
                 }
@@ -2478,7 +2813,7 @@ internal static class MdsBridgeAdapter
             if (chosen.Role == WeaponCascadeRole.FireControl && friendlyFcuScratch.Count > 0)
             {
                 GlobalPosition fcuAnchor = friendlyFcuScratch[0];
-                float maxLinkMeters = Mathf.Clamp(chosen.FcuLinkRadiusKm * 850f, 450f, 700f);
+                float maxLinkMeters = Mathf.Clamp(chosen.FcuLinkRadiusKm * 850f, 450f, 16000f);
                 for (int b = 0; b < safeBaseScratch.Count; b++)
                 {
                     Airbase ab = safeBaseScratch[b];
@@ -2699,13 +3034,28 @@ internal static class MdsBridgeAdapter
             AccessTools.TypeByName("MDSFramework.Deployment.MdsEncyclopediaCatalog");
         private static readonly MethodInfo? MdsEncyclopediaEnsureRegisteredMethod =
             AccessTools.Method(MdsEncyclopediaCatalogType, "EnsureRegisteredAll", Type.EmptyTypes);
+        private static readonly PropertyInfo? ProxyAnimatorProp =
+            AccessTools.Property(typeof(MdsClientSiteProxy), "Animator");
+        private static readonly FieldInfo? ProxyTargetDeployedField =
+            AccessTools.Field(typeof(MdsClientSiteProxy), "targetDeployed");
+        private static readonly FieldInfo? ProxyHoldFireField =
+            AccessTools.Field(typeof(MdsClientSiteProxy), "holdFire");
+        private static readonly FieldInfo? ProxySuspendedInTransitField =
+            AccessTools.Field(typeof(MdsClientSiteProxy), "suspendedInTransit");
+        private static readonly FieldInfo? ProxyHasAppliedLandedPoseField =
+            AccessTools.Field(typeof(MdsClientSiteProxy), "hasAppliedLandedPose");
+        private static readonly Type? GlbAnimatorType =
+            AccessTools.TypeByName("MDSFramework.Assets3D.GlbKeyframedAnimator");
+        private static readonly MethodInfo? GlbAnimatorSetTargetDeployedMethod =
+            AccessTools.Method(GlbAnimatorType, "SetTargetDeployed", new[] { typeof(bool) });
 
         private readonly RtsEconomyBridgeImpl ecoBridge;
         private readonly RtsCapBridgeImpl capBridge;
         private readonly RtsLogisticsBridgeImpl logisticsBridge;
         private readonly Dictionary<string, BuildingDefinition> buildDefsByUnitId = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<BuildingDefinition, (ContractorPackage Pkg, ModularUnitSpec Spec)> metaByBuildDef = new();
-        private Encyclopedia? cachedEnc;
+        private Encyclopedia? cachedAirdropEnc;
+        private Encyclopedia? cachedBuildEnc;
         private int lastInjectedMountCount = -1;
 
         internal MdsUiAndTransportHelper(
@@ -2720,10 +3070,34 @@ internal static class MdsBridgeAdapter
 
         internal void ResetSession()
         {
+            DestroyClonedBuildDefinitions();
+            cachedAirdropEnc = null;
+            cachedBuildEnc = null;
+            lastInjectedMountCount = -1;
+        }
+
+        private void DestroyClonedBuildDefinitions()
+        {
+            foreach (BuildingDefinition def in buildDefsByUnitId.Values)
+            {
+                if (def == null)
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrEmpty(def.jsonKey)
+                    && Encyclopedia.Lookup != null
+                    && Encyclopedia.Lookup.TryGetValue(def.jsonKey, out UnitDefinition registered)
+                    && ReferenceEquals(registered, def))
+                {
+                    Encyclopedia.Lookup.Remove(def.jsonKey);
+                }
+
+                UnityEngine.Object.Destroy(def);
+            }
+
             buildDefsByUnitId.Clear();
             metaByBuildDef.Clear();
-            cachedEnc = null;
-            lastInjectedMountCount = -1;
         }
 
         internal void EnsureAirdropMountsInjected()
@@ -2746,7 +3120,7 @@ internal static class MdsBridgeAdapter
                 }
             }
 
-            if (mdsMounts.Count == 0 || (ReferenceEquals(cachedEnc, enc) && lastInjectedMountCount == mdsMounts.Count))
+            if (mdsMounts.Count == 0 || (ReferenceEquals(cachedAirdropEnc, enc) && lastInjectedMountCount == mdsMounts.Count))
             {
                 return;
             }
@@ -2840,13 +3214,13 @@ internal static class MdsBridgeAdapter
             if (injectedBays > 0)
             {
                 lastInjectedMountCount = mdsMounts.Count;
-                cachedEnc = enc;
+                cachedAirdropEnc = enc;
                 AddonLog.Info($"[MDS Bridge] Injected {mdsMounts.Count} MDS airdrop container mount(s) into {injectedAircraft} aircraft ({injectedBays} cargo bay(s)).");
             }
             else if (lastInjectedMountCount == mdsMounts.Count)
             {
                 // Already injected earlier; avoid redundant re-scan unless new mounts arrive.
-                cachedEnc = enc;
+                cachedAirdropEnc = enc;
             }
         }
 
@@ -2886,7 +3260,7 @@ internal static class MdsBridgeAdapter
                 return true;
             }
 
-            return ecoBridge.IsPackageAllowedForFaction(pkg, ToAffinity(hq));
+            return ecoBridge.IsPackageAllowedForFaction(pkg, hq, ToAffinity(hq));
         }
 
         internal string GetAirdropMountSuffix(WeaponMount? mount, FactionHQ? hq)
@@ -2948,7 +3322,7 @@ internal static class MdsBridgeAdapter
                     continue;
                 }
 
-                if (!ecoBridge.IsPackageAllowedForFaction(pkg, affinity))
+                if (!ecoBridge.IsPackageAllowedForFaction(pkg, hq, affinity))
                 {
                     return $"BLOCKED ({spec.DisplayName}): restricted to {pkg.DefaultFaction} faction.";
                 }
@@ -3329,7 +3703,7 @@ internal static class MdsBridgeAdapter
             FactionAffinity affinity = ToAffinity(hq);
             foreach (KeyValuePair<BuildingDefinition, (ContractorPackage Pkg, ModularUnitSpec Spec)> kv in metaByBuildDef)
             {
-                if (kv.Key != null && !kv.Value.Spec.IsMobileVehicle && ecoBridge.IsPackageAllowedForFaction(kv.Value.Pkg, affinity))
+                if (kv.Key != null && !kv.Value.Spec.IsMobileVehicle && ecoBridge.IsPackageAllowedForFaction(kv.Value.Pkg, hq, affinity))
                 {
                     list.Add(kv.Key);
                 }
@@ -3400,7 +3774,7 @@ internal static class MdsBridgeAdapter
             }
 
             FactionAffinity affinity = ToAffinity(hq);
-            if (!ecoBridge.IsPackageAllowedForFaction(pkg, affinity))
+            if (!ecoBridge.IsPackageAllowedForFaction(pkg, hq, affinity))
             {
                 return $"{pkg.DisplayName} restricted to {pkg.DefaultFaction} faction.";
             }
@@ -3472,7 +3846,18 @@ internal static class MdsBridgeAdapter
                 return true;
             }
 
-            logisticsBridge.DeliverBuiltSiteImmediately(hq, spec.UnitId, affinity, worldPos, yaw);
+            if (!logisticsBridge.DeliverBuiltSiteImmediately(hq, spec.UnitId, affinity, worldPos, yaw))
+            {
+                capBridge.ReleaseCap(hq, spec.Logistics.CapCategory, spec.Logistics.CapWeight);
+                ecoBridge.TrySpendFactionCredits(hq, -spec.Logistics.CreditCost, $"Refund failed {spec.DisplayName}");
+                if (ReferenceEquals(hq, GroundControlReflection.GetLocalHq()))
+                {
+                    GroundControlReflection.NoticeFail($"{spec.DisplayName} failed to deploy (refunded {spec.Logistics.CreditCost:0}).");
+                }
+
+                return true;
+            }
+
             AddonLog.Info($"[MDS Bridge] Built '{spec.DisplayName}' via BUILD menu at {worldPos} for {hq.faction?.factionName}.");
 
             Unit? spawnedSiteUnit = FindNearestSpawnedMdsUnit(hq, worldPos, 12f);
@@ -3558,11 +3943,57 @@ internal static class MdsBridgeAdapter
 
         internal void SetMdsHaulerOutriggersDeployed(GroundVehicle? vehicle, bool deployed)
         {
+            if (vehicle == null)
+            {
+                return;
+            }
+
             Component? siteComp = FindModularSiteComponent(vehicle);
             if (siteComp != null)
             {
                 SiteSetHaulerOutriggersMethod?.Invoke(siteComp, new object[] { deployed });
+                return;
             }
+
+            MdsClientSiteProxy? proxy = vehicle.GetComponent<MdsClientSiteProxy>();
+            if (proxy != null)
+            {
+                ProxyTargetDeployedField?.SetValue(proxy, deployed);
+                object? animator = ProxyAnimatorProp?.GetValue(proxy);
+                if (animator != null)
+                {
+                    GlbAnimatorSetTargetDeployedMethod?.Invoke(animator, new object[] { deployed });
+                }
+            }
+        }
+
+        internal bool IsMdsContainerWeaponSiteReadyToRestock(Unit unit)
+        {
+            if (unit == null || unit.disabled || unit.weaponStations == null || unit.weaponStations.Count == 0)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < unit.weaponStations.Count; i++)
+            {
+                if (unit.weaponStations[i]?.WeaponInfo == null)
+                {
+                    return false;
+                }
+            }
+
+            Component? siteComp = FindModularSiteComponent(unit);
+            if (siteComp == null)
+            {
+                return false;
+            }
+
+            if (SiteSuspendedInTransitField?.GetValue(siteComp) is bool inTransit && inTransit)
+            {
+                return false;
+            }
+
+            return SiteIsWeaponSiteProp?.GetValue(siteComp) is bool isWeaponSite && isWeaponSite;
         }
 
         internal bool HasSelectedFriendlyMdsWeaponSite()
@@ -3592,7 +4023,7 @@ internal static class MdsBridgeAdapter
             return false;
         }
 
-        private static bool HasMdsComponent(Unit? unit)
+        internal static bool HasMdsComponent(Unit? unit)
         {
             if (unit == null)
             {
@@ -3772,8 +4203,14 @@ internal static class MdsBridgeAdapter
 
             if (!((NetworkBehaviour)unit).IsServer)
             {
-                if (unit.GetComponent<MdsClientSiteProxy>() != null || HasMdsComponent(unit))
+                MdsClientSiteProxy? proxy = unit.GetComponent<MdsClientSiteProxy>();
+                if (proxy != null || HasMdsComponent(unit))
                 {
+                    if (proxy != null)
+                    {
+                        ProxyHoldFireField?.SetValue(proxy, holdFire);
+                    }
+
                     MdsNetworkSync.RequestClientHoldFire(unit, holdFire);
                 }
 
@@ -3824,6 +4261,21 @@ internal static class MdsBridgeAdapter
             if (unit is Container container && ((NetworkBehaviour)container).IsServer)
             {
                 container.Networkkinematic = inTransit;
+            }
+
+            MdsClientSiteProxy? proxy = unit.GetComponent<MdsClientSiteProxy>();
+            if (proxy != null)
+            {
+                ProxySuspendedInTransitField?.SetValue(proxy, inTransit);
+                if (inTransit)
+                {
+                    ProxyHasAppliedLandedPoseField?.SetValue(proxy, false);
+                    object? animator = ProxyAnimatorProp?.GetValue(proxy);
+                    if (animator != null)
+                    {
+                        GlbAnimatorSetTargetDeployedMethod?.Invoke(animator, new object[] { false });
+                    }
+                }
             }
 
             MonoBehaviour[] behaviours = unit.GetComponents<MonoBehaviour>();
@@ -3914,7 +4366,7 @@ internal static class MdsBridgeAdapter
                     continue;
                 }
 
-                vehDef.value = Mathf.Max(0.05f, spec.Logistics.CreditCost);
+                vehDef.value = Mathf.Max(5f, spec.Logistics.CreditCost);
                 if (!buffer.Contains(vehDef))
                 {
                     buffer.Add(vehDef);
@@ -3950,7 +4402,7 @@ internal static class MdsBridgeAdapter
                 return null;
             }
 
-            return ecoBridge.IsPackageAllowedForFaction(pkg, ToAffinity(hq));
+            return ecoBridge.IsPackageAllowedForFaction(pkg, hq, ToAffinity(hq));
         }
 
         internal bool IsMdsMobileVehicleDefinition(VehicleDefinition? def)
@@ -3974,11 +4426,10 @@ internal static class MdsBridgeAdapter
                 return;
             }
 
-            if (!ReferenceEquals(cachedEnc, enc))
+            if (!ReferenceEquals(cachedBuildEnc, enc))
             {
-                buildDefsByUnitId.Clear();
-                metaByBuildDef.Clear();
-                cachedEnc = enc;
+                DestroyClonedBuildDefinitions();
+                cachedBuildEnc = enc;
             }
 
             BuildingDefinition? plain = null;

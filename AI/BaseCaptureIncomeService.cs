@@ -13,12 +13,31 @@ internal static class BaseCaptureIncomeService
     private const float CaptureBountyCooldownSeconds = 300f;
 
     private static readonly Dictionary<(Airbase Base, FactionHQ Hq), float> BountyCooldownUntil = new();
+    private static readonly Dictionary<Airbase, FactionHQ> InitialChampionsBaseOwners = new();
     private static readonly HashSet<Airbase> SeenBasesScratch = new();
     private static readonly List<(Airbase Base, FactionHQ Hq)> StaleCooldownKeysScratch = new();
 
     internal static void ResetSession()
     {
         BountyCooldownUntil.Clear();
+        InitialChampionsBaseOwners.Clear();
+    }
+
+    internal static void RecordChampionsInitialBases()
+    {
+        if (!GroundControlReflection.IsChampionsMission() || FactionRegistry.airbaseLookup == null)
+        {
+            return;
+        }
+
+        InitialChampionsBaseOwners.Clear();
+        foreach (Airbase? ab in FactionRegistry.airbaseLookup.Values)
+        {
+            if (IsEligibleCapturableBase(ab) && ab!.CurrentHQ != null)
+            {
+                InitialChampionsBaseOwners[ab] = ab.CurrentHQ;
+            }
+        }
     }
 
     internal static bool IsEligibleCapturableBase(Airbase? ab)
@@ -58,7 +77,26 @@ internal static class BaseCaptureIncomeService
             return 0;
         }
 
-        return Mathf.Max(0, CountHeldCapturableBases(hq) - 1);
+        SeenBasesScratch.Clear();
+        int totalHeld = 0;
+        int nonInitialHeld = 0;
+        foreach (Airbase ab in hq.GetAirbases())
+        {
+            if (!IsEligibleCapturableBase(ab) || !SeenBasesScratch.Add(ab))
+            {
+                continue;
+            }
+
+            totalHeld++;
+            if (!InitialChampionsBaseOwners.TryGetValue(ab, out FactionHQ? initialOwner)
+                || !ReferenceEquals(initialOwner, hq))
+            {
+                nonInitialHeld++;
+            }
+        }
+
+        SeenBasesScratch.Clear();
+        return Mathf.Min(Mathf.Max(0, totalHeld - 1), nonInitialHeld);
     }
 
     internal static float GetCapturedBaseIncomePerMinute(FactionHQ? hq)
@@ -108,7 +146,8 @@ internal static class BaseCaptureIncomeService
 
         float rate = Mathf.Max(0f, GcreNetworkSync.EffectiveCapturedBaseIncomePerMinute);
         int bonusCount = CountCapturedBonusBases(newHq);
-        if (!paidBounty && rate <= 0f)
+        float effectiveAddedRate = bonusCount > 0 ? rate : 0f;
+        if (!paidBounty && effectiveAddedRate <= 0f)
         {
             return;
         }
@@ -119,13 +158,13 @@ internal static class BaseCaptureIncomeService
             : newHq.name;
 
         AddonLog.Info(
-            $"[Economy] {factionName} captured {label}: bounty={(paidBounty ? $"+${bounty:0}m" : "$0m (cd)")}, ongoing=+${rate:0}m/min ({bonusCount} extra bases).");
+            $"[Economy] {factionName} captured {label}: bounty={(paidBounty ? $"+${bounty:0}m" : "$0m (cd)")}, ongoing=+${effectiveAddedRate:0}m/min ({bonusCount} extra bases).");
 
         string upperLabel = label.ToUpperInvariant();
         string toastText;
-        if (paidBounty && rate > 0f)
+        if (paidBounty && effectiveAddedRate > 0f)
         {
-            toastText = $"BASE CAPTURED: {upperLabel} (+${bounty:0}m | +${rate:0}m/min)";
+            toastText = $"BASE CAPTURED: {upperLabel} (+${bounty:0}m | +${effectiveAddedRate:0}m/min)";
         }
         else if (paidBounty)
         {
@@ -133,7 +172,7 @@ internal static class BaseCaptureIncomeService
         }
         else
         {
-            toastText = $"BASE CAPTURED: {upperLabel} (+${rate:0}m/min)";
+            toastText = $"BASE CAPTURED: {upperLabel} (+${effectiveAddedRate:0}m/min)";
         }
 
         if (ReferenceEquals(newHq, GroundControlReflection.GetLocalHq()))
@@ -178,8 +217,8 @@ internal static class PayCapturedBaseIncomePatch
     private static void Postfix()
     {
         if (!AddonConfig.ModEnabled.Value
-            || !AddonConfig.EnableCapturedBaseIncome.Value
-            || AddonConfig.CapturedBaseIncomePerMinute.Value <= 0f)
+            || !GcreNetworkSync.EffectiveEnableCapturedBaseIncome
+            || GcreNetworkSync.EffectiveCapturedBaseIncomePerMinute <= 0f)
         {
             return;
         }
@@ -269,6 +308,26 @@ internal static class AirbaseCaptureBountyPatch
         if (__instance != null)
         {
             BaseCaptureIncomeService.OnAirbaseCaptured(__instance, __state, newHQ);
+        }
+    }
+}
+
+[HarmonyPatch]
+internal static class ChampionsBaselineCapturePatch
+{
+    private static bool Prepare() => GroundControlReflection.TickChampionsStartMethod != null;
+    private static MethodBase TargetMethod() => GroundControlReflection.TickChampionsStartMethod!;
+
+    private static void Prefix(object __instance, out bool __state)
+    {
+        __state = GroundControlReflection.GetChampionsDealt(__instance);
+    }
+
+    private static void Postfix(object __instance, bool __state)
+    {
+        if (!__state && GroundControlReflection.GetChampionsDealt(__instance))
+        {
+            BaseCaptureIncomeService.RecordChampionsInitialBases();
         }
     }
 }

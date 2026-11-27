@@ -71,7 +71,11 @@ internal static class IsChallengingDecouplePatch
 
     private static void Postfix(FactionHQ? hq, ref bool __result)
     {
-        if (AddonConfig.EnableTacticalQualityAi.Value && hq != null && hq.faction != null && ((Mirage.NetworkBehaviour)hq).IsServer)
+        if (AddonConfig.EnableTacticalQualityAi.Value
+            && !AiEconomySettings.GetActiveProfile().IsVanilla
+            && hq != null
+            && hq.faction != null
+            && ((Mirage.NetworkBehaviour)hq).IsServer)
         {
             // Unlock counter-buying, main-effort pushes, anti-ship sorties, and smart base expansion independent of cheat funding.
             __result = true;
@@ -325,7 +329,10 @@ internal static class CollectCatalogFilterPatch
             for (int i = 0; i < catalog.Count; i++)
             {
                 VehicleDefinition v = catalog[i];
-                if (v != null && GroundControlReflection.IsAirDefence(v) && v.value >= 50f)
+                if (v != null
+                    && GroundControlReflection.IsAirDefence(v)
+                    && !GroundControlReflection.IsRadarGuidedAirDefence(v)
+                    && v.value >= 50f)
                 {
                     heavyAdCount++;
                 }
@@ -386,12 +393,8 @@ internal static class ChooseDearLeanPatch
             return;
         }
 
-        float current = GroundControlReflection.EnemyDearLeanField.GetValue(__instance) is float f ? f : 0f;
         float desired = Mathf.Clamp01(AddonConfig.QualityDearLean.Value);
-        if (current < desired)
-        {
-            GroundControlReflection.EnemyDearLeanField.SetValue(__instance, desired);
-        }
+        GroundControlReflection.EnemyDearLeanField.SetValue(__instance, desired);
     }
 }
 

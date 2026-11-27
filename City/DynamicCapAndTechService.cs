@@ -89,6 +89,7 @@ internal sealed class RtsBuildingRecord
     internal FactionHQ Hq { get; set; } = null!;
     internal RtsBuildingSpec Spec { get; set; } = null!;
     internal int Level { get; set; } = 1;
+    internal bool WasDisabled { get; set; }
 }
 
 internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
@@ -99,6 +100,9 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
     private const float AiCityReviewCooldownSeconds = 8.0f;
     private const float NoticeCooldownSeconds = 15.0f;
     private const int ArtilleryVehicleTypeInt = 5;
+
+    [ThreadStatic]
+    internal static bool BuilderExemptionScope;
 
     internal static DynamicCapAndTechService Instance { get; } = new();
 
@@ -111,6 +115,7 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
     private readonly Dictionary<string, float> noticeCooldowns = new(StringComparer.Ordinal);
     private readonly Dictionary<Unit, float> logisticsHealedAt = new();
     private readonly List<Unit> logisticsCleanScratch = new();
+    private readonly List<(uint Pid, int KindInt, int Level)> pendingClientCityEntries = new();
 
     private float nextAdoptScanAt;
     private float nextLogisticsAuraAt;
@@ -128,19 +133,27 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
             return;
         }
 
-        float now = Time.unscaledTime;
+        float realNow = Time.unscaledTime;
         PruneDeadRecords();
 
-        if (now >= nextAdoptScanAt)
+        if (GcreNetworkSync.IsPureClient)
         {
-            nextAdoptScanAt = now + AdoptScanIntervalSeconds;
+            ReconcilePendingClientCitySync();
+        }
+        else if (realNow >= nextAdoptScanAt)
+        {
+            nextAdoptScanAt = realNow + AdoptScanIntervalSeconds;
             AdoptExistingCustomBuildings();
         }
 
-        if (IsActive && now >= nextLogisticsAuraAt)
+        if (IsActive && Time.timeScale > 0f)
         {
-            nextLogisticsAuraAt = now + LogisticsAuraIntervalSeconds;
-            TickLogisticsAura(now);
+            float simNow = Time.time;
+            if (simNow >= nextLogisticsAuraAt)
+            {
+                nextLogisticsAuraAt = simNow + LogisticsAuraIntervalSeconds;
+                TickLogisticsAura(simNow);
+            }
         }
     }
 
@@ -155,6 +168,7 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
         noticeCooldowns.Clear();
         logisticsHealedAt.Clear();
         logisticsCleanScratch.Clear();
+        pendingClientCityEntries.Clear();
         nextAdoptScanAt = 0f;
         nextLogisticsAuraAt = 0f;
         RtsBuildingCatalog.ResetSession();
@@ -177,6 +191,12 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
     }
 
     internal FactionCapSnapshot GetSnapshot(FactionHQ? hq)
+        => GetSnapshotInternal(hq, bypassCache: false);
+
+    internal FactionCapSnapshot GetFreshSnapshot(FactionHQ? hq)
+        => GetSnapshotInternal(hq, bypassCache: true);
+
+    private FactionCapSnapshot GetSnapshotInternal(FactionHQ? hq, bool bypassCache)
     {
         if (hq == null)
         {
@@ -202,7 +222,7 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
         }
 
         float now = Time.unscaledTime;
-        if (snapshotCache.TryGetValue(hq, out (FactionCapSnapshot Snap, float ExpiresAt) cached) && now < cached.ExpiresAt)
+        if (!bypassCache && snapshotCache.TryGetValue(hq, out (FactionCapSnapshot Snap, float ExpiresAt) cached) && now < cached.ExpiresAt)
         {
             return cached.Snap;
         }
@@ -342,6 +362,7 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
             return;
         }
 
+        pendingClientCityEntries.Clear();
         var syncedUnits = new HashSet<Unit>();
         for (int i = 0; i < entries.Count; i++)
         {
@@ -352,7 +373,13 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
             }
 
             var pid = new PersistentID { Id = pidId };
-            if (!pid.TryGetUnit(out Unit unit) || unit == null || unit.disabled || unit.NetworkHQ == null)
+            if (!pid.TryGetUnit(out Unit unit) || unit == null || unit.NetworkHQ == null)
+            {
+                pendingClientCityEntries.Add((pidId, kindInt, level));
+                continue;
+            }
+
+            if (unit.disabled && !RtsBuildingCatalog.IsRepairableBuilding(unit))
             {
                 continue;
             }
@@ -360,36 +387,14 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
             RtsBuildingKind kind = (RtsBuildingKind)kindInt;
             RtsBuildingSpec spec = RtsBuildingCatalog.GetSpec(kind);
             syncedUnits.Add(unit);
-
-            if (records.TryGetValue(unit, out RtsBuildingRecord existing))
-            {
-                existing.Hq = unit.NetworkHQ;
-                existing.Spec = spec;
-                int clamped = Mathf.Clamp(level, 1, 3);
-                if (existing.Level != clamped)
-                {
-                    existing.Level = clamped;
-                    RtsBuildingCatalog.ApplyCustomVisual(unit, spec, clamped, forceReplace: true);
-                }
-            }
-            else
-            {
-                int clamped = Mathf.Clamp(level, 1, 3);
-                records[unit] = new RtsBuildingRecord
-                {
-                    Unit = unit,
-                    Hq = unit.NetworkHQ,
-                    Spec = spec,
-                    Level = clamped,
-                };
-                RtsBuildingCatalog.ApplyCustomVisual(unit, spec, clamped, forceReplace: true);
-            }
+            UpsertClientRecord(unit, unit.NetworkHQ, spec, level);
         }
 
         pruneScratch.Clear();
         foreach (KeyValuePair<Unit, RtsBuildingRecord> kv in records)
         {
-            if (kv.Key == null || kv.Key.disabled || !syncedUnits.Contains(kv.Key))
+            bool keepDisabledRepairable = kv.Key != null && kv.Key.disabled && RtsBuildingCatalog.IsRepairableBuilding(kv.Key);
+            if (kv.Key == null || (!keepDisabledRepairable && !syncedUnits.Contains(kv.Key)))
             {
                 pruneScratch.Add(kv.Key!);
             }
@@ -401,6 +406,73 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
         }
 
         InvalidateCache();
+    }
+
+    private void ReconcilePendingClientCitySync()
+    {
+        if (pendingClientCityEntries.Count == 0)
+        {
+            return;
+        }
+
+        bool anyResolved = false;
+        for (int i = pendingClientCityEntries.Count - 1; i >= 0; i--)
+        {
+            (uint pidId, int kindInt, int level) = pendingClientCityEntries[i];
+            var pid = new PersistentID { Id = pidId };
+            if (!pid.TryGetUnit(out Unit unit) || unit == null || unit.NetworkHQ == null)
+            {
+                continue;
+            }
+
+            pendingClientCityEntries.RemoveAt(i);
+            if (unit.disabled && !RtsBuildingCatalog.IsRepairableBuilding(unit))
+            {
+                continue;
+            }
+
+            RtsBuildingSpec spec = RtsBuildingCatalog.GetSpec((RtsBuildingKind)kindInt);
+            UpsertClientRecord(unit, unit.NetworkHQ, spec, level);
+            anyResolved = true;
+        }
+
+        if (anyResolved)
+        {
+            InvalidateCache();
+        }
+    }
+
+    private void UpsertClientRecord(Unit unit, FactionHQ hq, RtsBuildingSpec spec, int level)
+    {
+        int clamped = Mathf.Clamp(level, 1, 3);
+        if (records.TryGetValue(unit, out RtsBuildingRecord existing))
+        {
+            existing.Hq = hq;
+            existing.Spec = spec;
+            existing.WasDisabled = unit.disabled;
+            if (existing.Level != clamped)
+            {
+                existing.Level = clamped;
+                RtsBuildingCatalog.ApplyCustomVisual(unit, spec, clamped, forceReplace: true);
+            }
+        }
+        else
+        {
+            records[unit] = new RtsBuildingRecord
+            {
+                Unit = unit,
+                Hq = hq,
+                Spec = spec,
+                Level = clamped,
+                WasDisabled = unit.disabled,
+            };
+            RtsBuildingCatalog.ApplyCustomVisual(unit, spec, clamped, forceReplace: true);
+        }
+
+        if (unit.disabled)
+        {
+            RtsBuildingCatalog.SetCustomVisualVisible(unit, spec, clamped, visible: false);
+        }
     }
 
     internal bool CanStartBuilding(FactionHQ hq, RtsBuildingKind kind, out string reason)
@@ -534,8 +606,16 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
             return false;
         }
 
-        FactionCapSnapshot snap = GetSnapshot(hq);
-        if (snap.TotalUsed < snap.TotalCap)
+        if (BuilderExemptionScope && CountLiveBuilders(hq) < 2)
+        {
+            return false;
+        }
+
+        FactionCapSnapshot snap = GetFreshSnapshot(hq);
+        int effectiveTotalUsed = Math.Min(snap.GroundUsed, snap.GroundCap)
+            + Math.Min(snap.AirUsed, snap.AirCap)
+            + Math.Min(snap.NavalUsed, snap.NavalCap);
+        if (effectiveTotalUsed < snap.TotalCap)
         {
             return false;
         }
@@ -559,7 +639,12 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
             return false;
         }
 
-        FactionCapSnapshot snap = GetSnapshot(hq);
+        if (BuilderExemptionScope && CountLiveBuilders(hq) < 2)
+        {
+            return false;
+        }
+
+        FactionCapSnapshot snap = GetFreshSnapshot(hq);
         if (snap.GroundUsed < snap.GroundCap)
         {
             return false;
@@ -584,7 +669,7 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
             return false;
         }
 
-        FactionCapSnapshot snap = GetSnapshot(hq);
+        FactionCapSnapshot snap = GetFreshSnapshot(hq);
         if (snap.AirUsed < snap.AirCap)
         {
             return false;
@@ -614,7 +699,7 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
             return false;
         }
 
-        FactionCapSnapshot snap = GetSnapshot(hq);
+        FactionCapSnapshot snap = GetFreshSnapshot(hq);
 
         if (def is VehicleDefinition vdef)
         {
@@ -741,12 +826,12 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
 
     internal void TickAiCityDecision(object ecoInstance, FactionHQ hq)
     {
-        if (!IsActive || !AddonConfig.EnableAiCityBuilding.Value || hq == null || !((NetworkBehaviour)hq).IsServer)
+        if (!IsActive || !AddonConfig.EnableAiCityBuilding.Value || hq == null || !((NetworkBehaviour)hq).IsServer || Time.timeScale <= 0f)
         {
             return;
         }
 
-        float now = Time.unscaledTime;
+        float now = Time.time;
         if (aiNextReviewAt.TryGetValue(hq, out float nextAt) && now < nextAt)
         {
             return;
@@ -757,7 +842,7 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
         FactionCapSnapshot snap = GetSnapshot(hq);
         GetOwnedBuildings(hq, ownedScratch);
 
-        // 1. Ensure a Command HQ exists first (before MDS/City expansion so TechTier never stays locked at 1)
+        // 1. Ensure a Command HQ exists first (before City expansion so TechTier never stays locked at 1)
         if (snap.CommandHqCount == 0 && CountInProgressBlueprints(hq, RtsBuildingKind.CommandHq) == 0)
         {
             if (TryQueueAiCityBuilding(ecoInstance, hq, RtsBuildingKind.CommandHq, minReserve: 180f, isUrgentCapRelief: false))
@@ -765,9 +850,6 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
                 return;
             }
         }
-
-        // 1b. Faction-appropriate modular air defence / contractor batteries via MDSFramework
-        MdsBridgeBootstrap.TickAiMdsDeploymentAction?.Invoke(hq);
 
         // 2. Expand ground capacity when close to ground cap or if no Barracks yet
         bool urgentGround = snap.GroundUsed >= snap.GroundCap - 2;
@@ -1194,8 +1276,12 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
                 Hq = hq,
                 Spec = spec,
                 Level = 1,
+                WasDisabled = unit.disabled,
             };
-            GcreNetworkSync.MarkCityDirty();
+            if (!GcreNetworkSync.IsPureClient)
+            {
+                GcreNetworkSync.MarkCityDirty();
+            }
         }
 
         InvalidateCache(hq);
@@ -1203,6 +1289,11 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
 
     private void AdoptExistingCustomBuildings()
     {
+        if (GcreNetworkSync.IsPureClient)
+        {
+            return;
+        }
+
         for (int i = 0; i < UnitRegistry.allUnits.Count; i++)
         {
             Unit? u = UnitRegistry.allUnits[i];
@@ -1222,31 +1313,55 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
     private void PruneDeadRecords()
     {
         pruneScratch.Clear();
+        bool dirty = false;
         foreach (KeyValuePair<Unit, RtsBuildingRecord> kv in records)
         {
-            if (kv.Key == null || kv.Key.disabled || kv.Value.Hq == null)
+            Unit? unit = kv.Key;
+            RtsBuildingRecord rec = kv.Value;
+            if (unit == null || rec.Hq == null)
             {
-                pruneScratch.Add(kv.Key!);
+                pruneScratch.Add(unit!);
+                continue;
             }
-        }
 
-        if (pruneScratch.Count == 0)
-        {
-            return;
-        }
-
-        for (int i = 0; i < pruneScratch.Count; i++)
-        {
-            Unit dead = pruneScratch[i];
-            if (records.TryGetValue(dead, out RtsBuildingRecord? rec) && rec != null)
+            if (unit.disabled && !RtsBuildingCatalog.IsRepairableBuilding(unit))
             {
+                pruneScratch.Add(unit);
+                continue;
+            }
+
+            if (rec.WasDisabled != unit.disabled)
+            {
+                rec.WasDisabled = unit.disabled;
                 InvalidateCache(rec.Hq);
+                dirty = true;
+                if (!unit.disabled)
+                {
+                    RtsBuildingCatalog.SetCustomVisualVisible(unit, rec.Spec, rec.Level, visible: true);
+                }
             }
-
-            records.Remove(dead);
         }
 
-        GcreNetworkSync.MarkCityDirty();
+        if (pruneScratch.Count > 0)
+        {
+            for (int i = 0; i < pruneScratch.Count; i++)
+            {
+                Unit dead = pruneScratch[i];
+                if (records.TryGetValue(dead, out RtsBuildingRecord? rec) && rec != null)
+                {
+                    InvalidateCache(rec.Hq);
+                }
+
+                records.Remove(dead);
+            }
+
+            dirty = true;
+        }
+
+        if (dirty && !GcreNetworkSync.IsPureClient)
+        {
+            GcreNetworkSync.MarkCityDirty();
+        }
     }
 
     private FactionCapSnapshot ComputeSnapshot(FactionHQ hq)
@@ -1422,8 +1537,15 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
                 Unit? candidate = UnitRegistry.allUnits[i];
                 if (candidate == null
                     || candidate.disabled
-                    || !ReferenceEquals(candidate.NetworkHQ, camp.Hq)
-                    || (!(candidate is GroundVehicle) && !(candidate is Building)))
+                    || !ReferenceEquals(candidate.NetworkHQ, camp.Hq))
+                {
+                    continue;
+                }
+
+                bool isEligible = candidate is GroundVehicle
+                    || candidate is Building
+                    || (candidate is Container && MdsBridgeBootstrap.QueryMdsSiteUiStatus?.Invoke(candidate).IsMdsSite == true);
+                if (!isEligible)
                 {
                     continue;
                 }
@@ -1453,7 +1575,7 @@ internal sealed class DynamicCapAndTechService : IAddonTick, IAddonResetSession
                         logisticsHealedAt[candidate] = now;
                         if (candidate.persistentID.IsValid)
                         {
-                            GcreNetworkSync.BroadcastPartHeal(candidate.persistentID.Id);
+                            GcreNetworkSync.BroadcastPartHeal(candidate.persistentID, p);
                         }
                         break;
                     }

@@ -9,7 +9,8 @@ namespace GroundControlRtsExpanded;
 [HarmonyPatch]
 internal static class TurretIdleThrottlePatch
 {
-    private const float ActivePaddingMultiplier = 1.15f;
+    // Turret.AssessTargetPriority accepts targets up to maxRange / 0.7f (~1.4286x); pad above that so pre-slewing never drops valid targets.
+    private const float ActivePaddingMultiplier = 1.45f;
     private const float ActivePaddingMeters = 500f;
 
     private static readonly AccessTools.FieldRef<Turret, Unit?> TargetRef =
@@ -56,16 +57,11 @@ internal static class TurretIdleThrottlePatch
         Unit? target = TargetRef(__instance);
         float now = Time.timeSinceLevelLoad;
 
-        if (target == null || target.disabled)
+        if ((target == null || target.disabled) && !IsCombatTurretExemptFromIdleThrottle(attachedUnit))
         {
-            float desiredInterval = PerfMetricsService.Instance.IdleTurretIntervalSeconds;
+            float desiredInterval = Mathf.Min(PerfMetricsService.Instance.IdleTurretIntervalSeconds, 4.0f);
             if (desiredInterval > 2.05f)
             {
-                // Keep anti-air interceptors (aircraft & radar/IR SAMs) responsive; throttle non-SAM ground/naval/building turrets.
-                float effectiveInterval = IsHighPriorityAirDefence(attachedUnit)
-                    ? Mathf.Min(desiredInterval, 2.5f)
-                    : desiredInterval;
-
                 int id = __instance.GetInstanceID();
                 if (NextIdleScanAt.TryGetValue(id, out float nextAllowed) && now < nextAllowed)
                 {
@@ -79,7 +75,7 @@ internal static class TurretIdleThrottlePatch
                 }
 
                 float stagger = (id & 15) * 0.03f;
-                NextIdleScanAt[id] = now + effectiveInterval + stagger;
+                NextIdleScanAt[id] = now + desiredInterval + stagger;
             }
         }
 
@@ -124,7 +120,7 @@ internal static class TurretIdleThrottlePatch
         return __exception;
     }
 
-    private static bool IsHighPriorityAirDefence(Unit? unit)
+    private static bool IsCombatTurretExemptFromIdleThrottle(Unit? unit)
     {
         if (unit == null)
         {
@@ -138,14 +134,26 @@ internal static class TurretIdleThrottlePatch
 
         if (unit.definition is VehicleDefinition vd)
         {
-            return vd.vehicleType == VehicleType.R_SAM
+            if (vd.vehicleType == VehicleType.AFV
+                || vd.vehicleType == VehicleType.MBT
+                || vd.vehicleType == VehicleType.ART
+                || vd.vehicleType == VehicleType.R_SAM
                 || vd.vehicleType == VehicleType.IR_SAM
-                || vd.vehicleType == VehicleType.AAA;
+                || vd.vehicleType == VehicleType.AAA)
+            {
+                return true;
+            }
+
+            return vd.roleIdentity.antiAir > 0f
+                || vd.roleIdentity.antiSurface > 0f
+                || vd.roleIdentity.antiMissile > 0f;
         }
 
-        if (unit is Ship || unit is Building)
+        if ((unit is Ship || unit is Building) && unit.definition != null)
         {
-            return unit.definition != null && unit.definition.roleIdentity.antiAir > 0f;
+            return unit.definition.roleIdentity.antiAir > 0f
+                || unit.definition.roleIdentity.antiSurface > 0f
+                || unit.definition.roleIdentity.antiMissile > 0f;
         }
 
         return false;

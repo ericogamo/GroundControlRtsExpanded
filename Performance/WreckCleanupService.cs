@@ -1,7 +1,5 @@
 using System.Collections.Generic;
 using HarmonyLib;
-using Mirage;
-using NuclearOption.Networking;
 using UnityEngine;
 
 namespace GroundControlRtsExpanded;
@@ -13,8 +11,9 @@ internal sealed class WreckCleanupService : IAddonTick, IAddonResetSession
 
     internal static WreckCleanupService Instance { get; } = new();
 
-    private readonly Dictionary<Unit, float> trackedWrecks = new();
-    private readonly List<Unit> scratchRemove = new();
+    private readonly Dictionary<Wreckage, float> trackedWrecks = new();
+    private readonly List<Wreckage> scratchRemove = new();
+    private readonly List<Wreckage> scratchDisintegrated = new();
     private float nextScanAt;
 
     private WreckCleanupService()
@@ -29,16 +28,27 @@ internal sealed class WreckCleanupService : IAddonTick, IAddonResetSession
         }
 
         float now = Time.time;
-        if (now < nextScanAt || trackedWrecks.Count == 0)
+        if (now < nextScanAt)
         {
             return;
         }
 
         nextScanAt = now + ScanIntervalSeconds;
 
-        NetworkManagerNuclearOption net = NetworkManagerNuclearOption.i;
-        ServerObjectManager? som = net != null ? net.ServerObjectManager : null;
-        if (som == null)
+        MissionManager? missionManager = NetworkSceneSingleton<MissionManager>.i;
+        if (missionManager != null && missionManager.listWrecks != null)
+        {
+            for (int i = 0; i < missionManager.listWrecks.Count; i++)
+            {
+                Wreckage? w = missionManager.listWrecks[i];
+                if (w != null && !trackedWrecks.ContainsKey(w))
+                {
+                    trackedWrecks[w] = now;
+                }
+            }
+        }
+
+        if (trackedWrecks.Count == 0)
         {
             return;
         }
@@ -46,27 +56,28 @@ internal sealed class WreckCleanupService : IAddonTick, IAddonResetSession
         float maxAge = AddonConfig.WreckCleanupSeconds.Value;
         int despawned = 0;
         scratchRemove.Clear();
+        scratchDisintegrated.Clear();
 
-        foreach (KeyValuePair<Unit, float> pair in trackedWrecks)
+        foreach (KeyValuePair<Wreckage, float> pair in trackedWrecks)
         {
-            Unit unit = pair.Key;
-            if (unit == null || !unit.disabled || unit.Identity == null || unit.Identity.IsSceneObject || !unit.IsServer)
+            Wreckage wreck = pair.Key;
+            if (wreck == null)
             {
-                scratchRemove.Add(unit!);
+                scratchRemove.Add(wreck!);
                 continue;
             }
 
-            if (now - pair.Value < maxAge)
+            if (float.IsNaN(pair.Value) || now - pair.Value < maxAge)
             {
                 continue;
             }
 
             if (despawned < MaxDespawnsPerPass)
             {
-                som.Destroy(unit.Identity, true);
+                wreck.Disintegrate();
                 despawned++;
                 PerfMetricsService.Instance.NoteWreckCleaned();
-                scratchRemove.Add(unit);
+                scratchDisintegrated.Add(wreck);
             }
         }
 
@@ -75,45 +86,55 @@ internal sealed class WreckCleanupService : IAddonTick, IAddonResetSession
             trackedWrecks.Remove(scratchRemove[i]);
         }
 
+        for (int i = 0; i < scratchDisintegrated.Count; i++)
+        {
+            Wreckage w = scratchDisintegrated[i];
+            if (w != null)
+            {
+                trackedWrecks[w] = float.NaN;
+            }
+            else if (!ReferenceEquals(w, null))
+            {
+                trackedWrecks.Remove(w!);
+            }
+        }
+
         scratchRemove.Clear();
+        scratchDisintegrated.Clear();
     }
 
     public void ResetSession()
     {
         trackedWrecks.Clear();
         scratchRemove.Clear();
+        scratchDisintegrated.Clear();
         nextScanAt = 0f;
     }
 
-    internal void TrackDeadGroundVehicle(Unit unit)
+    internal void TrackWreck(Wreckage? wreck)
     {
-        if (unit is not GroundVehicle || !unit.IsServer || !unit.disabled)
+        if (wreck == null)
         {
             return;
         }
 
-        if (unit.Identity == null || unit.Identity.IsSceneObject)
+        if (!trackedWrecks.ContainsKey(wreck))
         {
-            return;
-        }
-
-        if (!trackedWrecks.ContainsKey(unit))
-        {
-            trackedWrecks[unit] = Time.time;
+            trackedWrecks[wreck] = Time.time;
         }
     }
 }
 
-[HarmonyPatch(typeof(Unit), "ServerDisableUnit")]
-internal static class UnitServerDisableWreckTrackPatch
+[HarmonyPatch(typeof(Wreckage), "Start")]
+internal static class WreckageStartTrackPatch
 {
-    private static void Postfix(Unit __instance)
+    private static void Postfix(Wreckage __instance)
     {
         if (!AddonConfig.EnableAntiLag.Value || AddonConfig.WreckCleanupSeconds.Value <= 0f || __instance == null)
         {
             return;
         }
 
-        WreckCleanupService.Instance.TrackDeadGroundVehicle(__instance);
+        WreckCleanupService.Instance.TrackWreck(__instance);
     }
 }
