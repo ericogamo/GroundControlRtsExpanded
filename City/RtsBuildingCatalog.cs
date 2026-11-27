@@ -642,7 +642,7 @@ internal static class RtsBuildingCatalog
     }
 }
 
-[HarmonyPatch(typeof(Encyclopedia), "AfterLoad")]
+[HarmonyPatch(typeof(Encyclopedia), "AfterLoad", new[] { typeof(Encyclopedia) })]
 internal static class RtsBuildingCatalogAfterLoadPatch
 {
     private static void Postfix()
